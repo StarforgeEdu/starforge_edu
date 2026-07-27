@@ -1,0 +1,24 @@
+# Keep secrets, VCS history, and local caches OUT of the production image
+# (docker/Dockerfile does COPY . /app from the repo root).
+.git
+.gitignore
+.env
+.env.*
+*.pem
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.sqlite3
+node_modules/
+config/settings/local_run.py
+# Docs/tests aren't needed at runtime (kept small; keep migrations + templates).
+.github/
+docs/
+*.md

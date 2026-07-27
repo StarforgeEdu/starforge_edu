@@ -42,6 +42,13 @@ dependencies = [
 
     "daphne>=4.1",
     "gunicorn>=23.0",
+
+    "cryptography>=43.0",      # TD-11 field encryption (Fernet); also a simplejwt[crypto] dep
+    "python-dateutil>=2.9",    # TD-12 recurrence rules (used from Day 2 schedule)
+    "icalendar>=6.0",          # TD-16 / D2-A iCal feed
+    "weasyprint>=63.0",        # TD-14 / D2-C transcript PDFs (needs GTK native libs at runtime)
+    "openpyxl>=3.1",           # TD-14/16 / D4-B report Excel export (lazy import; CI installs it)
+    "sentry-sdk>=2.0",         # O-10 error tracking (prod-only, no-op without DSN)
 ]
 
 [dependency-groups]
@@ -50,15 +57,40 @@ dev = [
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=5.1",
     "djangorestframework-stubs>=3.15",
+    "types-requests>=2.32",
     "pytest>=8.3",
     "pytest-django>=4.9",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
+    "pytest-xdist>=3.6",       # TESTING.md §1 parallel test runner
+    "factory-boy>=3.3",        # TD-16 / TESTING.md §4 — the factory standard
+    "time-machine>=2.16",      # TESTING.md §5 — deterministic time travel
     "pre-commit>=4.0",
-    "model-bakery>=1.20",
     "ipython>=8.30",
     "ipdb>=0.13",
 ]
 
 [tool.uv]
 package = false
+
+[tool.coverage.run]
+omit = [
+    "*/migrations/*",
+    "*/tests/*",
+    "*/admin.py",
+    "*/apps.py",
+    "conftest.py",
+    "manage.py",
+    "scripts/*",
+    "config/asgi.py",
+    "config/wsgi.py",
+    "docker/*",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "def __str__",
+    "@abstractmethod",
+]

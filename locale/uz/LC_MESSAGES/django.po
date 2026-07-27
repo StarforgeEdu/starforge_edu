@@ -1,0 +1,64 @@
+# Starforge Edu uz translations (D4-LF-2).
+# Seeded by scripts/build_locale.py; CI's `makemessages -a` extends this.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: starforge_edu\n"
+"Report-Msgid-Bugs-To: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: uz\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Invalid input."
+msgstr "Noto‘g‘ri ma’lumot."
+
+msgid "Invalid phone number."
+msgstr "Telefon raqami noto‘g‘ri."
+
+msgid "You don't have permission to do that."
+msgstr "Buni bajarishga ruxsatingiz yo‘q."
+
+msgid "Resource not found."
+msgstr "Resurs topilmadi."
+
+msgid "Forbidden."
+msgstr "Ruxsat etilmagan."
+
+msgid "Too many requests."
+msgstr "So‘rovlar juda ko‘p."
+
+msgid "Conflict with the current state."
+msgstr "Joriy holat bilan ziddiyat."
+
+msgid "The request could not be processed."
+msgstr "So‘rovni qayta ishlab bo‘lmadi."
+
+msgid "Authentication failed."
+msgstr "Autentifikatsiya muvaffaqiyatsiz tugadi."
+
+msgid "No active tenant context."
+msgstr "Faol ijarachi konteksti yo‘q."
+
+msgid "Something went wrong."
+msgstr "Nimadir noto‘g‘ri ketdi."
+
+msgid "Invalid username or password."
+msgstr "Login yoki parol noto‘g‘ri."
+
+msgid "Current password is incorrect."
+msgstr "Joriy parol noto‘g‘ri."
+
+msgid "Invalid code."
+msgstr "Kod noto‘g‘ri."
+
+msgid "A file must be attached to a lesson or a folder."
+msgstr "Fayl darsga yoki papkaga biriktirilishi kerak."
+
+msgid "At least one field is required."
+msgstr "Kamida bitta maydon talab qilinadi."
+
+msgid "Provide plan_code and/or status."
+msgstr "plan_code va/yoki status ni kiriting."
+

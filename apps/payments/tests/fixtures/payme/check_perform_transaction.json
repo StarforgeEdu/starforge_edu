@@ -1,0 +1,22 @@
+{
+  "method": "CheckPerformTransaction",
+  "description": "Pre-flight: account resolves to an open invoice and the amount (tiyin) matches. Echoes back nothing but allow=true on success.",
+  "amount_uzs": "150000.00",
+  "amount_tiyin": 15000000,
+  "account_field": "order_id",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "CheckPerformTransaction",
+    "params": {
+      "amount": 15000000,
+      "account": {"order_id": "INV-2026-000001"}
+    }
+  },
+  "expected_result": {"allow": true},
+  "errors": {
+    "amount_mismatch": -31001,
+    "unknown_account": -31050,
+    "auth_failed": -32504
+  }
+}

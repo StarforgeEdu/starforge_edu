@@ -1,0 +1,41 @@
+{
+  "description": "Canonical Payme JSON-RPC error responses. All carry HTTP 200; the error lives in the `error` member (TD-18 exception for Payme, per Lane B decision). Account-field errors live in the -31050..-31099 band and name the offending field in `data`.",
+  "auth_failed": {
+    "code": -32504,
+    "note": "HTTP Basic Paycom:<key> wrong or missing"
+  },
+  "unknown_method": {
+    "code": -32601,
+    "note": "JSON-RPC method not in the handler set"
+  },
+  "amount_mismatch": {
+    "code": -31001,
+    "note": "tiyin amount != invoice total * 100"
+  },
+  "unknown_transaction": {
+    "code": -31003,
+    "note": "Perform/Cancel/Check on an id that was never created"
+  },
+  "cannot_perform": {
+    "code": -31008,
+    "note": "state transition not allowed (e.g. perform an already-cancelled txn)"
+  },
+  "account_band": {
+    "low": -31050,
+    "high": -31099,
+    "examples": {
+      "unknown_invoice": {
+        "code": -31050,
+        "error": {
+          "code": -31050,
+          "message": {"ru": "Заказ не найден", "uz": "Buyurtma topilmadi", "en": "Order not found"},
+          "data": "order_id"
+        }
+      },
+      "second_concurrent_transaction": {
+        "code": -31099,
+        "note": "another in-progress transaction already exists for this account"
+      }
+    }
+  }
+}

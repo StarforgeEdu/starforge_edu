@@ -4,6 +4,45 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from typing import TYPE_CHECKING
+
+from django.conf import settings
+from django.db import connection
+
+if TYPE_CHECKING:
+    from django.http import HttpRequest
+    from rest_framework.request import Request
+
+    # Both the DRF Request and a plain Django HttpRequest expose ``.META`` — these
+    # helpers serve both view styles during the off-DRF migration.
+    AnyRequest = HttpRequest | Request
+
+
+def current_schema() -> str:
+    """The active django-tenants schema name (one typed access point for it)."""
+    return connection.schema_name  # type: ignore[attr-defined]
+
+
+def client_ip(request: AnyRequest) -> str:
+    """Client IP with rightmost-trusted-hop semantics.
+
+    ``X-Forwarded-For`` is honored only for the configured ``NUM_PROXIES``
+    trusted hops, counted from the right (each trusted proxy appends exactly
+    one address). With the default of 0 only ``REMOTE_ADDR`` is trusted, so a
+    client-supplied header can never spoof the IP used by the OTP per-IP cap
+    or audit logs.
+    """
+    remote_addr = request.META.get("REMOTE_ADDR", "") or ""
+    num_proxies = int(getattr(settings, "NUM_PROXIES", 0) or 0)
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
+    if num_proxies > 0 and forwarded:
+        addrs = forwarded.split(",")
+        return addrs[-min(num_proxies, len(addrs))].strip()
+    return remote_addr
+
+
+def user_agent(request: AnyRequest) -> str:
+    return request.META.get("HTTP_USER_AGENT", "")[:512]
 
 
 def generate_otp(length: int = 6) -> str:

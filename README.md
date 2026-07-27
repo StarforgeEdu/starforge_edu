@@ -7,7 +7,7 @@ Multi-tenant Django backend for an Uzbek education platform.
 - django-tenants (schema-per-tenant) with subdomain routing
 - Channels + Redis (realtime); Celery + tenant-schemas-celery (background)
 - Postgres 16, S3-compatible storage (MinIO in dev / AWS S3 in prod)
-- Anthropic Claude (`claude-opus-4-7`) with prompt caching
+- Anthropic Claude (`claude-sonnet-4-6`) with prompt caching
 - Eskiz SMS (real client + dev mock)
 - uv for dependency management; ruff + mypy + pytest
 
@@ -44,9 +44,9 @@ uv run python manage.py runserver
 ```
 
 Then hit:
-- `http://demo.localhost:8000/admin/`  (login: `+998901234567` / `starforge-dev`)
+- `http://demo.localhost:8000/admin/`  (login: `admin` / `starforge-dev`)
 - `http://demo.localhost:8000/api/schema/swagger-ui/`
-- `POST http://demo.localhost:8000/api/v1/auth/otp/request/  {"identifier":"+998901234567"}`
+- `POST http://demo.localhost:8000/api/v1/auth/login/  {"username":"admin","password":"starforge-dev"}`
 
 ## Tenancy
 - `apps.tenancy.Center` is the tenant model; `apps.tenancy.Domain` maps hostnames.
@@ -56,11 +56,11 @@ Then hit:
 - Channels consumers resolve tenant from hostname before any DB access (`infrastructure/websocket/middleware.py`).
 
 ## Auth
-- JWT everywhere via `djangorestframework-simplejwt` (15-min access, 14-day rotating refresh, Redis denylist via `token_blacklist`).
-- `/admin/` keeps Django sessions enabled.
-- Login = OTP via Eskiz SMS or email. Endpoints: `POST /api/v1/auth/otp/{request,verify}/` → `{access, refresh}`.
-- Phone OR email may be the identifier (`apps.auth.backends.PhoneOrEmailBackend`).
-- OTP throttled per-phone (3/min), per-IP (10/min), and globally (1000/h).
+- JWT everywhere via `djangorestframework-simplejwt` (15-min access, 14-day rotating refresh, blacklist via `token_blacklist`). Tokens are tenant-bound (`schema` claim) and version-bound (`tv` claim) on both the access and refresh paths.
+- **Login = username + password**: `POST /api/v1/auth/login/ {username, password}` → `{access, refresh}`. Throttled per-username (5/min) and per-IP (10/min).
+- **Password reset = OTP** via Eskiz SMS or email: `POST /api/v1/auth/password/reset/{request,confirm}/`. Throttled per-identifier (3/min), per-IP, and globally; responses never reveal whether an account exists.
+- Password change: `POST /api/v1/auth/password/change/` — ends every other session, returns a fresh pair.
+- `/admin/` keeps Django sessions; staff may log in with username, phone, or email (`apps.auth.backends.PhoneOrEmailBackend`).
 
 ## Permissions
 - Role-permission matrix lives in `core/permissions.py`.

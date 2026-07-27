@@ -1,8 +1,9 @@
-"""Authentication backend that accepts phone OR email as the identifier.
+"""Admin-convenience backend: accepts phone OR email (+password) at /admin/.
 
-Used by Django session login (the /admin/ panel) and as a fallback for
-DRF Session auth. The OTP flow does not call this backend — it mints
-JWTs via apps.auth.services.issue_token_pair.
+API login is strictly username+password (apps.auth.services.login_with_password,
+which does its own lookup — it does not call authenticate()). For /admin/,
+Django's stock ModelBackend (listed after this one) handles the username case;
+this backend lets staff type their phone or email instead.
 """
 
 from __future__ import annotations

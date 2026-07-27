@@ -1,0 +1,65 @@
+{% load i18n %}<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Выписка по счёту</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body { font-family: "DejaVu Sans", sans-serif; color: #1a1a1a; font-size: 11pt; }
+    h1 { font-size: 18pt; margin-bottom: 0; }
+    h2 { font-size: 13pt; margin-top: 1.5em; }
+    .meta { color: #555; margin-bottom: 1.5em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5em; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f0f0f0; }
+    td.num, th.num { text-align: right; }
+    .balance { margin-top: 1.5em; font-size: 13pt; font-weight: bold; }
+    .empty { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>Выписка по счёту</h1>
+  <div class="meta">
+    <div>Учащийся: {{ student.user.get_full_name }} ({{ student.student_id }})</div>
+    <div>Дата: {{ generated_on }}</div>
+  </div>
+
+  {% if invoices %}
+  {% for inv in invoices %}
+  <h2>Счёт {{ inv.number }} — {{ inv.get_status_display }} (срок {{ inv.due_date }})</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Описание</th>
+        <th class="num">Кол-во</th>
+        <th class="num">Цена</th>
+        <th class="num">Сумма (сум)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for line in inv.lines.all %}
+      <tr>
+        <td>{{ line.description }}</td>
+        <td class="num">{{ line.quantity }}</td>
+        <td class="num">{{ line.unit_price_uzs }}</td>
+        <td class="num">{{ line.amount_uzs }}</td>
+      </tr>
+      {% endfor %}
+      {% for alloc in inv.allocations.all %}
+      <tr>
+        <td>Поступил платёж (#{{ alloc.payment_id }})</td>
+        <td class="num"></td>
+        <td class="num"></td>
+        <td class="num">-{{ alloc.amount_uzs }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+  {% else %}
+  <p class="empty">Счетов нет.</p>
+  {% endif %}
+
+  <div class="balance">Остаток к оплате: {{ outstanding_uzs }} сум</div>
+</body>
+</html>

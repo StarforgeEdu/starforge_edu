@@ -1,10 +1,19 @@
 from django.urls import path
 
-from .views import JWTLogoutView, JWTRefreshView, OTPRequestView, OTPVerifyView
+from apps.auth.views.v1.auth_views import (
+    login_view,
+    logout_view,
+    password_change_view,
+    password_reset_confirm_view,
+    password_reset_request_view,
+    role_login_view,
+)
 
 urlpatterns = [
-    path("otp/request/", OTPRequestView.as_view(), name="otp-request"),
-    path("otp/verify/", OTPVerifyView.as_view(), name="otp-verify"),
-    path("refresh/", JWTRefreshView.as_view(), name="token-refresh"),
-    path("logout/", JWTLogoutView.as_view(), name="token-logout"),
+    path("login/", login_view, name="login"),
+    path("role-login/", role_login_view, name="role-login"),
+    path("logout/", logout_view, name="logout"),
+    path("password/change/", password_change_view, name="password-change"),
+    path("password/reset/request/", password_reset_request_view, name="password-reset-request"),
+    path("password/reset/confirm/", password_reset_confirm_view, name="password-reset-confirm"),
 ]

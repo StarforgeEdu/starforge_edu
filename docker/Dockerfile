@@ -39,6 +39,11 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --chown=app:app . /app
 
+# TD-17: wire the entrypoint so `docker compose run web <verb>` dispatches
+# (web|daphne|worker|beat|migrate|shell). `migrate` runs shared + tenant.
+RUN chmod +x /app/docker/entrypoint.sh
+
 USER app
 EXPOSE 8000
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--access-logfile", "-"]
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+CMD ["web"]

@@ -1,0 +1,29 @@
+{
+  "method": "CreateTransaction",
+  "description": "Creates (state 1). Idempotent on Payme `id`: re-sending the same id returns the SAME create_time and state, never a second Payment row. `time` and the echoed `create_time` are epoch milliseconds.",
+  "amount_uzs": "150000.00",
+  "amount_tiyin": 15000000,
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "CreateTransaction",
+    "params": {
+      "id": "5e7a0f9b3c2d1a0011223344",
+      "time": 1700000000000,
+      "amount": 15000000,
+      "account": {"order_id": "INV-2026-000001"}
+    }
+  },
+  "expected_result": {
+    "transaction": "1",
+    "state": 1,
+    "create_time": 1700000000000
+  },
+  "state_after": 1,
+  "errors": {
+    "amount_mismatch": -31001,
+    "unknown_account": -31050,
+    "already_in_progress_other_txn": -31099,
+    "auth_failed": -32504
+  }
+}

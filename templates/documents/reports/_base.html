@@ -1,0 +1,40 @@
+{% load i18n report_extras %}<!doctype html>
+<html lang="{{ LANGUAGE_CODE }}">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}{{ report_title }}{% endblock %}</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body { font-family: "DejaVu Sans", sans-serif; color: #1a1a1a; font-size: 11pt; }
+    h1 { font-size: 18pt; margin-bottom: 0.2em; }
+    .meta { color: #555; margin-bottom: 1.2em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5em; }
+    th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; font-size: 10pt; }
+    th { background: #f0f0f0; }
+    .summary { margin-top: 1.2em; font-size: 12pt; }
+    .summary strong { font-weight: bold; }
+    .empty { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>{% block heading %}{{ report_title }}{% endblock %}</h1>
+  <div class="meta">{% trans "Generated" %}: {% now "Y-m-d H:i" %}</div>
+
+  {% block summary %}{% endblock %}
+
+  {% if data.rows %}
+  <table>
+    <thead>
+      <tr>{% for col in data.columns %}<th>{{ col }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+      {% for row in data.rows %}
+      <tr>{% for col in data.columns %}<td>{{ row|dictkey:col }}</td>{% endfor %}</tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">{% trans "No data for the selected parameters." %}</p>
+  {% endif %}
+</body>
+</html>

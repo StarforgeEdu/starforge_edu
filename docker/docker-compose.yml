@@ -47,7 +47,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: starforge:dev
-    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--reload", "--access-logfile", "-"]
+    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--reload", "--access-logfile", "-", "--access-logformat", "%(h)s %(m)s %(s)s %(L)s"]
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.development
       DATABASE_URL: postgres://starforge:starforge@postgres:5432/starforge

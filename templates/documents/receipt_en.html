@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Payment Receipt</title>
+  <style>
+    @page { size: A5; margin: 1.5cm; }
+    body { font-family: "DejaVu Sans", sans-serif; color: #1a1a1a; font-size: 11pt; }
+    h1 { font-size: 16pt; margin-bottom: 0; }
+    .meta { color: #555; margin-bottom: 1em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1em; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f0f0f0; }
+    .total { font-weight: bold; }
+    .qr { margin-top: 1.5em; color: #444; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>Payment Receipt</h1>
+  <div class="meta">
+    <div>Payment #: {{ payment.id }}</div>
+    <div>Provider: {{ payment.get_provider_display }}</div>
+    <div>Reference: {{ payment.account_ref }}</div>
+    <div>Paid at: {{ payment.paid_at }}</div>
+  </div>
+
+  <table>
+    <tr><th>Amount (UZS)</th><td class="total">{{ payment.amount_uzs }}</td></tr>
+    <tr><th>Status</th><td>{{ payment.get_status_display }}</td></tr>
+    <tr><th>Fiscal sign</th><td>{{ receipt.fiscal_sign }}</td></tr>
+  </table>
+
+  {% if receipt.qr_url %}
+  <div class="qr">Verify: {{ receipt.qr_url }}</div>
+  {% endif %}
+</body>
+</html>

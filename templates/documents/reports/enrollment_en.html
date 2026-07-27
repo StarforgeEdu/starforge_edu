@@ -1,0 +1,7 @@
+{% extends "documents/reports/_base.html" %}
+{% load i18n %}
+{% block title %}{% trans "Enrollment report" %}{% endblock %}
+{% block heading %}{% trans "Enrollment report" %}{% endblock %}
+{% block summary %}
+<div class="summary"><strong>{% trans "Total students" %}:</strong> {{ data.total }}</div>
+{% endblock %}
