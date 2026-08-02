@@ -111,7 +111,7 @@ jobs:
           docker run --rm --entrypoint python \
             -e SECRET_KEY='ci-only-production-check-secret-key-0000000000000000000000000000' \
             -e ALLOWED_HOSTS='example.invalid' \
-            -e FIELD_ENCRYPTION_KEY='MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=' \
+            -e FIELD_ENCRYPTION_KEY='sxHcPTH6vnzsZ0_HSYTjWsQssumrpoqqlXn7dlR8RB0=' \
             -e NUM_PROXIES='1' \
             -e DATABASE_URL='postgres://ci:ci@127.0.0.1:5432/ci' \
             -e REDIS_URL='redis://127.0.0.1:6379/0' \
@@ -126,6 +126,7 @@ jobs:
             -e AWS_EC2_METADATA_DISABLED='true' \
             -e STATIC_STORAGE_WRITE_ENABLED='False' \
             -e EMAIL_HOST='smtp.example.invalid' \
+            -e EMAIL_USE_TLS='True' \
             -e ESKIZ_EMAIL='ci@example.invalid' \
             -e ESKIZ_PASSWORD="$GITHUB_RUN_ID" \
             -e ESKIZ_FROM='ci' \
