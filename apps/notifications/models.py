@@ -337,6 +337,10 @@ class NotificationDelivery(models.Model):
         ordering = ("-created_at",)
         indexes = [
             models.Index(fields=("notification", "channel")),
+            models.Index(
+                fields=("status", "created_at"),
+                name="notif_delivery_status_created_idx",
+            ),
             # Push dead-token tracking looks up the newest three attempts for one
             # provider device id. The id lives in JSON, so the ordinary delivery
             # indexes cannot support that equality + newest-first query; without

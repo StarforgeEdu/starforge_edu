@@ -28,8 +28,7 @@ def validate_exact_https_origins(name: str, origins: Sequence[str]) -> tuple[str
             or origin != origin.strip()
             or "\\" in origin
             or any(
-                character.isspace() or ord(character) < 32 or ord(character) == 127
-                for character in origin
+                character.isspace() or ord(character) < 32 or ord(character) == 127 for character in origin
             )
         ):
             raise ImproperlyConfigured(f"{name}[{index}] is not a valid exact HTTPS origin.")

@@ -350,7 +350,7 @@ def _validate_query(request: HttpRequest, *, allowed: frozenset[str]) -> None:
 
 def _bounded_param(request: HttpRequest, name: str, *, max_length: int) -> str | None:
     raw = request.GET.get(name)
-    if raw in (None, ""):
+    if raw is None or raw == "":
         return None
     if len(raw) > max_length:
         raise ValidationException(

@@ -13,6 +13,7 @@ from apps.finance.models import (
     FeeSchedule,
     Invoice,
     PaymentMethod,
+    StatementExport,
 )
 
 
@@ -41,6 +42,14 @@ class IInvoiceRepository(ABC):
         roles: set[str],
         permission: str = "finance:read",
     ) -> Invoice | None: ...
+
+
+class IStatementExportRepository(ABC):
+    @abstractmethod
+    def query(self) -> QuerySet[StatementExport]: ...
+
+    @abstractmethod
+    def get(self, pk) -> StatementExport | None: ...
 
 
 class IDiscountRepository(ABC):

@@ -39,4 +39,11 @@ class Migration(migrations.Migration):
                 name="notif_one_provider_contact_per_destination",
             ),
         ),
+        migrations.AddIndex(
+            model_name="notificationdelivery",
+            index=models.Index(
+                fields=["status", "created_at"],
+                name="notif_delivery_status_created_idx",
+            ),
+        ),
     ]

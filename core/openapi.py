@@ -442,6 +442,7 @@ def _components() -> dict:
     # DTOs and response envelopes validated against the registered callbacks.
     from apps.ai.openapi_contracts import OPENAPI_SCHEMAS as AI_SCHEMAS
     from apps.audit.openapi_contracts import OPENAPI_SCHEMAS as AUDIT_SCHEMAS
+    from apps.finance.openapi_contracts import OPENAPI_SCHEMAS as FINANCE_SCHEMAS
     from apps.forms.openapi_contracts import OPENAPI_SCHEMAS as FORM_SCHEMAS
     from apps.meetings.openapi_contracts import OPENAPI_SCHEMAS as MEETING_SCHEMAS
     from apps.payroll.openapi_contracts import PAYROLL_SCHEMAS
@@ -454,6 +455,7 @@ def _components() -> dict:
         AI_SCHEMAS,
         AUDIT_SCHEMAS,
         FORM_SCHEMAS,
+        FINANCE_SCHEMAS,
         MEETING_SCHEMAS,
         PAYROLL_SCHEMAS,
         STUDENT_SCHEMAS,

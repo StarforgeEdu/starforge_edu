@@ -27,7 +27,10 @@ from core.role_principals import PRINCIPAL_KINDS, RolePrincipal
 from core.utils import client_ip, user_agent
 
 if TYPE_CHECKING:
+    from django.http import HttpRequest
     from rest_framework.request import Request
+
+    type AuditRequest = HttpRequest | Request
 
 # Field names whose values must never be written in plaintext to an audit row.
 # Encrypted-at-rest PII (TD-11) + all provider credentials + raw passwords.
@@ -146,7 +149,7 @@ def audit_log(
     resource_id: str | int = "",
     before: dict[str, Any] | None = None,
     after: dict[str, Any] | None = None,
-    request: Request | None = None,
+    request: AuditRequest | None = None,
     ip: str | None = None,
     user_agent: str | None = None,
     scope: AuditScopeSnapshot | None = None,
@@ -190,7 +193,7 @@ def _build_audit_log(
     resource_id: str | int = "",
     before: dict[str, Any] | None = None,
     after: dict[str, Any] | None = None,
-    request: Request | None = None,
+    request: AuditRequest | None = None,
     ip: str | None = None,
     user_agent: str | None = None,
     scope: AuditScopeSnapshot | None = None,
@@ -288,7 +291,7 @@ def _actor_repr(actor: Any) -> str:
 def _actor_attribution(
     *,
     actor: Any,
-    request: Request | None,
+    request: AuditRequest | None,
     actor_principal: RolePrincipal | None,
 ) -> tuple[str, str, int | None]:
     """Return a fail-closed immutable actor snapshot.
@@ -349,7 +352,7 @@ def _actor_attribution(
     return AuditLog.ActorAttributionStatus.UNRESOLVED, "", None
 
 
-def _user_agent(request: Request) -> str:
+def _user_agent(request: AuditRequest) -> str:
     # Re-export the core helper under a private name so the public kwarg
     # `user_agent` can shadow it in this module without a recursion hazard.
     return user_agent_from_request(request)

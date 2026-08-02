@@ -130,7 +130,9 @@ class PayrollRepository(IPayrollRepository):
                 PayrollPeriod.Status.APPROVED,
                 PayrollPeriod.Status.PAYMENT_IN_PROGRESS,
             ),
-            outstanding_amount_uzs__gt=0,
+            # Correlated annotation installed by ``_lines``; django-stubs only
+            # knows concrete PayrollLineItem fields.
+            outstanding_amount_uzs__gt=0,  # type: ignore[misc]
         )
         return _scope(
             queryset,

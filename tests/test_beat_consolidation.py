@@ -56,6 +56,9 @@ CANONICAL_BEAT_TASKS: dict[str, str] = {
     "reconcile-deferred-notification-deliveries": (
         "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries"
     ),
+    "reconcile-stale-provider-delivery-claims": (
+        "celery_tasks.notification_tasks.reconcile_stale_provider_delivery_claims"
+    ),
 }
 
 

@@ -15,10 +15,7 @@ def test_finance_statement_cache_reuse_accepts_only_exact_task_output():
         "invoice_ids": [2, 9],
     }
 
-    assert (
-        _trusted_cached_statement(valid, schema=schema, student_id=17, requested_by_id=8)
-        == key
-    )
+    assert _trusted_cached_statement(valid, schema=schema, student_id=17, requested_by_id=8) == key
     assert (
         _trusted_cached_statement(
             {**valid, "key": f"another/documents/{key.rsplit('/', 1)[-1]}"},

@@ -17,6 +17,7 @@ from django.utils.translation import gettext_lazy as _
 
 from apps.finance import selectors
 from apps.finance import services as domain
+from apps.finance.dto import StatementExportRequestDTO
 from apps.finance.interfaces.repositories import (
     ICashierShiftRepository,
     IDiscountRepository,
@@ -24,6 +25,7 @@ from apps.finance.interfaces.repositories import (
     IFeeScheduleRepository,
     IInvoiceRepository,
     IPaymentMethodRepository,
+    IStatementExportRepository,
 )
 from apps.finance.interfaces.services import IFinanceService
 from apps.finance.models import (
@@ -35,8 +37,10 @@ from apps.finance.models import (
     PaymentMethod,
     PaymentPlan,
     Refund,
+    StatementExport,
 )
 from core.exceptions import ValidationException
+from core.role_principals import RolePrincipal
 
 
 class FinanceService(IFinanceService):
@@ -48,6 +52,7 @@ class FinanceService(IFinanceService):
         payment_method_repository: IPaymentMethodRepository,
         expense_repository: IExpenseRepository,
         cashier_shift_repository: ICashierShiftRepository,
+        statement_export_repository: IStatementExportRepository,
     ) -> None:
         self._fee = fee_schedule_repository
         self._inv = invoice_repository
@@ -55,6 +60,7 @@ class FinanceService(IFinanceService):
         self._pm = payment_method_repository
         self._exp = expense_repository
         self._shift = cashier_shift_repository
+        self._statement = statement_export_repository
 
     # --- fee schedules ---
     def fee_schedules(self) -> QuerySet[FeeSchedule]:
@@ -264,3 +270,28 @@ class FinanceService(IFinanceService):
 
     def parent_can_see_student(self, *, user, student_id: int) -> bool:
         return selectors.parent_can_see_student(user=user, student_id=student_id)
+
+    # --- durable statements ---
+    def request_statement_export(
+        self,
+        *,
+        student_id: int,
+        requested_by,
+        principal: RolePrincipal,
+        dto: StatementExportRequestDTO,
+    ) -> tuple[StatementExport, bool]:
+        return domain.request_statement_export(
+            student_id=student_id,
+            requested_by=requested_by,
+            principal=principal,
+            locale=dto.locale,
+        )
+
+    def statement_export(self, pk) -> StatementExport | None:
+        return self._statement.get(pk)
+
+    def statement_export_is_visible(self, export: StatementExport) -> bool:
+        return domain.statement_export_is_visible(export)
+
+    def statement_export_download_url(self, export: StatementExport) -> str | None:
+        return domain.presign_statement_export(export)

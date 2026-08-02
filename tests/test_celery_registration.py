@@ -28,9 +28,7 @@ def test_every_project_task_uses_the_durable_at_least_once_contract():
 
     app.loader.import_default_modules()
     app.finalize()
-    project_tasks = {
-        name: task for name, task in app.tasks.items() if name.startswith("celery_tasks.")
-    }
+    project_tasks = {name: task for name, task in app.tasks.items() if name.startswith("celery_tasks.")}
     assert project_tasks
     for name, task in project_tasks.items():
         assert task.acks_late is True, name

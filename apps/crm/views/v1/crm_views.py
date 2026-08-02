@@ -761,6 +761,8 @@ def follow_up_register_view(request: HttpRequest) -> HttpResponse:
             },
         )
     if assignee_kind is not None:
+        # Pair validation above proves both values are present together.
+        assert assignee_id is not None
         if assignee_kind not in STAFF_PRINCIPAL_KINDS:
             raise ValidationException(
                 "Invalid assignee kind.", fields={"assignee_kind": ["Must be staff or teacher."]}
@@ -956,10 +958,10 @@ def _duplicate_review(request: HttpRequest, pk: int, action: str, body: dict[str
         "idempotency_key": idempotency_key(request),
     }
     if action == "merge":
-        result, replayed = _service().merge_duplicate(pk, dto, **kwargs)
-        return _mutation_response(merge_to_dict(result), replayed=replayed)
-    result, replayed = _service().dismiss_duplicate(pk, dto, **kwargs)
-    return _mutation_response(duplicate_to_dict(result), replayed=replayed)
+        merge, replayed = _service().merge_duplicate(pk, dto, **kwargs)
+        return _mutation_response(merge_to_dict(merge), replayed=replayed)
+    candidate, replayed = _service().dismiss_duplicate(pk, dto, **kwargs)
+    return _mutation_response(duplicate_to_dict(candidate), replayed=replayed)
 
 
 @openapi_contract(

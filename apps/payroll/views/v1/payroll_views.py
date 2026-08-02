@@ -86,7 +86,7 @@ def _service() -> IPayrollService:
 
 
 def _roles(request: HttpRequest):
-    return get_user_roles(request)  # type: ignore[arg-type]
+    return get_user_roles(request)
 
 
 def _principal(request: HttpRequest):
@@ -400,11 +400,14 @@ def period_lines_view(request: HttpRequest, pk: int) -> HttpResponse:
     payment_state = request.GET.get("payment_state")
     if payment_state:
         if payment_state == "unpaid":
-            queryset = queryset.filter(paid_amount_uzs=0)
+            queryset = queryset.filter(paid_amount_uzs=0)  # type: ignore[misc]
         elif payment_state == "paid":
-            queryset = queryset.filter(outstanding_amount_uzs=0)
+            queryset = queryset.filter(outstanding_amount_uzs=0)  # type: ignore[misc]
         elif payment_state == "partial":
-            queryset = queryset.filter(paid_amount_uzs__gt=0, outstanding_amount_uzs__gt=0)
+            queryset = queryset.filter(  # type: ignore[misc]
+                paid_amount_uzs__gt=0,
+                outstanding_amount_uzs__gt=0,
+            )
         else:
             raise ValidationException(
                 code="validation_error",

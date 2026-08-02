@@ -1,3 +1,26 @@
 # Historical test-only idempotency label. The fingerprint pins the exception to
 # one finding, file, line, rule, and commit; it cannot suppress a future secret.
 c02d293b3871cf1a64b67eeef7146a7a3f2457aa:apps/payments/tests/test_payment_integrity.py:generic-api-key:206
+
+# Deterministic CI-only Fernet fixture. It is derived from a public label and
+# cannot protect data; production rejects the known development keys separately.
+88c4cc4c927f28a9953e934b49972c86bbf7122d:.github/workflows/ci.yml:generic-api-key:114
+
+# Migration identifiers and test-only idempotency/password fixtures. These
+# exact-fingerprint entries cannot suppress a finding at another commit/line.
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/access/migrations/0005_protect_owner_authority.py:generic-api-key:115
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/access/tests/test_owner_authority_migration.py:generic-api-key:14
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/crm/tests/test_duplicates_and_funnel.py:generic-api-key:74
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/payroll/tests/test_http_security.py:generic-api-key:182
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/payroll/tests/test_workflow.py:generic-api-key:130
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:178
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_compensation_permissions.py:generic-api-key:168
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/tenancy/management/commands/check_safeguarding_encryption_cutover.py:generic-api-key:21
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:401
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:407
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:413
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:500
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:509
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:apps/teachers/tests/test_payout.py:generic-api-key:515
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:tests/test_principal_membership_isolation.py:generic-api-key:16
+007b90f9daf8ec5b7f1aa86ff381efd64b9b4ded:tests/test_session_bootstrap_contract.py:generic-api-key:20

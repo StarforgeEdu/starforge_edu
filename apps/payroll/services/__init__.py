@@ -8,7 +8,7 @@ import json
 import logging
 from collections import defaultdict
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db import transaction
@@ -526,17 +526,20 @@ def _preview(period: PayrollPeriod, filters: PreviewFilterDTO, *, lock: bool = F
     # also provide historical cohort attribution for percentage-of-tuition
     # policies.  Current CohortTeacher/primary_teacher assignments have no
     # effective dates and would let a later reassignment rewrite old payroll.
-    lesson_groups = list(
-        Lesson.objects.filter(
-            teacher_id__in=teacher_ids,
-            status=Lesson.Status.COMPLETED,
-            starts_at__gte=start_dt,
-            starts_at__lt=end_dt,
-        )
-        .values("teacher_id", "cohort_id")
-        .annotate(total=Sum(F("ends_at") - F("starts_at")))
-        .order_by("teacher_id", "cohort_id")
-        .values_list("teacher_id", "cohort_id", "total")[: MAX_PAYROLL_LESSON_GROUPS + 1]
+    lesson_groups = cast(
+        list[tuple[int, int, dt.timedelta]],
+        list(
+            Lesson.objects.filter(
+                teacher_id__in=teacher_ids,
+                status=Lesson.Status.COMPLETED,
+                starts_at__gte=start_dt,
+                starts_at__lt=end_dt,
+            )
+            .values("teacher_id", "cohort_id")
+            .annotate(total=Sum(F("ends_at") - F("starts_at")))
+            .order_by("teacher_id", "cohort_id")
+            .values_list("teacher_id", "cohort_id", "total")[: MAX_PAYROLL_LESSON_GROUPS + 1]
+        ),
     )
     if len(lesson_groups) > MAX_PAYROLL_LESSON_GROUPS:
         raise UnprocessableEntity(
@@ -549,16 +552,19 @@ def _preview(period: PayrollPeriod, filters: PreviewFilterDTO, *, lock: bool = F
         durations[teacher_id] += duration
         cohorts_by_teacher[teacher_id].add(cohort_id)
     all_cohort_ids = {cohort_id for values in cohorts_by_teacher.values() for cohort_id in values}
-    allocation_groups = list(
-        PaymentAllocation.objects.filter(
-            invoice__cohort_id__in=all_cohort_ids,
-            created_at__gte=start_dt,
-            created_at__lt=end_dt,
-        )
-        .values("invoice_id", "invoice__cohort_id")
-        .annotate(total=Sum("amount_uzs"))
-        .order_by("invoice_id")
-        .values_list("invoice_id", "invoice__cohort_id", "total")[: MAX_PAYROLL_ALLOCATION_GROUPS + 1]
+    allocation_groups = cast(
+        list[tuple[int, int, Decimal]],
+        list(
+            PaymentAllocation.objects.filter(
+                invoice__cohort_id__in=all_cohort_ids,
+                created_at__gte=start_dt,
+                created_at__lt=end_dt,
+            )
+            .values("invoice_id", "invoice__cohort_id")
+            .annotate(total=Sum("amount_uzs"))
+            .order_by("invoice_id")
+            .values_list("invoice_id", "invoice__cohort_id", "total")[: MAX_PAYROLL_ALLOCATION_GROUPS + 1]
+        ),
     )
     if len(allocation_groups) > MAX_PAYROLL_ALLOCATION_GROUPS:
         raise UnprocessableEntity(
@@ -623,6 +629,7 @@ def _preview(period: PayrollPeriod, filters: PreviewFilterDTO, *, lock: bool = F
         if policy is None:
             errors.append({"teacher": teacher.pk, "code": "no_payout_policy"})
             continue
+        breakdown: dict[str, Any]
         try:
             if policy.method == PayoutPolicy.Method.HOURLY:
                 duration = durations.get(teacher.pk) or dt.timedelta()
@@ -662,6 +669,7 @@ def _preview(period: PayrollPeriod, filters: PreviewFilterDTO, *, lock: bool = F
                     "attribution": "completed_lesson_cohorts",
                 }
             elif policy.method == PayoutPolicy.Method.FLAT_MONTHLY:
+                assert start_dt.tzinfo is not None
                 _validate_flat_month(period.period_start, period.period_end, tz=start_dt.tzinfo)
                 amount = policy.flat_amount_uzs
                 if amount is None or not amount.is_finite() or amount <= 0:
@@ -1968,11 +1976,14 @@ def _export_rows(export: PayrollExport) -> list[dict[str, Any]]:
     for line in queryset[: MAX_PAYROLL_TEACHERS + 1]:
         paid = sum(
             (
-                reconciliation.amount_uzs
-                if reconciliation.kind == PayrollReconciliation.Kind.PAYMENT
-                else -reconciliation.amount_uzs
-            )
-            for reconciliation in line.reconciliations.all()
+                (
+                    reconciliation.amount_uzs
+                    if reconciliation.kind == PayrollReconciliation.Kind.PAYMENT
+                    else -reconciliation.amount_uzs
+                )
+                for reconciliation in line.reconciliations.all()
+            ),
+            Decimal("0"),
         )
         state = "unpaid" if paid == 0 else "paid" if paid == line.net_amount_uzs else "partial"
         if payment_state and state != payment_state:

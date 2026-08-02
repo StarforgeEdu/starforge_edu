@@ -13,8 +13,9 @@ from apps.ai.models import AIRequest, TenantAIBudget
 from apps.ai.services import (
     AIBudgetExceeded,
     Usage,
+    begin_provider_attempt,
     cost_microusd,
-    record_usage,
+    record_provider_completion,
 )
 from apps.ai.services import (
     check_and_reserve_budget as _check_and_reserve_budget,
@@ -22,6 +23,9 @@ from apps.ai.services import (
 from apps.ai.tests.factories import AIPromptFactory, make_budget
 from apps.assignments.models import Submission
 from apps.assignments.tests.factories import SubmissionFactory
+from apps.users.models import RoleMembership
+from core.permissions import Role
+from core.role_principals import RolePrincipal
 
 pytestmark = pytest.mark.django_db
 
@@ -38,8 +42,36 @@ def check_and_reserve_budget(**kwargs):
     submission = Submission.objects.select_related("student__user").filter(
         pk=source_id
     ).first() or SubmissionFactory(pk=source_id)
+    RoleMembership.objects.get_or_create(
+        user=submission.student.user,
+        branch=submission.assignment.cohort.branch,
+        department=None,
+        role=Role.STUDENT,
+    )
+    submission.student.user.refresh_from_db()
     kwargs["requested_by"] = submission.student.user
+    kwargs["requested_principal"] = RolePrincipal(
+        kind="student",
+        principal_id=submission.student_id,
+        user_id=submission.student.user_id,
+    )
     return _check_and_reserve_budget(**kwargs)
+
+
+def _record_provider_usage(request: AIRequest, usage: Usage) -> None:
+    """Move a reserved request through the durable provider-receipt boundary."""
+
+    request.status = AIRequest.Status.RUNNING
+    request.celery_task_id = f"budget-test-{request.pk}"
+    request.save(update_fields=["status", "celery_task_id"])
+    begin_provider_attempt(ai_request_id=request.pk, task_id=request.celery_task_id)
+    record_provider_completion(
+        ai_request_id=request.pk,
+        usage=usage,
+        output="bounded test output",
+        provider_request_id=f"provider-budget-test-{request.pk}",
+        provider_stop_reason="end_turn",
+    )
 
 
 def test_reserve_creates_queued_request(tenant_a):
@@ -88,7 +120,11 @@ def test_over_daily_budget_denies_and_records(tenant_a):
 def test_over_monthly_budget_denies(tenant_a):
     _seed(tenant_a)
     with schema_context(tenant_a.schema_name):
-        make_budget(daily_token_limit=100_000, monthly_token_limit=100)
+        make_budget(
+            daily_token_limit=100_000,
+            monthly_token_limit=100_000,
+            tokens_used_month=99_900,
+        )
         with pytest.raises(AIBudgetExceeded):
             check_and_reserve_budget(
                 feature="assignment_feedback",
@@ -132,11 +168,9 @@ def test_record_usage_bumps_counters_atomically(tenant_a):
         req = check_and_reserve_budget(
             feature="assignment_feedback", estimated_tokens=10, source_app="assignments", source_id=6
         )
-        req.status = AIRequest.Status.RUNNING
-        req.save(update_fields=["status"])
-        record_usage(
-            ai_request_id=req.pk,
-            usage=Usage(
+        _record_provider_usage(
+            req,
+            Usage(
                 input_tokens=120,
                 output_tokens=80,
                 cache_read_tokens=30,
@@ -160,15 +194,18 @@ def test_record_usage_no_double_count_on_terminal(tenant_a):
         req = check_and_reserve_budget(
             feature="assignment_feedback", estimated_tokens=10, source_app="assignments", source_id=7
         )
-        req.status = AIRequest.Status.RUNNING
-        req.save(update_fields=["status"])
         usage = Usage(input_tokens=100, output_tokens=100)
-        record_usage(ai_request_id=req.pk, usage=usage)
+        _record_provider_usage(req, usage)
         req.refresh_from_db()
-        req.status = AIRequest.Status.SUCCEEDED
-        req.save(update_fields=["status"])
-        # A retry after success must not double-count.
-        record_usage(ai_request_id=req.pk, usage=usage)
+        # A duplicate provider completion reuses the durable receipt and must
+        # not reconcile the same usage twice.
+        record_provider_completion(
+            ai_request_id=req.pk,
+            usage=usage,
+            output="different retry output",
+            provider_request_id="different-retry-receipt",
+            provider_stop_reason="end_turn",
+        )
         budget = TenantAIBudget.objects.get(pk=1)
         assert budget.tokens_used_today == 200
 
@@ -186,10 +223,10 @@ def test_day_anchor_rolls_over(tenant_a):
         # the counter at 9000 — so landing on exactly the 5000 reservation shows
         # the day rolled over.)
         check_and_reserve_budget(
-            feature="assignment_feedback", estimated_tokens=5_000, source_app="assignments", source_id=8
+            feature="assignment_feedback", estimated_tokens=4_000, source_app="assignments", source_id=8
         )
         budget.refresh_from_db()
-        assert budget.tokens_used_today == 5_000  # reset to 0, then 5000 reserved
+        assert budget.tokens_used_today == 4_000  # reset to 0, then 4000 reserved
         assert budget.day_anchor == timezone.localdate()
 
 
@@ -199,21 +236,21 @@ def test_month_anchor_rolls_over():
 
     with time_machine.travel("2026-02-15", tick=False), schema_context("tenant_a"):
         AIPromptFactory()
-        budget = make_budget(daily_token_limit=1_000_000, monthly_token_limit=10_000)
+        budget = make_budget(daily_token_limit=10_000, monthly_token_limit=10_000)
         budget.tokens_used_month = 9_000
         budget.month_anchor = timezone.localdate()
         budget.save()
     with time_machine.travel("2026-03-01", tick=False), schema_context("tenant_a"):
         check_and_reserve_budget(
             feature="assignment_feedback",
-            estimated_tokens=5_000,
+            estimated_tokens=4_000,
             source_app="assignments",
             source_id=9,
         )
         budget = TenantAIBudget.objects.get(pk=1)
         # Reset to 0 on the month rollover, then 5000 reserved (without the reset,
         # 9000+5000 would exceed the 10000 monthly cap and be denied → stay 9000).
-        assert budget.tokens_used_month == 5_000
+        assert budget.tokens_used_month == 4_000
 
 
 def test_cost_microusd_uses_settings():

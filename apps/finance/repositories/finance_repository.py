@@ -13,6 +13,7 @@ from apps.finance.interfaces.repositories import (
     IFeeScheduleRepository,
     IInvoiceRepository,
     IPaymentMethodRepository,
+    IStatementExportRepository,
 )
 from apps.finance.models import (
     CashierShift,
@@ -21,6 +22,7 @@ from apps.finance.models import (
     FeeSchedule,
     Invoice,
     PaymentMethod,
+    StatementExport,
 )
 from core.repositories import BaseRepository
 
@@ -68,6 +70,22 @@ class InvoiceRepository(BaseRepository[Invoice], IInvoiceRepository):
             .filter(pk=pk)
             .first()
         )
+
+
+class StatementExportRepository(
+    BaseRepository[StatementExport],
+    IStatementExportRepository,
+):
+    model = StatementExport
+
+    def query(self) -> QuerySet[StatementExport]:
+        return StatementExport.objects.select_related(
+            "student__user",
+            "requested_by",
+        ).prefetch_related("invoice_links")
+
+    def get(self, pk) -> StatementExport | None:
+        return self.query().filter(pk=pk).first()
 
 
 class DiscountRepository(BaseRepository[Discount], IDiscountRepository):

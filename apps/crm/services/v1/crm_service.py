@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 
 from django.apps import apps as django_apps
 from django.db import IntegrityError, connection, transaction
-from django.db.models import Count, Q, QuerySet
+from django.db.models import Count, Model, Q, QuerySet
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -124,11 +124,13 @@ def _selected_principal(owner: LeadOwnerDTO, *, branch_id: int, department_id: i
 
 
 def _state_for_stage(stage: PipelineStage) -> str:
-    return {
-        PipelineStage.Category.OPEN: CRMLead.State.OPEN,
-        PipelineStage.Category.WON: CRMLead.State.WON,
-        PipelineStage.Category.LOST: CRMLead.State.LOST,
-    }[stage.category]
+    if stage.category == PipelineStage.Category.OPEN:
+        return CRMLead.State.OPEN
+    if stage.category == PipelineStage.Category.WON:
+        return CRMLead.State.WON
+    if stage.category == PipelineStage.Category.LOST:
+        return CRMLead.State.LOST
+    raise RuntimeError("Unsupported CRM pipeline-stage category")
 
 
 class CRMService(ICRMService):
@@ -1484,6 +1486,7 @@ class CRMService(ICRMService):
         """
 
         lead_qs = self._repository.scoped_leads(scope=scope)
+        result: Model | None
         if record.result_type == "stage":
             result = PipelineStage.objects.filter(pk=record.result_id).first()
         elif record.result_type == "source":

@@ -395,6 +395,8 @@ def test_audit_actions_are_bounded_to_the_documented_registry(tenant_a):
 
         with pytest.raises(ValueError, match="documented audit action"):
             audit_log(action="print.job_reconcilation_typo")
+
+
 # --------------------------------------------------------------------------- #
 
 

@@ -4,7 +4,6 @@ import re
 
 import pytest
 from django.conf import settings
-from django.contrib.auth.hashers import is_password_usable
 from django.test import RequestFactory
 from django_tenants.utils import schema_context
 
@@ -365,7 +364,9 @@ def test_session_hash_bulk_cutover_is_post_readiness_not_a_schema_migration():
     assert readiness_gate < cutover < release_marker
 
 
-def test_profile_delete_disables_bridge_grants_devices_and_sessions(tenant_a):
+def test_profile_delete_is_protected_without_mutating_access(tenant_a):
+    from django.db.models.deletion import ProtectedError
+
     from apps.org.tests.factories import BranchFactory
     from apps.students.tests.factories import StudentProfileFactory
     from apps.users.models import Device, RoleMembership, Session, User
@@ -386,17 +387,20 @@ def test_profile_delete_disables_bridge_grants_devices_and_sessions(tenant_a):
             principal_id=student.pk,
         )
 
-        student.delete()  # exercises the shared pre-delete safety net
+        # Role identities are immutable history.  Deactivation is the only
+        # supported lifecycle operation; a rejected delete must not partially
+        # revoke credentials as an incidental pre-delete side effect.
+        with pytest.raises(ProtectedError, match="identity history cannot be deleted"):
+            student.delete()
 
         bridge = User.objects.get(pk=user_id)
         membership.refresh_from_db()
         device.refresh_from_db()
         stored_session = Session.objects.get(pk=session.pk)
-        assert bridge.is_active is False
-        assert not is_password_usable(bridge.password)
-        assert membership.revoked_at is not None
-        assert device.revoked_at is not None
-        assert stored_session.revoked_at is not None
+        assert bridge.is_active is True
+        assert membership.revoked_at is None
+        assert device.revoked_at is None
+        assert stored_session.revoked_at is None
 
 
 def test_profile_deactivation_revokes_bridge_grants_and_sessions(tenant_a):

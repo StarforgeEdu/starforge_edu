@@ -18,12 +18,17 @@ def _object(
     required: tuple[str, ...] | None = None,
     nullable: bool = False,
 ) -> dict[str, Any]:
+    required_fields = list(required if required is not None else properties)
     schema: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": properties,
-        "required": list(required if required is not None else properties),
     }
+    # OpenAPI 3.0 requires ``required`` to contain at least one item whenever
+    # the keyword is present.  Optional PATCH/action DTOs are still closed
+    # objects, but must omit the keyword instead of publishing ``required: []``.
+    if required_fields:
+        schema["required"] = required_fields
     if nullable:
         schema["nullable"] = True
     return schema

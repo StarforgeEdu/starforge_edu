@@ -30,19 +30,28 @@ def test_push_device_history_has_targeted_expression_index():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_concurrent_delivery_workers_serialize_on_notification_row(tenant_a, monkeypatch):
-    """Duplicate workers cannot both emit the same non-push channel."""
+def test_concurrent_delivery_workers_share_one_durable_provider_claim(tenant_a, monkeypatch):
+    """Duplicate workers can contact an external provider only once."""
     from concurrent.futures import ThreadPoolExecutor
-    from concurrent.futures import TimeoutError as FutureTimeout
     from threading import Event
+    from uuid import uuid4
 
     from django.db import close_old_connections
 
     import celery_tasks.notification_tasks as nt
     from apps.notifications.models import Channel, Notification, NotificationDelivery
+    from apps.notifications.tests.helpers import ensure_notification_principal
+    from apps.users.tests.factories import UserFactory
 
-    user = _user_with_phone(tenant_a)
     with schema_context(tenant_a.schema_name):
+        discriminator = uuid4().hex
+        user = ensure_notification_principal(
+            UserFactory(
+                username=f"claim-{discriminator}",
+                phone=f"+99891{int(discriminator[:8], 16) % 10_000_000:07d}",
+                email=f"claim-{discriminator}@example.com",
+            )
+        )
         notification = Notification.objects.create(
             user=user,
             event_type="attendance.absent",
@@ -51,31 +60,26 @@ def test_concurrent_delivery_workers_serialize_on_notification_row(tenant_a, mon
         )
         notification_id = notification.pk
 
-    first_holds_lock = Event()
+    first_contact_started = Event()
     release_first = Event()
-    second_started = Event()
-    delivery_calls: list[int] = []
+    provider_calls: list[str] = []
 
-    def slow_delivery(notification, channel, _context, _render_template):
-        delivery_calls.append(notification.pk)
-        nt._record(notification, channel, NotificationDelivery.Status.SENT)
-        first_holds_lock.set()
-        if not release_first.wait(timeout=10):
-            raise RuntimeError("test timed out waiting to release the first delivery")
-        return "sent"
+    class SlowProvider:
+        def send(self, *, phone, text):
+            provider_calls.append(phone)
+            first_contact_started.set()
+            if not release_first.wait(timeout=10):
+                raise RuntimeError("test timed out waiting to release the first delivery")
+            return {"status": "accepted", "message_id": "provider-1"}
 
-    monkeypatch.setattr(nt, "_deliver", slow_delivery)
+    monkeypatch.setattr("infrastructure.sms.eskiz_client.get_sms_client", lambda: SlowProvider())
 
-    def deliver(*, mark_started: bool = False):
+    def deliver():
         close_old_connections()
         try:
             with schema_context(tenant_a.schema_name):
-                if mark_started:
-                    second_started.set()
-                return nt.dispatch_notification.run(
-                    notification_id,
-                    channels=[Channel.IN_APP],
-                )
+                current = Notification.objects.select_related("user").get(pk=notification_id)
+                return nt._deliver_sms(current, "A learner is absent.")
         finally:
             close_old_connections()
 
@@ -83,30 +87,24 @@ def test_concurrent_delivery_workers_serialize_on_notification_row(tenant_a, mon
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(deliver)
         try:
-            assert first_holds_lock.wait(timeout=10)
-            second = pool.submit(deliver, mark_started=True)
-            assert second_started.wait(timeout=10)
-            # It has entered the task but is blocked at Notification.select_for_update.
-            with pytest.raises(FutureTimeout):
-                second.result(timeout=0.25)
+            assert first_contact_started.wait(timeout=10)
+            second = pool.submit(deliver)
+            assert second.result(timeout=10) == "already_claimed"
         finally:
             release_first.set()
         assert second is not None
-        assert first.result(timeout=10)["results"][Channel.IN_APP] == "sent"
-        assert second.result(timeout=10)["results"][Channel.IN_APP] == "already_handled"
+        assert first.result(timeout=10) == "sent"
 
-    assert delivery_calls == [notification_id]
+    assert provider_calls == [user.phone]
     with schema_context(tenant_a.schema_name):
         assert (
             NotificationDelivery.objects.filter(
                 notification_id=notification_id,
-                channel=Channel.IN_APP,
+                channel=Channel.SMS,
                 status=NotificationDelivery.Status.SENT,
             ).count()
             == 1
         )
-        Notification.objects.filter(pk=notification_id).delete()
-        type(user).objects.filter(pk=user.pk).delete()
 
 
 def test_bulk_reschedule_child_is_exact_principal_and_idempotent_in_database(tenant_a, monkeypatch):
@@ -160,10 +158,13 @@ def test_bulk_reschedule_child_is_exact_principal_and_idempotent_in_database(ten
 
 def _user_with_phone(tenant):
     from apps.notifications.tests.helpers import ensure_notification_principal
+    from apps.users.models import User
     from apps.users.tests.factories import UserFactory
 
     with schema_context(tenant.schema_name):
-        user = UserFactory(phone="+998901112233", email="payer@example.com")
+        user = User.objects.filter(phone="+998901112233").first()
+        if user is None:
+            user = UserFactory(phone="+998901112233", email="payer@example.com")
         return ensure_notification_principal(user)
 
 

@@ -15,6 +15,7 @@ class FinanceConfig(AppConfig):
             IFeeScheduleRepository,
             IInvoiceRepository,
             IPaymentMethodRepository,
+            IStatementExportRepository,
         )
         from apps.finance.interfaces.services import IFinanceService
         from apps.finance.repositories.finance_repository import (
@@ -24,6 +25,7 @@ class FinanceConfig(AppConfig):
             FeeScheduleRepository,
             InvoiceRepository,
             PaymentMethodRepository,
+            StatementExportRepository,
         )
         from apps.finance.services.v1.finance_service import FinanceService
         from core.container import container
@@ -32,6 +34,7 @@ class FinanceConfig(AppConfig):
 
         container.register(IFeeScheduleRepository, FeeScheduleRepository)
         container.register(IInvoiceRepository, InvoiceRepository)
+        container.register(IStatementExportRepository, StatementExportRepository)
         container.register(IDiscountRepository, DiscountRepository)
         container.register(IPaymentMethodRepository, PaymentMethodRepository)
         container.register(IExpenseRepository, ExpenseRepository)

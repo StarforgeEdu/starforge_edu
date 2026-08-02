@@ -378,7 +378,7 @@ def resolve_source_authorization(
                 "AI source scope is unavailable.",
                 code="ai_scope_unavailable",
             )
-        department_id = placement_subject.department_id if placement_department is not None else None
+        department_id = placement_department.pk if placement_department is not None else None
     elif feature == AIFeature.WRITING_MARKING:
         from apps.placement.models import PlacementAttempt, PlacementQuestion
 
@@ -406,7 +406,7 @@ def resolve_source_authorization(
                 "AI source scope is unavailable.",
                 code="ai_scope_unavailable",
             )
-        department_id = attempt_subject.department_id if attempt_department is not None else None
+        department_id = attempt_department.pk if attempt_department is not None else None
     elif feature == AIFeature.FORM_ANALYSIS:
         from apps.forms.models import Form
 

@@ -173,7 +173,16 @@ def test_extend_trial_rejects_zero_days(staff_client, tenant_a):
 @pytest.mark.parametrize(
     ("path", "payload", "field"),
     [
-        ("", {"name": "Unknown field", "slug": "unknown-field", "primary_domain": "unknown.localhost", "admin": True}, "admin"),
+        (
+            "",
+            {
+                "name": "Unknown field",
+                "slug": "unknown-field",
+                "primary_domain": "unknown.localhost",
+                "admin": True,
+            },
+            "admin",
+        ),
         ("/{center}", {"contact_name": "Operator", "is_active": False}, "is_active"),
         ("/{center}/suspend", {"reason": "review", "days": 7}, "days"),
         ("/{center}/activate", {"force": True}, "force"),

@@ -627,11 +627,7 @@ def _assert_no_output_before_printing(job: PrintJob, pages_printed: int | None) 
         raise ValidationException(
             _("Page progress requires an acknowledged printing state."),
             code="validation_error",
-            fields={
-                "pages_printed": [
-                    _("Report printing successfully before submitting physical output.")
-                ]
-            },
+            fields={"pages_printed": [_("Report printing successfully before submitting physical output.")]},
         )
 
 

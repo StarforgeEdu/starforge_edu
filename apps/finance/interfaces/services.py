@@ -7,6 +7,7 @@ from typing import Any
 
 from django.db.models import QuerySet
 
+from apps.finance.dto import StatementExportRequestDTO
 from apps.finance.models import (
     CashierShift,
     Discount,
@@ -16,7 +17,9 @@ from apps.finance.models import (
     PaymentMethod,
     PaymentPlan,
     Refund,
+    StatementExport,
 )
+from core.role_principals import RolePrincipal
 
 
 class IFinanceService(ABC):
@@ -140,3 +143,23 @@ class IFinanceService(ABC):
     def outstanding(self, *, student_id: int, user, roles: set[str]) -> tuple[Any, QuerySet[Invoice]]: ...
     @abstractmethod
     def parent_can_see_student(self, *, user, student_id: int) -> bool: ...
+
+    # --- durable statements ---
+    @abstractmethod
+    def request_statement_export(
+        self,
+        *,
+        student_id: int,
+        requested_by,
+        principal: RolePrincipal,
+        dto: StatementExportRequestDTO,
+    ) -> tuple[StatementExport, bool]: ...
+
+    @abstractmethod
+    def statement_export(self, pk) -> StatementExport | None: ...
+
+    @abstractmethod
+    def statement_export_is_visible(self, export: StatementExport) -> bool: ...
+
+    @abstractmethod
+    def statement_export_download_url(self, export: StatementExport) -> str | None: ...

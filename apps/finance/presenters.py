@@ -22,6 +22,7 @@ from apps.finance.models import (
     PaymentPlan,
     PaymentPlanInstallment,
     Refund,
+    StatementExport,
 )
 
 _2DP = Decimal("0.01")
@@ -38,6 +39,29 @@ def _money(value: Any) -> str | None:
 
 def _rate(value: Any) -> str | None:
     return str(Decimal(value).quantize(_4DP)) if value is not None else None
+
+
+def statement_export_to_dict(
+    export: StatementExport,
+    *,
+    url: str | None,
+) -> dict[str, Any]:
+    state = export.status
+    public_status = (
+        "pending" if state in {StatementExport.Status.QUEUED, StatementExport.Status.RUNNING} else state
+    )
+    return {
+        # `task_id` is retained as a compatibility alias. It identifies the
+        # durable domain job, never a transient Celery result.
+        "task_id": str(export.pk),
+        "export_id": str(export.pk),
+        "status": public_status,
+        "state": state,
+        "url": url,
+        "error_code": export.error_code or None,
+        "created_at": _iso(export.created_at),
+        "expires_at": _iso(export.expires_at),
+    }
 
 
 def fee_schedule_to_dict(fs: FeeSchedule) -> dict[str, Any]:

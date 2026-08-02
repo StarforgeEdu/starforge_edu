@@ -363,15 +363,15 @@ def check_and_reserve_budget(
         requested = prompt.token_cost_cap
     else:
         if isinstance(estimated_tokens, bool):
-            raise ValidationException("Invalid token reservation.", code="invalid_ai_token_reservation")
+            raise ValidationException(_("Invalid token reservation."), code="invalid_ai_token_reservation")
         try:
             requested = int(estimated_tokens)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValidationException(
-                "Invalid token reservation.", code="invalid_ai_token_reservation"
+                _("Invalid token reservation."), code="invalid_ai_token_reservation"
             ) from exc
     if requested < 1 or requested > prompt.token_cost_cap:
-        raise ValidationException("Invalid token reservation.", code="invalid_ai_token_reservation")
+        raise ValidationException(_("Invalid token reservation."), code="invalid_ai_token_reservation")
 
     def _create(status: str, *, reserved: int = 0) -> tuple[AIRequest, bool]:
         # get_or_create on the unique key makes a concurrent duplicate a no-op.
@@ -414,7 +414,7 @@ def check_and_reserve_budget(
         )
         if not all(expected):
             raise ConflictException(
-                "The existing AI request has a different authorization context.",
+                _("The existing AI request has a different authorization context."),
                 code="ai_request_context_conflict",
             )
 
@@ -508,7 +508,7 @@ def check_and_reserve_budget(
 
 @transaction.atomic
 def record_usage(*, ai_request_id: int, usage: Usage, billable: bool = True) -> None:
-    """Reconcile real token usage onto the request + the tenant budget.
+    """Finish a receipt-less completion and reconcile it to the tenant budget.
 
     The request reserved ``reserved_tokens`` (the estimate) at queue time; here we
     move the budget by the *delta* (actual - reserved) and zero the reservation,
@@ -536,6 +536,12 @@ def record_usage(*, ai_request_id: int, usage: Usage, billable: bool = True) -> 
     req.cache_creation_tokens = usage.cache_creation_tokens
     req.cost_microusd = cost_microusd(usage) if billable else 0
     req.reserved_tokens = 0  # reservation consumed by this reconciliation
+    # A receipt-less request cannot remain RUNNING after releasing its entire
+    # reservation: that state is neither safely retryable nor reconcilable.
+    # Paid provider work uses record_provider_completion(), which persists the
+    # receipt and may remain RUNNING while downstream output is applied.
+    req.status = AIRequest.Status.SUCCEEDED
+    req.finished_at = timezone.now()
     req.save(
         update_fields=[
             "input_tokens",
@@ -544,6 +550,8 @@ def record_usage(*, ai_request_id: int, usage: Usage, billable: bool = True) -> 
             "cache_creation_tokens",
             "cost_microusd",
             "reserved_tokens",
+            "status",
+            "finished_at",
         ]
     )
 
@@ -726,7 +734,7 @@ def reconcile_ambiguous_provider_attempt(
         ):
             return request
         raise ConflictException(
-            "The AI provider attempt was already reconciled.",
+            _("The AI provider attempt was already reconciled."),
             code="ai_provider_already_reconciled",
         )
     if (
@@ -736,7 +744,7 @@ def reconcile_ambiguous_provider_attempt(
         or request.reserved_tokens <= 0
     ):
         raise ConflictException(
-            "The AI provider attempt is not awaiting reconciliation.",
+            _("The AI provider attempt is not awaiting reconciliation."),
             code="ai_provider_not_uncertain",
         )
 
@@ -858,12 +866,12 @@ def update_budget(*, daily_token_limit=None, monthly_token_limit=None, is_enable
     max_limit = int(getattr(settings, "AI_MAX_BUDGET_TOKENS", 2_000_000_000))
     if daily_token_limit is not None:
         if isinstance(daily_token_limit, bool) or not 0 <= int(daily_token_limit) <= max_limit:
-            raise ValidationException("Invalid daily token limit.", code="invalid_ai_budget")
+            raise ValidationException(_("Invalid daily token limit."), code="invalid_ai_budget")
         budget.daily_token_limit = int(daily_token_limit)
         fields.append("daily_token_limit")
     if monthly_token_limit is not None:
         if isinstance(monthly_token_limit, bool) or not 0 <= int(monthly_token_limit) <= max_limit:
-            raise ValidationException("Invalid monthly token limit.", code="invalid_ai_budget")
+            raise ValidationException(_("Invalid monthly token limit."), code="invalid_ai_budget")
         budget.monthly_token_limit = int(monthly_token_limit)
         fields.append("monthly_token_limit")
     if is_enabled is not None:
@@ -871,16 +879,16 @@ def update_budget(*, daily_token_limit=None, monthly_token_limit=None, is_enable
         fields.append("is_enabled")
     if budget.monthly_token_limit < budget.daily_token_limit:
         raise ValidationException(
-            "The monthly token limit cannot be lower than the daily limit.",
+            _("The monthly token limit cannot be lower than the daily limit."),
             code="invalid_ai_budget",
-            fields={"monthly_token_limit": ["Must be greater than or equal to the daily limit."]},
+            fields={"monthly_token_limit": [_("Must be greater than or equal to the daily limit.")]},
         )
     if fields:
         try:
             budget.full_clean()
         except DjangoValidationError as exc:
             raise ValidationException(
-                "Invalid AI budget.", code="invalid_ai_budget", fields=exc.message_dict
+                _("Invalid AI budget."), code="invalid_ai_budget", fields=exc.message_dict
             ) from exc
         budget.save(update_fields=[*fields, "updated_at"])
     return budget

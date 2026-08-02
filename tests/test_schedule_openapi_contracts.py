@@ -14,9 +14,10 @@ def test_ical_url_issuance_is_session_secured_and_exact():
         {"sessionAuth": []},
         {"cookieSession": []},
     ]
-    assert operation["get"]["responses"]["200"]["content"]["application/json"]["schema"][
-        "additionalProperties"
-    ] is False
+    assert (
+        operation["get"]["responses"]["200"]["content"]["application/json"]["schema"]["additionalProperties"]
+        is False
+    )
 
 
 def test_ical_feed_is_explicitly_token_authenticated_and_returns_calendar():

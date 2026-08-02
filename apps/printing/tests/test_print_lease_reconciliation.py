@@ -191,10 +191,7 @@ def test_agent_failure_after_printing_began_is_not_automatically_replayed(
         assert job.status == PrintJob.Status.RECONCILIATION_REQUIRED
         assert job.pages_printed == 1
         assert job.next_attempt_at is None
-        assert (
-            job.reconciliation_reason
-            == PrintJob.ReconciliationReason.AGENT_REPORTED_FAILURE
-        )
+        assert job.reconciliation_reason == PrintJob.ReconciliationReason.AGENT_REPORTED_FAILURE
 
 
 def test_stale_sweep_is_bounded_idempotent_and_never_requeues(tenant_a):

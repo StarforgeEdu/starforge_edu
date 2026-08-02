@@ -14,16 +14,21 @@ import re
 from datetime import date
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
-from django.core.cache import cache
 from django.db.models import Q, QuerySet
 from django.http import HttpRequest, HttpResponse
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.cohorts.models import Cohort
+from apps.finance.dto import StatementExportRequestDTO
 from apps.finance.interfaces.services import IFinanceService
 from apps.finance.models import FeeSchedule, InvoiceLine
+from apps.finance.openapi_contracts import (
+    STATEMENT_REQUEST_OPERATION,
+    STATEMENT_RESULT_OPERATIONS,
+)
 from apps.finance.presenters import (
     cashier_shift_to_dict,
     discount_to_dict,
@@ -35,14 +40,20 @@ from apps.finance.presenters import (
     payment_method_to_dict,
     payment_plan_to_dict,
     refund_to_dict,
+    statement_export_to_dict,
 )
 from apps.finance.selectors import has_natural_finance_scope
 from apps.org.models import Branch
 from core.api_auth import check_perm, require_auth
 from core.container import container
-from core.exceptions import NotFoundException, PermissionException, ValidationException
+from core.exceptions import (
+    NotFoundException,
+    PermissionException,
+    ServiceUnavailableException,
+    ValidationException,
+)
 from core.historical_scope import ATTRIBUTED_SCOPE_STATUSES
-from core.http import decimal_field, int_field, read_json, str_field
+from core.http import decimal_field, int_field, read_json, reject_unknown_fields, str_field
 from core.listing import (
     apply_date_range_filters,
     apply_filters,
@@ -50,8 +61,10 @@ from core.listing import (
     parse_date_range_filters,
     positive_int_filter,
 )
+from core.openapi_contracts import openapi_contract
 from core.permissions import PermissionRoleSet, Role, get_user_roles, has_permission_code
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import request_role_principal
 from core.scoping import (
     assert_permission_membership_scope,
     assert_permission_organization_scope,
@@ -66,10 +79,7 @@ from core.utils import stable_hash
 _BILLING_PERIODS = frozenset(c[0] for c in FeeSchedule.BillingPeriod.choices)
 _LINE_TYPES = frozenset(c[0] for c in InvoiceLine.LineType.choices)
 _LOCALES = frozenset({"uz", "ru", "en"})
-_STATEMENT_TTL = 3600
-_STATEMENT_MAX_INVOICES = 5000
 _MAX_INVOICE_LINES = 500
-_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
 def _service() -> IFinanceService:
@@ -78,36 +88,6 @@ def _service() -> IFinanceService:
 
 def _method_not_allowed() -> HttpResponse:
     return error("Method not allowed.", code="method_not_allowed", status=405)
-
-
-def _trusted_statement_key(result: dict[str, Any], *, schema: str) -> str | None:
-    """Validate the complete server-derived tenant/student statement key."""
-    key = result.get("key")
-    student_id = result.get("student_id")
-    if (
-        not isinstance(key, str)
-        or len(key) > 512
-        or isinstance(student_id, bool)
-        or not isinstance(student_id, int)
-        or student_id <= 0
-    ):
-        return None
-    pattern = (
-        rf"\A{re.escape(schema)}/documents/"
-        rf"statement_{student_id}_[0-9]{{14}}_[0-9a-f]{{32}}\.pdf\Z"
-    )
-    return key if re.fullmatch(pattern, key) is not None else None
-
-
-def _trusted_statement_invoice_ids(result: dict[str, Any]) -> tuple[int, ...] | None:
-    """Return a bounded, canonical invoice-id set from the task result."""
-    raw = result.get("invoice_ids")
-    if not isinstance(raw, list) or not raw or len(raw) > _STATEMENT_MAX_INVOICES:
-        return None
-    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in raw):
-        return None
-    invoice_ids = tuple(raw)
-    return invoice_ids if invoice_ids == tuple(sorted(set(invoice_ids))) else None
 
 
 def _reject(field: str, message: str) -> ValidationException:
@@ -1197,27 +1177,16 @@ def outstanding_balance_view(request: HttpRequest) -> HttpResponse:
 # --- statements (async) ----------------------------------------------------
 
 
+@openapi_contract(
+    path="/api/v1/finance/students/{student_id}/statement/",
+    operations=(STATEMENT_REQUEST_OPERATION,),
+)
 @csrf_exempt
 @require_auth
 def statement_request_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "finance:read")
-    from apps.students.models import StudentProfile
-
-    if not StudentProfile.objects.filter(pk=student_id).exists():
-        raise NotFoundException("Student not found.", code="student_not_found")
-    # A transfer must not let the destination branch download invoices issued
-    # by the prior branch. Prove at least one historical invoice is currently
-    # visible, then recompute the same live membership scope inside the task so
-    # a revocation between enqueue and execution also fails closed.
-    if (
-        not _service()
-        .invoices(user=request.user, roles=_roles(request))
-        .filter(student_id=student_id)
-        .exists()
-    ):
-        raise NotFoundException(code="not_found")
     from core.ratelimit import check_rate
     from core.utils import current_schema
 
@@ -1226,46 +1195,51 @@ def statement_request_view(request: HttpRequest, student_id: int) -> HttpRespons
     # fresh S3 object with NO budget cap or dedupe, so an unthrottled finance:read
     # holder could flood the shared Celery pool and grow storage without bound.
     check_rate(scope="finance_statement", key=f"{current_schema()}:{request.user.pk}", limit=10, window=60)
-    locale = _choice(read_json(request).get("locale", "en"), "locale", _LOCALES)
+    body = read_json(request)
+    reject_unknown_fields(body, allowed={"locale"})
+    locale = _choice(body.get("locale", "en"), "locale", _LOCALES)
+    principal = request_role_principal(request, allowed_kinds={"staff", "teacher"})
+    export, should_enqueue = _service().request_statement_export(
+        student_id=student_id,
+        requested_by=request.user,
+        principal=principal,
+        dto=StatementExportRequestDTO(locale=locale),
+    )
     from celery_tasks.finance_tasks import generate_statement_pdf
 
-    result = generate_statement_pdf.delay(
-        int(student_id),
-        locale=locale,
-        requested_by_id=request.user.pk,
-        _schema_name=current_schema(),
-    )
-    return success({"task_id": result.id}, status=202)
+    if should_enqueue:
+        try:
+            generate_statement_pdf.delay(str(export.pk), _schema_name=current_schema())
+        except Exception as exc:
+            raise ServiceUnavailableException(code="statement_queue_unavailable") from exc
+    export = _service().statement_export(export.pk) or export
+    url = _service().statement_export_download_url(export)
+    return success(statement_export_to_dict(export, url=url), status=202)
 
 
+@openapi_contract(
+    path="/api/v1/finance/statements/{export_id}/",
+    operations=STATEMENT_RESULT_OPERATIONS,
+)
 @csrf_exempt
 @require_auth
-def statement_result_view(request: HttpRequest, task_id: str) -> HttpResponse:
+def statement_result_view(request: HttpRequest, export_id: str) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "finance:read")
-    from core.utils import current_schema
-
-    if _TASK_ID_RE.fullmatch(task_id) is None:
+    try:
+        export_uuid = UUID(export_id)
+    except (TypeError, ValueError, AttributeError):
+        raise NotFoundException(code="not_found") from None
+    principal = request_role_principal(request, allowed_kinds={"staff", "teacher"})
+    export = _service().statement_export(export_uuid)
+    if (
+        export is None
+        or export.requested_by_id_snapshot != request.user.pk
+        or export.requested_principal_kind != principal.kind
+        or export.requested_principal_id != principal.principal_id
+        or not _service().statement_export_is_visible(export)
+    ):
         raise NotFoundException(code="not_found")
-    result = cache.get(f"finance:statement:{current_schema()}:{task_id}")
-    if result is None:
-        return success({"status": "pending", "url": None})
-    if not isinstance(result, dict) or result.get("requested_by_id") != request.user.pk:
-        raise NotFoundException(code="not_found")
-    key = _trusted_statement_key(result, schema=current_schema())
-    invoice_ids = _trusted_statement_invoice_ids(result)
-    if key is None or invoice_ids is None:
-        raise NotFoundException(code="not_found")
-    visible_invoice_ids = tuple(
-        _service()
-        .invoices(user=request.user, roles=_roles(request))
-        .filter(student_id=result["student_id"], pk__in=invoice_ids)
-        .order_by("pk")
-        .values_list("pk", flat=True)
-    )
-    if visible_invoice_ids != invoice_ids:
-        raise NotFoundException(code="not_found")
-    from infrastructure.storage.s3_client import presign_download
-
-    return success({"status": "done", "url": presign_download(key, expires_in=600)})
+    url = _service().statement_export_download_url(export)
+    return success(statement_export_to_dict(export, url=url))

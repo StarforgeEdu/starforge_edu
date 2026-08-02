@@ -17,14 +17,15 @@ Highlights:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+import logging
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
-from uuid import uuid4
+from uuid import UUID
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -40,6 +41,8 @@ from apps.finance.models import (
     PaymentPlan,
     PaymentPlanInstallment,
     Refund,
+    StatementExport,
+    StatementExportInvoice,
 )
 from apps.finance.signals import invoice_issued
 from apps.org.selectors import get_center_settings
@@ -48,6 +51,7 @@ from core.exceptions import (
     ConflictException,
     NotFoundException,
     PermissionException,
+    ThrottledException,
     UnprocessableEntity,
     ValidationException,
 )
@@ -63,6 +67,10 @@ _FX_QUANTUM = Decimal("0.0001")
 _FX_MAX_EXCLUSIVE = Decimal("100000000")
 _MONEY_MAX_EXCLUSIVE = Decimal("10000000000000000")
 _MAX_INVOICE_LINES = 500
+_MAX_STATEMENT_INVOICES = 5_000
+_STATEMENT_ERROR_CODE = "statement_generation_failed"
+
+logger = logging.getLogger("starforge.finance")
 
 # Statuses that still owe money (used for allocation + reminders + balance).
 OPEN_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.PARTIALLY_PAID, Invoice.Status.OVERDUE)
@@ -1563,80 +1571,566 @@ def render_statement_pdf(
     return HTML(string=html).write_pdf()
 
 
-@dataclass(frozen=True)
-class GeneratedStatement:
-    """Server-derived statement artifact and the immutable rows it contains."""
-
-    key: str
-    invoice_ids: tuple[int, ...]
+def _statement_invoice_set_hash(invoice_ids: list[int] | tuple[int, ...]) -> str:
+    return stable_hash(",".join(str(invoice_id) for invoice_id in invoice_ids))
 
 
-def generate_statement_artifact(
-    student_id: int,
-    *,
-    locale: str = "en",
-    requested_by_id: int | None = None,
-) -> GeneratedStatement:
-    """Render one statement and bind it to its exact authorized invoice set."""
-    student = StudentProfile.objects.select_related("user").get(pk=student_id)
-    invoice_ids: list[int] | None = None
-    if requested_by_id is not None:
-        from apps.finance.selectors import scoped_invoices
-        from apps.users.models import User
-        from core.permissions import get_unambiguous_user_roles, has_permission_code
+def expected_statement_export_key(export: StatementExport) -> str:
+    """Return the only private object key owned by this tenant-local job."""
 
-        requested_by = User.objects.filter(pk=requested_by_id, is_active=True).first()
-        if requested_by is None:
-            raise PermissionException(_("Statement access is no longer available."), code="forbidden")
-        roles = get_unambiguous_user_roles(requested_by)
-        if not (requested_by.is_superuser or has_permission_code(roles, "finance:read")):
-            raise PermissionException(_("Statement access is no longer available."), code="forbidden")
-        invoice_ids = list(
-            scoped_invoices(user=requested_by, roles=roles)
-            .filter(student_id=student_id)
-            .values_list("pk", flat=True)
-        )
-        if not invoice_ids:
-            raise NotFoundException(_("Statement records were not found."), code="not_found")
-        if len(invoice_ids) > 5000:
-            raise UnprocessableEntity(
-                _("The statement contains too many records."),
-                code="statement_too_large",
-            )
-    if invoice_ids is None:
-        pdf = render_statement_pdf(student=student, locale=locale)
-    else:
-        pdf = render_statement_pdf(
-            student=student,
-            locale=locale,
-            invoice_ids=invoice_ids,
-        )
-    # A random artifact suffix prevents two authorized users who request a
-    # transferred student's differently scoped statements in the same second
-    # from overwriting one another's object.
-    ts = timezone.now().strftime("%Y%m%d%H%M%S")
-    key = f"{current_schema()}/documents/statement_{student_id}_{ts}_{uuid4().hex}.pdf"
-    from infrastructure.storage.s3_client import upload_bytes
+    from core.tenant_context import assert_tenant_context
 
-    upload_bytes(key, pdf, content_type="application/pdf")
-    return GeneratedStatement(
-        key=key,
-        invoice_ids=tuple(sorted(invoice_ids or ())),
+    assert_tenant_context()
+    return f"{current_schema()}/documents/statements/{export.pk}.pdf"
+
+
+def _statement_export_invoice_ids(export: StatementExport) -> tuple[int, ...]:
+    prefetched = getattr(export, "_prefetched_objects_cache", {}).get("invoice_links")
+    if prefetched is not None:
+        return tuple(sorted(link.invoice_id for link in prefetched))
+    return tuple(
+        StatementExportInvoice.objects.filter(export=export)
+        .order_by("invoice_id")
+        .values_list("invoice_id", flat=True)
     )
 
 
-def generate_statement(
-    student_id: int,
+def _statement_export_roles(export: StatementExport):
+    from core.permissions import get_user_roles_for_user, has_permission_code
+    from core.role_principals import validate_role_principal
+
+    user = export.requested_by
+    if user is None or not user.is_active or user.pk != export.requested_by_id_snapshot:
+        return None
+    try:
+        validate_role_principal(
+            kind=export.requested_principal_kind,
+            principal_id=export.requested_principal_id,
+            user_id=export.requested_by_id_snapshot,
+            allowed_kinds={"staff", "teacher"},
+        )
+    except ValidationException:
+        return None
+    roles = get_user_roles_for_user(
+        user,
+        principal_kind=export.requested_principal_kind,
+        principal_id=export.requested_principal_id,
+        principal_validated=True,
+    )
+    if not (user.is_superuser or has_permission_code(roles, "finance:read")):
+        return None
+    return roles
+
+
+def statement_export_is_visible(export: StatementExport) -> bool:
+    """Re-evaluate the exact creator principal and every snapshotted invoice.
+
+    Both worker publication and result delivery call this function.  A grant
+    revocation, branch transfer, deactivated role profile, poisoned invoice
+    link, or changed invoice set fails closed without exposing object existence.
+    """
+
+    from apps.finance.selectors import scoped_invoices
+
+    invoice_ids = _statement_export_invoice_ids(export)
+    if (
+        not invoice_ids
+        or len(invoice_ids) > _MAX_STATEMENT_INVOICES
+        or invoice_ids != tuple(sorted(set(invoice_ids)))
+        or export.invoice_set_hash != _statement_invoice_set_hash(invoice_ids)
+    ):
+        return False
+    roles = _statement_export_roles(export)
+    if roles is None:
+        return False
+    visible_ids = tuple(
+        scoped_invoices(user=export.requested_by, roles=roles)
+        .filter(student_id=export.student_id, pk__in=invoice_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    return visible_ids == invoice_ids
+
+
+def _statement_audit_scope(export: StatementExport):
+    from apps.audit.scopes import (
+        organization_audit_scope,
+        scoped_audit_scope,
+        unresolved_audit_scope,
+    )
+    from core.scoping import permission_membership_is_unscoped
+
+    invoice_ids = _statement_export_invoice_ids(export)
+    pairs = set(
+        Invoice.objects.filter(pk__in=invoice_ids).values_list(
+            "branch_at_issue_id",
+            "department_at_issue_id",
+        )
+    )
+    if len(pairs) == 1:
+        branch_id, department_id = pairs.pop()
+        if branch_id is not None:
+            return scoped_audit_scope(branch_id, department_id)
+    roles = _statement_export_roles(export)
+    if roles is not None and permission_membership_is_unscoped(
+        roles=roles,
+        permission="finance:read",
+        account_kinds={"staff"},
+    ):
+        return organization_audit_scope()
+    return unresolved_audit_scope()
+
+
+def _audit_statement_export(
+    export: StatementExport,
     *,
-    locale: str = "en",
-    requested_by_id: int | None = None,
-) -> str:
-    """Compatibility wrapper returning only the newly uploaded storage key."""
-    return generate_statement_artifact(
-        student_id,
+    action: str,
+    previous_status: str | None,
+) -> None:
+    from apps.audit.services import audit_log
+    from core.role_principals import RolePrincipal
+
+    actor = export.requested_by
+    principal = (
+        RolePrincipal(
+            kind=export.requested_principal_kind,
+            principal_id=export.requested_principal_id,
+            user_id=export.requested_by_id_snapshot,
+        )
+        if actor is not None and actor.pk == export.requested_by_id_snapshot
+        else None
+    )
+    audit_log(
+        actor=actor,
+        actor_principal=principal,
+        action=action,
+        resource_type="finance.StatementExport",
+        resource_id=str(export.pk),
+        before={"status": previous_status} if previous_status is not None else None,
+        after={
+            "status": export.status,
+            "student_id": export.student_id,
+            "invoice_count": len(_statement_export_invoice_ids(export)),
+            "file_bytes": export.file_bytes,
+            "error_code": export.error_code,
+        },
+        scope=_statement_audit_scope(export),
+    )
+
+
+@transaction.atomic
+def request_statement_export(
+    *,
+    student_id: int,
+    requested_by,
+    principal,
+    locale: str,
+) -> tuple[StatementExport, bool]:
+    """Create or safely reuse one exact invoice snapshot before publication."""
+
+    from apps.finance.selectors import scoped_invoices
+    from core.job_limits import lock_tenant_job_queue
+    from core.permissions import get_user_roles_for_user, has_permission_code
+    from core.role_principals import validate_role_principal
+
+    if locale not in {"en", "ru", "uz"}:
+        raise ValidationException(
+            code="validation_error",
+            fields={"locale": [_('Choose "en", "ru", or "uz".')]},
+        )
+    if (
+        requested_by is None
+        or not requested_by.is_active
+        or principal.user_id != requested_by.pk
+        or principal.kind not in {"staff", "teacher"}
+    ):
+        raise PermissionException(code="statement_principal_unavailable")
+    try:
+        validated_principal = validate_role_principal(
+            kind=principal.kind,
+            principal_id=principal.principal_id,
+            user_id=principal.user_id,
+            allowed_kinds={"staff", "teacher"},
+        )
+    except ValidationException as exc:
+        raise PermissionException(code="statement_principal_unavailable") from exc
+    if not StudentProfile.objects.filter(pk=student_id).exists():
+        raise NotFoundException(_("Student not found."), code="student_not_found")
+    roles = get_user_roles_for_user(
+        requested_by,
+        principal_kind=validated_principal.kind,
+        principal_id=validated_principal.principal_id,
+        principal_validated=True,
+    )
+    if not (requested_by.is_superuser or has_permission_code(roles, "finance:read")):
+        raise PermissionException(code="forbidden")
+
+    lock_tenant_job_queue("finance-statement-admission")
+    invoice_ids = list(
+        scoped_invoices(user=requested_by, roles=roles)
+        .filter(student_id=student_id)
+        .order_by("pk")
+        .values_list("pk", flat=True)[: _MAX_STATEMENT_INVOICES + 1]
+    )
+    if not invoice_ids:
+        raise NotFoundException(code="not_found")
+    if len(invoice_ids) > _MAX_STATEMENT_INVOICES:
+        raise UnprocessableEntity(
+            _("The statement contains too many records."),
+            code="statement_too_large",
+        )
+
+    now = timezone.now()
+    invoice_set_hash = _statement_invoice_set_hash(invoice_ids)
+    candidates = StatementExport.objects.filter(
+        requested_by_id_snapshot=requested_by.pk,
+        requested_principal_kind=validated_principal.kind,
+        requested_principal_id=validated_principal.principal_id,
+        student_id=student_id,
         locale=locale,
-        requested_by_id=requested_by_id,
-    ).key
+        invoice_set_hash=invoice_set_hash,
+        expires_at__gt=now,
+        artifact_deleted_at__isnull=True,
+        status__in=(
+            StatementExport.Status.QUEUED,
+            StatementExport.Status.RUNNING,
+            StatementExport.Status.DONE,
+        ),
+    ).order_by("-created_at")
+    expected_ids = tuple(invoice_ids)
+    for candidate in candidates[:3]:
+        if _statement_export_invoice_ids(candidate) == expected_ids:
+            return candidate, candidate.status == StatementExport.Status.QUEUED
+
+    active = (StatementExport.Status.QUEUED, StatementExport.Status.RUNNING)
+    if StatementExport.objects.filter(
+        requested_by_id_snapshot=requested_by.pk,
+        status__in=active,
+    ).count() >= getattr(settings, "FINANCE_STATEMENT_MAX_ACTIVE_PER_USER", 3):
+        raise ThrottledException(code="statement_user_queue_full", wait=60)
+    if StatementExport.objects.filter(status__in=active).count() >= getattr(
+        settings,
+        "FINANCE_STATEMENT_MAX_ACTIVE_PER_TENANT",
+        20,
+    ):
+        raise ThrottledException(code="statement_tenant_queue_full", wait=60)
+    if StatementExport.objects.filter(
+        requested_by_id_snapshot=requested_by.pk,
+        created_at__gte=now - timedelta(hours=1),
+    ).count() >= getattr(settings, "FINANCE_STATEMENT_MAX_HOURLY_PER_USER", 10):
+        raise ThrottledException(code="statement_user_hourly_limit", wait=3600)
+
+    export = StatementExport.objects.create(
+        student_id=student_id,
+        requested_by=requested_by,
+        requested_by_id_snapshot=requested_by.pk,
+        requested_principal_kind=validated_principal.kind,
+        requested_principal_id=validated_principal.principal_id,
+        locale=locale,
+        invoice_set_hash=invoice_set_hash,
+    )
+    StatementExportInvoice.objects.bulk_create(
+        [StatementExportInvoice(export=export, invoice_id=invoice_id) for invoice_id in invoice_ids]
+    )
+    export = StatementExport.objects.prefetch_related("invoice_links").get(pk=export.pk)
+    _audit_statement_export(export, action="export", previous_status=None)
+    return export, True
+
+
+def build_statement_export(export_id: UUID | str) -> str | None:
+    """Retry-safe queued/running → done transition for one durable job."""
+
+    from core.exceptions import ConflictException
+    from core.job_limits import release_job_execution, try_acquire_job_execution
+
+    export_uuid = export_id if isinstance(export_id, UUID) else UUID(str(export_id))
+    lock_id = export_uuid.int
+    if not try_acquire_job_execution("finance-statement", lock_id):
+        raise ConflictException(code="statement_export_in_progress")
+    try:
+        with transaction.atomic():
+            export = (
+                StatementExport.objects.select_for_update()
+                .select_related("student__user", "requested_by")
+                .prefetch_related("invoice_links")
+                .get(pk=export_uuid)
+            )
+            if export.status == StatementExport.Status.DONE:
+                return expected_statement_export_key(export)
+            if export.status in {StatementExport.Status.FAILED, StatementExport.Status.EXPIRED}:
+                return None
+            if not statement_export_is_visible(export):
+                raise PermissionException(code="statement_export_forbidden")
+            export.status = StatementExport.Status.RUNNING
+            export.started_at = timezone.now()
+            export.attempt_count += 1
+            export.error_code = ""
+            export.file_bytes = 0
+            export.finished_at = None
+            export.save(
+                update_fields=(
+                    "status",
+                    "started_at",
+                    "attempt_count",
+                    "error_code",
+                    "file_bytes",
+                    "finished_at",
+                )
+            )
+
+        export = (
+            StatementExport.objects.select_related("student__user", "requested_by")
+            .prefetch_related("invoice_links")
+            .get(pk=export_uuid)
+        )
+        invoice_ids = list(_statement_export_invoice_ids(export))
+        pdf = render_statement_pdf(
+            student=export.student,
+            locale=export.locale,
+            invoice_ids=invoice_ids,
+        )
+        if not pdf:
+            raise RuntimeError("Statement renderer returned an empty document.")
+
+        # Rendering is expensive; a live permission/scope check immediately
+        # before private publication closes the revocation-during-render race.
+        export = (
+            StatementExport.objects.select_related("student__user", "requested_by")
+            .prefetch_related("invoice_links")
+            .get(pk=export_uuid)
+        )
+        if timezone.now() >= export.expires_at or not statement_export_is_visible(export):
+            raise PermissionException(code="statement_export_forbidden")
+        from infrastructure.storage.s3_client import upload_bytes
+
+        key = expected_statement_export_key(export)
+        upload_bytes(key, pdf, content_type="application/pdf")
+
+        # If the worker dies after upload but before this transaction commits,
+        # the row remains RUNNING and still owns `key`; redelivery overwrites the
+        # same object, while expiry cleanup can delete it independently.
+        with transaction.atomic():
+            locked = (
+                StatementExport.objects.select_for_update()
+                .select_related("student__user", "requested_by")
+                .prefetch_related("invoice_links")
+                .get(pk=export_uuid)
+            )
+            if locked.status == StatementExport.Status.EXPIRED:
+                return None
+            previous_status = locked.status
+            locked.status = StatementExport.Status.DONE
+            locked.file_bytes = len(pdf)
+            locked.error_code = ""
+            locked.finished_at = timezone.now()
+            locked.save(
+                update_fields=(
+                    "status",
+                    "file_bytes",
+                    "error_code",
+                    "finished_at",
+                )
+            )
+            _audit_statement_export(
+                locked,
+                action="export.complete",
+                previous_status=previous_status,
+            )
+        return key
+    finally:
+        release_job_execution("finance-statement", lock_id)
+
+
+def reset_statement_export_for_retry(export_id: UUID | str) -> None:
+    export_uuid = export_id if isinstance(export_id, UUID) else UUID(str(export_id))
+    StatementExport.objects.filter(pk=export_uuid).exclude(
+        status__in=(StatementExport.Status.DONE, StatementExport.Status.EXPIRED)
+    ).update(
+        status=StatementExport.Status.QUEUED,
+        started_at=None,
+        finished_at=None,
+        file_bytes=0,
+        error_code="",
+    )
+
+
+def mark_statement_export_failed(export_id: UUID | str, exc: Exception) -> None:
+    export_uuid = export_id if isinstance(export_id, UUID) else UUID(str(export_id))
+    logger.error("Statement export %s failed (%s)", export_uuid, type(exc).__name__)
+    with transaction.atomic():
+        export = (
+            StatementExport.objects.select_for_update()
+            .select_related("student__user", "requested_by")
+            .prefetch_related("invoice_links")
+            .filter(pk=export_uuid)
+            .exclude(status__in=(StatementExport.Status.DONE, StatementExport.Status.EXPIRED))
+            .first()
+        )
+        if export is None:
+            return
+        previous_status = export.status
+        export.status = StatementExport.Status.FAILED
+        export.attempt_count = max(export.attempt_count, 1)
+        export.started_at = export.started_at or timezone.now()
+        export.finished_at = timezone.now()
+        export.file_bytes = 0
+        export.error_code = _STATEMENT_ERROR_CODE
+        export.save(
+            update_fields=(
+                "status",
+                "attempt_count",
+                "started_at",
+                "finished_at",
+                "file_bytes",
+                "error_code",
+            )
+        )
+        _audit_statement_export(
+            export,
+            action="export.failed",
+            previous_status=previous_status,
+        )
+
+
+def presign_statement_export(export: StatementExport) -> str | None:
+    if (
+        export.status != StatementExport.Status.DONE
+        or export.artifact_deleted_at is not None
+        or export.expires_at <= timezone.now()
+        or not statement_export_is_visible(export)
+    ):
+        return None
+    from infrastructure.storage.s3_client import presign_download
+
+    return presign_download(
+        expected_statement_export_key(export),
+        expires_in=600,
+        download_filename=f"statement-{export.student_id}.pdf",
+        response_content_type="application/pdf",
+    )
+
+
+def expire_statement_exports(*, now=None, batch_size: int = 100) -> int:
+    """Delete owned artifacts after retention, safely retrying partial sweeps."""
+
+    from core.job_limits import release_job_execution, try_acquire_job_execution
+    from infrastructure.storage.s3_client import delete_object
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 500:
+        raise ValueError("batch_size must be between 1 and 500")
+    cutoff = now or timezone.now()
+    export_ids = list(
+        StatementExport.objects.filter(
+            expires_at__lte=cutoff,
+            artifact_deleted_at__isnull=True,
+        )
+        .order_by("expires_at", "id")
+        .values_list("pk", flat=True)[:batch_size]
+    )
+    cleaned = 0
+    for export_id in export_ids:
+        lock_id = export_id.int
+        if not try_acquire_job_execution("finance-statement", lock_id):
+            continue
+        try:
+            with transaction.atomic():
+                export = (
+                    StatementExport.objects.select_for_update()
+                    .select_related("student__user", "requested_by")
+                    .prefetch_related("invoice_links")
+                    .filter(
+                        pk=export_id,
+                        expires_at__lte=cutoff,
+                        artifact_deleted_at__isnull=True,
+                    )
+                    .first()
+                )
+                if export is None:
+                    continue
+                previous_status = export.status
+                export.status = StatementExport.Status.EXPIRED
+                export.finished_at = export.finished_at or cutoff
+                export.save(update_fields=("status", "finished_at"))
+                if previous_status != StatementExport.Status.EXPIRED:
+                    _audit_statement_export(
+                        export,
+                        action="update",
+                        previous_status=previous_status,
+                    )
+            try:
+                delete_object(expected_statement_export_key(export))
+            except Exception as exc:  # a later sweep retries the same owned key
+                logger.error(
+                    "Statement export cleanup failed for %s (%s)",
+                    export_id,
+                    type(exc).__name__,
+                )
+                continue
+            StatementExport.objects.filter(
+                pk=export_id,
+                status=StatementExport.Status.EXPIRED,
+                artifact_deleted_at__isnull=True,
+            ).update(artifact_deleted_at=timezone.now())
+            cleaned += 1
+        finally:
+            release_job_execution("finance-statement", lock_id)
+    return cleaned
+
+
+def statement_exports_needing_redelivery(*, now=None, batch_size: int = 100) -> tuple[UUID, ...]:
+    """Recover broker-publish gaps and stale RUNNING rows after worker loss."""
+
+    from core.job_limits import release_job_execution, try_acquire_job_execution
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 500:
+        raise ValueError("batch_size must be between 1 and 500")
+    current = now or timezone.now()
+    stale_running = current - timedelta(seconds=settings.CELERY_TASK_TIME_LIMIT + 5 * 60)
+    publish_gap = current - timedelta(minutes=2)
+    candidate_ids = list(
+        StatementExport.objects.filter(expires_at__gt=current)
+        .filter(
+            Q(status=StatementExport.Status.QUEUED, created_at__lte=publish_gap)
+            | Q(status=StatementExport.Status.RUNNING, started_at__lte=stale_running)
+        )
+        .order_by("created_at", "id")
+        .values_list("pk", flat=True)[:batch_size]
+    )
+    recovered: list[UUID] = []
+    for export_id in candidate_ids:
+        lock_id = export_id.int
+        if not try_acquire_job_execution("finance-statement", lock_id):
+            continue
+        try:
+            with transaction.atomic():
+                export = StatementExport.objects.select_for_update().filter(pk=export_id).first()
+                if export is None or export.expires_at <= current:
+                    continue
+                if export.status == StatementExport.Status.RUNNING:
+                    if export.started_at is None or export.started_at > stale_running:
+                        continue
+                    export.status = StatementExport.Status.QUEUED
+                    export.started_at = None
+                    export.finished_at = None
+                    export.file_bytes = 0
+                    export.error_code = ""
+                    export.save(
+                        update_fields=(
+                            "status",
+                            "started_at",
+                            "finished_at",
+                            "file_bytes",
+                            "error_code",
+                        )
+                    )
+                elif not (
+                    export.status == StatementExport.Status.QUEUED and export.created_at <= publish_gap
+                ):
+                    continue
+                recovered.append(export_id)
+        finally:
+            release_job_execution("finance-statement", lock_id)
+    return tuple(recovered)
 
 
 # ---------------------------------------------------------------------------

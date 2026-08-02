@@ -37,6 +37,12 @@ LESSON_RESCHEDULE_EVENTS_PER_TASK = 5
 LESSON_RESCHEDULE_RECIPIENTS_PER_TASK = 50
 DEFERRED_DELIVERY_BATCH_SIZE = 500
 DEFERRED_DELIVERY_LEASE = timedelta(minutes=5)
+PROVIDER_CLAIM_BATCH_SIZE = 500
+# Provider timeouts are measured in seconds. A much longer claim lease avoids
+# racing an ordinarily slow request while still surfacing a killed worker in a
+# bounded period. Unknown claims are never retried without explicit evidence.
+PROVIDER_CLAIM_STALE_AFTER = timedelta(minutes=15)
+RECONCILED_RETRY_LEASE = timedelta(minutes=5)
 
 
 class RescheduleMove(TypedDict):
@@ -343,6 +349,153 @@ def reconcile_deferred_notification_deliveries_for_schema() -> int:
 
 
 @app.task
+def reconcile_stale_provider_delivery_claims() -> int:
+    """Fan out stale-claim reconciliation to every active tenant."""
+
+    from django_tenants.utils import get_public_schema_name
+
+    from apps.tenancy.models import Center
+
+    schemas = list(
+        Center.objects.filter(is_active=True)
+        .exclude(schema_name=get_public_schema_name())
+        .order_by("schema_name")
+        .values_list("schema_name", flat=True)
+    )
+    for schema in schemas:
+        reconcile_stale_provider_delivery_claims_for_schema.delay(_schema_name=schema)
+    return len(schemas)
+
+
+@app.task
+def reconcile_stale_provider_delivery_claims_for_schema() -> int:
+    """Move abandoned pre-send claims to an operator-reviewable unknown state.
+
+    A worker can die after a provider accepted a message but before the success
+    update commits. Retrying such a row would create a duplicate contact. This
+    bounded, skip-locked sweep preserves that ambiguity explicitly; only the
+    evidence-backed management command may later resolve it.
+    """
+
+    from apps.notifications.models import NotificationDelivery
+
+    now = timezone.now()
+    cutoff = now - PROVIDER_CLAIM_STALE_AFTER
+    claim_ids = list(
+        NotificationDelivery.objects.filter(
+            channel__in=("sms", "email", "push"),
+            status=NotificationDelivery.Status.CLAIMED,
+            created_at__lte=cutoff,
+        )
+        .order_by("created_at", "pk")
+        .values_list("pk", flat=True)[:PROVIDER_CLAIM_BATCH_SIZE]
+    )
+    reconciled = 0
+    for claim_id in claim_ids:
+        with transaction.atomic():
+            claim = (
+                NotificationDelivery.objects.select_for_update(skip_locked=True)
+                .filter(
+                    channel__in=("sms", "email", "push"),
+                    pk=claim_id,
+                    status=NotificationDelivery.Status.CLAIMED,
+                    created_at__lte=cutoff,
+                )
+                .first()
+            )
+            if claim is None:
+                continue
+            evidence = dict(claim.provider_response or {})
+            evidence.update(
+                {
+                    "unknown_at": now.isoformat(),
+                    "unknown_reason": "stale_claim",
+                    "reconciliation_required": True,
+                }
+            )
+            claim.status = NotificationDelivery.Status.UNKNOWN
+            claim.provider_response = evidence
+            claim.save(update_fields=["status", "provider_response"])
+            reconciled += 1
+    return reconciled + _enqueue_reconciled_provider_retries()
+
+
+def _enqueue_reconciled_provider_retries() -> int:
+    """Lease durable, explicitly authorized retry intents for broker delivery."""
+
+    from apps.notifications.models import NotificationDelivery
+    from core.utils import current_schema
+
+    now = timezone.now()
+    lease_cutoff = now - RECONCILED_RETRY_LEASE
+    marker_ids = list(
+        NotificationDelivery.objects.filter(
+            status=NotificationDelivery.Status.FAILED,
+            provider_response__retryable=True,
+            provider_response__has_key="retry_requested_at",
+        )
+        .order_by("created_at", "pk")
+        .values_list("pk", flat=True)[:PROVIDER_CLAIM_BATCH_SIZE]
+    )
+    queued = 0
+    schema = current_schema()
+    for marker_id in marker_ids:
+        with transaction.atomic():
+            marker = (
+                NotificationDelivery.objects.select_for_update(skip_locked=True)
+                .filter(
+                    pk=marker_id,
+                    status=NotificationDelivery.Status.FAILED,
+                    provider_response__retryable=True,
+                )
+                .first()
+            )
+            if marker is None:
+                continue
+            evidence = dict(marker.provider_response or {})
+            if (
+                NotificationDelivery.objects.filter(
+                    notification_id=marker.notification_id,
+                    channel=marker.channel,
+                    delivery_key=marker.delivery_key,
+                    status__in=(
+                        NotificationDelivery.Status.CLAIMED,
+                        NotificationDelivery.Status.UNKNOWN,
+                        NotificationDelivery.Status.SENT,
+                    ),
+                )
+                .exclude(pk=marker.pk)
+                .exists()
+            ):
+                evidence.update({"retryable": False, "retry_resolved_at": now.isoformat()})
+                marker.provider_response = evidence
+                marker.save(update_fields=["provider_response"])
+                continue
+            raw_lease = evidence.get("retry_last_enqueued_at")
+            if raw_lease:
+                try:
+                    leased_at = datetime.fromisoformat(str(raw_lease))
+                except ValueError:
+                    leased_at = None
+                if leased_at is not None and leased_at > lease_cutoff:
+                    continue
+            evidence["retry_last_enqueued_at"] = now.isoformat()
+            marker.provider_response = evidence
+            marker.save(update_fields=["provider_response"])
+            notification_id = marker.notification_id
+            channel = marker.channel
+            transaction.on_commit(
+                lambda notification_id=notification_id, channel=channel: deliver_single_channel.delay(
+                    notification_id,
+                    channel,
+                    _schema_name=schema,
+                )
+            )
+            queued += 1
+    return queued
+
+
+@app.task
 def deliver_single_channel(
     notification_id: int,
     channel: str,
@@ -495,12 +648,13 @@ class ProviderOutcomeUnknown(RuntimeError):
     """Provider contact began but its acceptance could not be proved."""
 
 
-def _lock_live_recipient(notification) -> bool:
-    """Lock and revalidate the exact role account before external delivery.
+def _lock_live_recipient(notification, *, lock: bool = False) -> bool:
+    """Revalidate the exact role account before delivery.
 
     Attribution is an immutable historical snapshot, but delivery authorization
-    is live. The task is already atomic; locking the role row serializes a
-    concurrent deactivation with the provider attempt.
+    is live. Provider claims call this with ``lock=True`` in the same short
+    transaction that persists the claim. The external network request happens
+    only after that transaction commits.
     """
 
     if not notification.user.is_active:
@@ -517,15 +671,12 @@ def _lock_live_recipient(notification) -> bool:
     if label is None or notification.recipient_principal_id is None:
         return False
     model = django_apps.get_model(label)
-    profile_is_live = (
-        model.objects
-        .filter(
-            pk=notification.recipient_principal_id,
-            user_id=notification.user_id,
-            is_active=True,
-        )
-        .exists()
-    )
+    profiles = model.objects.select_for_update() if lock else model.objects
+    profile_is_live = profiles.filter(
+        pk=notification.recipient_principal_id,
+        user_id=notification.user_id,
+        is_active=True,
+    ).exists()
     if not profile_is_live:
         return False
     if (
@@ -543,7 +694,10 @@ def _lock_live_recipient(notification) -> bool:
         return False
     from apps.parents.models import Guardian
 
-    guardians = Guardian.objects.select_for_update().filter(
+    guardians = Guardian.objects.all()
+    if lock:
+        guardians = guardians.select_for_update()
+    guardians = guardians.filter(
         parent_id=notification.recipient_principal_id,
         student_id=raw_student_id,
         revoked_at__isnull=True,
@@ -576,8 +730,8 @@ def _channel_is_complete(notification, channel: str) -> bool:
 
     Push legitimately has multiple delivery rows (one per device), so a blanket
     unique constraint on ``(notification, channel)`` would corrupt its contract.
-    The notification row lock serializes workers while this guard checks every
-    active device independently.
+    External provider contact is serialized by the durable partial-unique claim
+    rather than by holding a database transaction open across a network call.
     """
     from apps.notifications.models import Channel, NotificationDelivery
 
@@ -704,10 +858,27 @@ def _deliver_in_app(notification, title, body) -> str:
     schema-prefixed group naming live there (the Day-4 NotificationConsumer
     contract).
     """
+    from django.db import IntegrityError
+
     from apps.notifications.models import Channel, NotificationDelivery
     from apps.notifications.services import push_in_app
 
-    _record(notification, Channel.IN_APP, NotificationDelivery.Status.SENT)
+    try:
+        _record(
+            notification,
+            Channel.IN_APP,
+            NotificationDelivery.Status.SENT,
+            delivery_key="feed",
+        )
+    except IntegrityError:
+        if NotificationDelivery.objects.filter(
+            notification=notification,
+            channel=Channel.IN_APP,
+            delivery_key="feed",
+            status=NotificationDelivery.Status.SENT,
+        ).exists():
+            return "already_claimed"
+        raise
     push_in_app(notification, title, body)
     return "sent"
 
@@ -806,6 +977,7 @@ def _deliver_push(notification, user, title, body, context) -> str:
     client = get_push_client()
     any_sent = False
     any_dead = False
+    any_unknown = False
     for device in devices:
         if _push_device_is_complete(notification, device.device_id):
             continue
@@ -828,6 +1000,7 @@ def _deliver_push(notification, user, title, body, context) -> str:
             # Dependency, credential, timeout, and provider outages say nothing
             # about token validity. Never erase a token for a generic exception.
             _mark_provider_unknown(claim, exc)
+            any_unknown = True
             continue
         if response.get("success"):
             any_sent = True
@@ -860,6 +1033,9 @@ def _deliver_push(notification, user, title, body, context) -> str:
             # The generic adapter cannot prove whether a transport error
             # happened before or after provider acceptance.
             _mark_provider_unknown(claim, RuntimeError("indeterminate provider response"))
+            any_unknown = True
+    if any_unknown:
+        return "partially_unknown" if any_sent or any_dead else "provider_outcome_unknown"
     if any_sent:
         return "sent"
     return "dead_token" if any_dead else "failed"
@@ -1000,13 +1176,21 @@ def _consecutive_push_failures(
     return streak
 
 
-def _record(notification, channel, status, *, provider_response: dict | None = None):
+def _record(
+    notification,
+    channel,
+    status,
+    *,
+    provider_response: dict | None = None,
+    delivery_key: str | None = None,
+):
     from apps.notifications.models import NotificationDelivery
 
     return NotificationDelivery.objects.create(
         notification=notification,
         channel=channel,
         status=status,
+        delivery_key=delivery_key,
         provider_response=provider_response or {},
         sent_at=timezone.now() if status == NotificationDelivery.Status.SENT else None,
     )
@@ -1020,21 +1204,40 @@ def _claim_provider_delivery(notification, channel: str, delivery_key: str, **ev
 
     try:
         with transaction.atomic():
+            locked_notification = (
+                type(notification).objects.select_for_update().select_related("user").get(pk=notification.pk)
+            )
+            if not locked_notification.is_deliverable or not _lock_live_recipient(
+                locked_notification,
+                lock=True,
+            ):
+                return None
             return NotificationDelivery.objects.create(
-                notification=notification,
+                notification=locked_notification,
                 channel=channel,
                 status=NotificationDelivery.Status.CLAIMED,
                 delivery_key=delivery_key[:160],
                 provider_response={**evidence, "claimed_at": timezone.now().isoformat()},
             )
     except IntegrityError:
-        return None
+        if NotificationDelivery.objects.filter(
+            notification=notification,
+            channel=channel,
+            delivery_key=delivery_key[:160],
+            status__in=(
+                NotificationDelivery.Status.CLAIMED,
+                NotificationDelivery.Status.UNKNOWN,
+                NotificationDelivery.Status.SENT,
+            ),
+        ).exists():
+            return None
+        raise
 
 
 def _finish_provider_delivery(claim, status: str, response: dict) -> None:
     from apps.notifications.models import NotificationDelivery
 
-    NotificationDelivery.objects.filter(
+    updated = NotificationDelivery.objects.filter(
         pk=claim.pk,
         status=NotificationDelivery.Status.CLAIMED,
     ).update(
@@ -1042,6 +1245,8 @@ def _finish_provider_delivery(claim, status: str, response: dict) -> None:
         provider_response=response,
         sent_at=timezone.now() if status == NotificationDelivery.Status.SENT else None,
     )
+    if updated != 1:
+        raise ProviderOutcomeUnknown("provider claim changed before its result was recorded")
 
 
 def _complete_provider_delivery(claim, response: dict) -> None:

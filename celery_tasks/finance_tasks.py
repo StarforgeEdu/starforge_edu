@@ -14,11 +14,7 @@
 
 from __future__ import annotations
 
-import re
-
 from config.celery import app
-
-_STATEMENT_KEY_SUFFIX_RE = re.compile(r"^statement_[1-9][0-9]*_[0-9]{14}_[0-9a-f]{32}\.pdf$")
 
 
 def _active_schemas() -> list[str]:
@@ -36,86 +32,56 @@ def _active_schemas() -> list[str]:
 @app.task(bind=True, max_retries=3, retry_backoff=True)
 def generate_statement_pdf(
     self,
-    student_id: int,
-    *,
-    locale: str = "en",
-    requested_by_id: int,
+    export_id: str,
 ) -> str | None:
-    """Render + upload one student's statement; cache the task-id -> key map."""
-    from django.core.cache import cache
+    """Drive one durable statement-export row to a terminal state."""
+    from apps.finance.services import (
+        build_statement_export,
+        mark_statement_export_failed,
+        reset_statement_export_for_retry,
+    )
+    from core.exceptions import ConflictException
 
-    from apps.finance.services import generate_statement_artifact
+    try:
+        return build_statement_export(export_id)
+    except Exception as exc:
+        if isinstance(exc, ConflictException) and exc.code == "statement_export_in_progress":
+            raise self.retry(
+                exc=RuntimeError("Finance statement generation is already in progress."),
+                countdown=5,
+            ) from None
+        safe_exc = RuntimeError("Finance statement generation failed.")
+        if self.request.retries >= self.max_retries:
+            mark_statement_export_failed(export_id, exc)
+            raise safe_exc from None
+        reset_statement_export_for_retry(export_id)
+        raise self.retry(exc=safe_exc) from None
+
+
+@app.task
+def maintain_statement_exports() -> int:
+    """Periodic public dispatcher for retention and lost-publish recovery."""
+
+    schemas = _active_schemas()
+    for schema in schemas:
+        maintain_statement_exports_for_schema.delay(_schema_name=schema)
+    return len(schemas)
+
+
+@app.task
+def maintain_statement_exports_for_schema() -> dict[str, int]:
+    from apps.finance.services import (
+        expire_statement_exports,
+        statement_exports_needing_redelivery,
+    )
     from core.utils import current_schema
 
+    cleaned = expire_statement_exports()
+    recovered = statement_exports_needing_redelivery()
     schema = current_schema()
-    cache_key = f"finance:statement:{schema}:{self.request.id}"
-    cached_key = _trusted_cached_statement(
-        cache.get(cache_key),
-        schema=schema,
-        student_id=student_id,
-        requested_by_id=requested_by_id,
-    )
-    if cached_key is not None:
-        return cached_key
-    try:
-        artifact = generate_statement_artifact(
-            student_id,
-            locale=locale,
-            requested_by_id=requested_by_id,
-        )
-        cache.set(
-            cache_key,
-            {
-                "key": artifact.key,
-                "requested_by_id": requested_by_id,
-                "student_id": student_id,
-                "invoice_ids": list(artifact.invoice_ids),
-            },
-            timeout=3600,
-        )
-        return artifact.key
-    except Exception:
-        # Provider/render exceptions can contain filesystem paths, signed URLs,
-        # or document data. Celery/DLQ receives only a stable safe error while
-        # the task's configured retry budget handles transient failures.
-        raise self.retry(exc=RuntimeError("Finance statement generation failed.")) from None
-
-
-def _trusted_cached_statement(
-    value: object,
-    *,
-    schema: str,
-    student_id: int,
-    requested_by_id: int,
-) -> str | None:
-    """Accept only the exact cache record this task writes after upload.
-
-    A late-ack redelivery keeps its Celery task id. Reusing the completed cache
-    record prevents a second expensive render and random-key storage orphan.
-    """
-
-    if not isinstance(value, dict):
-        return None
-    if value.get("student_id") != student_id or value.get("requested_by_id") != requested_by_id:
-        return None
-    invoice_ids = value.get("invoice_ids")
-    if (
-        not isinstance(invoice_ids, list)
-        or len(invoice_ids) > 5_000
-        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in invoice_ids)
-        or invoice_ids != sorted(set(invoice_ids))
-    ):
-        return None
-    key = value.get("key")
-    if not isinstance(key, str):
-        return None
-    prefix = f"{schema}/documents/"
-    if not key.startswith(prefix) or not _STATEMENT_KEY_SUFFIX_RE.fullmatch(key.removeprefix(prefix)):
-        return None
-    expected_prefix = f"statement_{student_id}_"
-    if not key.removeprefix(prefix).startswith(expected_prefix):
-        return None
-    return key
+    for export_id in recovered:
+        generate_statement_pdf.delay(str(export_id), _schema_name=schema)
+    return {"cleaned": cleaned, "redelivered": len(recovered)}
 
 
 @app.task

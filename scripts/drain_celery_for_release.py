@@ -123,8 +123,7 @@ def _worker_counts(*, expected_workers: int, timeout: float) -> tuple[dict[str, 
         replies[label] = response
 
     counts = {
-        label: sum(len(items or ()) for items in response.values())
-        for label, response in replies.items()
+        label: sum(len(items or ()) for items in response.values()) for label, response in replies.items()
     }
     fingerprint = hashlib.sha256("\0".join(nodes).encode("utf-8")).hexdigest()
     return counts, fingerprint

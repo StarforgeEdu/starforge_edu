@@ -88,8 +88,15 @@ def _claim_request(ai_request_id: int, *, task_id: str):
 
     from apps.ai.models import AIRequest
 
+    # ``prompt`` and ``requested_by`` are nullable historical relations.  A
+    # bare PostgreSQL ``FOR UPDATE`` attempts to lock every joined table and is
+    # rejected when an outer join has a nullable side.  The durable state
+    # machine owns only the request row, so lock that row explicitly while
+    # retaining the eager reads needed below.
     request = (
-        AIRequest.objects.select_for_update().select_related("prompt", "requested_by").get(pk=ai_request_id)
+        AIRequest.objects.select_for_update(of=("self",))
+        .select_related("prompt", "requested_by")
+        .get(pk=ai_request_id)
     )
     if request.status not in (AIRequest.Status.QUEUED, AIRequest.Status.RUNNING):
         return request, False

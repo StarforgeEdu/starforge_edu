@@ -135,6 +135,7 @@ def _query_datetime(raw: str, name: str) -> tuple[datetime, bool]:
         day = parse_date(raw)
     except ValueError:
         day = None
+    parsed: datetime | None
     if day is not None:
         parsed = datetime(day.year, day.month, day.day)
         date_only = True

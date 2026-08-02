@@ -544,9 +544,7 @@ CELERY_TASK_DEFAULT_QUEUE = "default"
 CELERY_TASK_ROUTES = {
     "celery_tasks.payment_tasks.*": {"queue": "critical"},
     "celery_tasks.health_tasks.*": {"queue": "critical"},
-    "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries*": {
-        "queue": "maintenance"
-    },
+    "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries*": {"queue": "maintenance"},
     "celery_tasks.notification_tasks.*": {"queue": "notifications"},
     "celery_tasks.campaign_tasks.*": {"queue": "notifications"},
     "celery_tasks.ai_tasks.*": {"queue": "ai"},
@@ -584,6 +582,11 @@ CELERY_BEAT_SCHEDULE = {
     },
     "reconcile-deferred-notification-deliveries": {
         "task": "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries",
+        "schedule": 60.0,
+        "options": {"queue": "maintenance", "expires": 55},
+    },
+    "reconcile-stale-provider-delivery-claims": {
+        "task": "celery_tasks.notification_tasks.reconcile_stale_provider_delivery_claims",
         "schedule": 60.0,
         "options": {"queue": "maintenance", "expires": 55},
     },

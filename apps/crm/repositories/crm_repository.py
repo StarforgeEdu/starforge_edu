@@ -78,9 +78,11 @@ class CRMRepository(BaseRepository[CRMLead], ICRMRepository):
         if filters.campaign_id is not None:
             qs = qs.filter(attributions__campaign_id=filters.campaign_id)
         if filters.follow_up_from is not None:
-            qs = qs.filter(next_follow_up_at__gte=filters.follow_up_from)
+            # ``next_follow_up_at`` is the typed Subquery annotation installed
+            # by ``get_queryset``; django-stubs only knows concrete model fields.
+            qs = qs.filter(next_follow_up_at__gte=filters.follow_up_from)  # type: ignore[misc]
         if filters.follow_up_to is not None:
-            qs = qs.filter(next_follow_up_at__lte=filters.follow_up_to)
+            qs = qs.filter(next_follow_up_at__lte=filters.follow_up_to)  # type: ignore[misc]
         if filters.created_from is not None:
             qs = qs.filter(created_at__gte=filters.created_from)
         if filters.created_to is not None:

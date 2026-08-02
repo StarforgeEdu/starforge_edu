@@ -12,9 +12,12 @@ A -> B). Lane B's `Payment` may FK `finance.CashierShift` because B merges after
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from core.historical_scope import (
@@ -501,3 +504,163 @@ class Expense(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"expense#{self.pk}:{self.status}:{self.amount_uzs}"
+
+
+def statement_export_expiry():
+    """Short retention boundary for a sensitive generated finance document."""
+
+    return timezone.now() + timedelta(hours=24)
+
+
+class StatementExport(models.Model):
+    """Durable ownership and lifecycle for one statement-of-account PDF.
+
+    The private object key is deliberately *not* stored.  It is derived from
+    this tenant-local UUID, so an upload-before-database-update crash still has
+    a row that unambiguously owns the object and a cleanup sweep can always
+    derive the only key it is permitted to delete.
+    """
+
+    class Status(models.TextChoices):
+        QUEUED = "queued", _("Queued")
+        RUNNING = "running", _("Running")
+        DONE = "done", _("Done")
+        FAILED = "failed", _("Failed")
+        EXPIRED = "expired", _("Expired")
+
+    id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
+    student = models.ForeignKey(
+        "students.StudentProfile",
+        on_delete=models.PROTECT,
+        related_name="statement_exports",
+    )
+    requested_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    requested_by_id_snapshot = models.PositiveBigIntegerField()
+    requested_principal_kind = models.CharField(
+        max_length=16,
+        choices=(("staff", _("Staff")), ("teacher", _("Teacher"))),
+    )
+    requested_principal_id = models.PositiveBigIntegerField()
+    locale = models.CharField(
+        max_length=2,
+        choices=(("en", "English"), ("ru", "Russian"), ("uz", "Uzbek")),
+        default="en",
+    )
+    invoice_set_hash = models.CharField(max_length=64)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.QUEUED,
+        db_index=True,
+    )
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    file_bytes = models.PositiveBigIntegerField(default=0)
+    error_code = models.CharField(max_length=64, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(default=statement_export_expiry, db_index=True)
+    artifact_deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        indexes = [
+            models.Index(
+                fields=("requested_by_id_snapshot", "status", "created_at"),
+                name="stmt_export_owner_status_idx",
+            ),
+            models.Index(
+                fields=("student", "invoice_set_hash", "created_at"),
+                name="stmt_export_student_set_idx",
+            ),
+            models.Index(
+                fields=("status", "expires_at"),
+                name="stmt_export_status_exp_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(expires_at__gt=models.F("created_at")),
+                name="stmt_export_expiry_after_create",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        status="queued",
+                        started_at__isnull=True,
+                        finished_at__isnull=True,
+                        file_bytes=0,
+                        error_code="",
+                        artifact_deleted_at__isnull=True,
+                    )
+                    | models.Q(
+                        status="running",
+                        started_at__isnull=False,
+                        finished_at__isnull=True,
+                        file_bytes=0,
+                        error_code="",
+                        artifact_deleted_at__isnull=True,
+                        attempt_count__gt=0,
+                    )
+                    | models.Q(
+                        status="done",
+                        started_at__isnull=False,
+                        finished_at__isnull=False,
+                        file_bytes__gt=0,
+                        error_code="",
+                        artifact_deleted_at__isnull=True,
+                        attempt_count__gt=0,
+                    )
+                    | models.Q(
+                        status="failed",
+                        started_at__isnull=False,
+                        finished_at__isnull=False,
+                        file_bytes=0,
+                        error_code="statement_generation_failed",
+                        artifact_deleted_at__isnull=True,
+                        attempt_count__gt=0,
+                    )
+                    | models.Q(
+                        status="expired",
+                        finished_at__isnull=False,
+                    )
+                ),
+                name="stmt_export_status_shape",
+            ),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"statement#{self.pk}:{self.student_id}:{self.status}"
+
+
+class StatementExportInvoice(models.Model):
+    """Immutable, normalized invoice snapshot rendered by a statement job."""
+
+    export = models.ForeignKey(
+        StatementExport,
+        on_delete=models.CASCADE,
+        related_name="invoice_links",
+    )
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.PROTECT,
+        related_name="statement_export_links",
+    )
+
+    class Meta:
+        ordering = ("invoice_id",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("export", "invoice"),
+                name="stmt_export_invoice_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=("invoice", "export"), name="stmt_export_invoice_lookup_idx"),
+        ]

@@ -57,5 +57,5 @@ urlpatterns = [
     path(
         "students/<int:student_id>/statement/", views.statement_request_view, name="finance-statement-request"
     ),
-    path("statements/<str:task_id>/", views.statement_result_view, name="finance-statement-result"),
+    path("statements/<str:export_id>/", views.statement_result_view, name="finance-statement-result"),
 ]
