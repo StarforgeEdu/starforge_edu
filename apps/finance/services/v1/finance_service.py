@@ -77,26 +77,66 @@ class FinanceService(IFinanceService):
         fee_schedule.delete()
 
     # --- invoices ---
-    def invoices(self, *, user, roles: set[str]) -> QuerySet[Invoice]:
-        return self._inv.scoped(user=user, roles=roles)
+    def invoices(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> QuerySet[Invoice]:
+        return self._inv.scoped(user=user, roles=roles, permission=permission)
 
-    def invoice(self, *, pk: int, user, roles: set[str]) -> Invoice | None:
-        return self._inv.get_scoped(pk=pk, user=user, roles=roles)
+    def invoice(
+        self,
+        *,
+        pk: int,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> Invoice | None:
+        return self._inv.get_scoped(
+            pk=pk,
+            user=user,
+            roles=roles,
+            permission=permission,
+        )
 
-    def issue_invoice(self, *, student_id: int, fee_schedule_id, lines, period: str, created_by) -> Invoice:
+    def issue_invoice(
+        self,
+        *,
+        student_id: int,
+        fee_schedule_id,
+        lines,
+        period: str,
+        created_by,
+        allowed_scope_pairs: set[tuple[int, int | None]] | None = None,
+    ) -> Invoice:
         return domain.issue_invoice(
             student_id=student_id,
             fee_schedule_id=fee_schedule_id,
             lines=lines,
             period=period,
             created_by=created_by,
+            allowed_scope_pairs=allowed_scope_pairs,
         )
 
     def void_invoice(self, *, invoice: Invoice, actor) -> Invoice:
         return domain.void_invoice(invoice=invoice, actor=actor)
 
-    def reload_invoice(self, *, pk: int, user, roles: set[str]) -> Invoice | None:
-        return self._inv.get_scoped(pk=pk, user=user, roles=roles)
+    def reload_invoice(
+        self,
+        *,
+        pk: int,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> Invoice | None:
+        return self._inv.get_scoped(
+            pk=pk,
+            user=user,
+            roles=roles,
+            permission=permission,
+        )
 
     def create_payment_plan(self, *, invoice: Invoice, installments: list[dict], created_by) -> PaymentPlan:
         return domain.create_payment_plan(invoice=invoice, installments=installments, created_by=created_by)
@@ -198,9 +238,6 @@ class FinanceService(IFinanceService):
     def cashier_shifts(self) -> QuerySet[CashierShift]:
         return self._shift.query()
 
-    def cashier_shift(self, pk: int) -> CashierShift | None:
-        return self._shift.get(pk)
-
     def open_cashier_shift(self, *, cashier, branch, opening_cash_uzs, notes: str) -> CashierShift:
         return domain.open_cashier_shift(
             cashier=cashier, branch=branch, opening_cash_uzs=opening_cash_uzs, notes=notes
@@ -222,7 +259,7 @@ class FinanceService(IFinanceService):
     # --- outstanding ---
     def outstanding(self, *, student_id: int, user, roles: set[str]) -> tuple[Any, QuerySet[Invoice]]:
         invoices = selectors.outstanding_invoices(student_id=student_id, user=user, roles=roles)
-        balance = selectors.outstanding_balance(student_id)
+        balance = selectors.outstanding_balance_for_invoices(invoices)
         return balance, invoices
 
     def parent_can_see_student(self, *, user, student_id: int) -> bool:

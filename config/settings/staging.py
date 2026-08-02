@@ -12,6 +12,7 @@ _STAGING_PLACEHOLDERS = {
     "ESKIZ_FROM": "staging",
     "ANTHROPIC_API_KEY": "staging-mock",
     "SOLIQ_API_URL": "https://soliq-staging.invalid",
+    "SOLIQ_API_ALLOWED_HOSTS": "soliq-staging.invalid",
     "SOLIQ_API_TOKEN": "staging-mock",
     "FCM_CREDENTIALS_FILE": "/run/secrets/staging-firebase-mock.json",
 }
@@ -22,11 +23,17 @@ from .production import *  # noqa: E402,F403
 
 DEBUG = False
 ESKIZ_USE_MOCK = True
+SMS_MOCK_CAPTURE_OUTBOX = False
 ANTHROPIC_USE_MOCK = True
 CLICK_USE_MOCK = True
 PAYME_USE_MOCK = True
 UZUM_USE_MOCK = True
+UZUM_LEGACY_INTEGRATION_ENABLED = False
+FINANCE_FX_USE_MOCK = True
 SOLIQ_USE_MOCK = True
 FCM_USE_MOCK = True
+FCM_MOCK_CAPTURE_OUTBOX = False
+ALLOW_LEGACY_PRINCIPAL_UNION_FOR_TESTS = False
+ALLOW_LEGACY_TENANT_SESSIONS_FOR_TESTS = False
 PLATFORM_PAYMENTS_USE_MOCK = True
 LOGGING["loggers"][""]["level"] = "DEBUG"  # type: ignore[index]  # noqa: F405

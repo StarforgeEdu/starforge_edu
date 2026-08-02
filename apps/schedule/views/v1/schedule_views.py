@@ -23,6 +23,12 @@ from apps.schedule.interfaces.services import (
     ITermService,
     ITimeSlotService,
 )
+from apps.schedule.openapi_contracts import (
+    ICAL_FEED_GET_CONTRACT,
+    ICAL_FEED_HEAD_CONTRACT,
+    ICAL_URL_GET_CONTRACT,
+    ICAL_URL_HEAD_CONTRACT,
+)
 from apps.schedule.presenters import (
     lesson_to_dict,
     lesson_type_to_dict,
@@ -35,10 +41,13 @@ from core.container import container
 from core.exceptions import NotFoundException, ValidationException
 from core.http import bool_field, parse_bool, read_json
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
+    assert_permission_organization_scope,
+    request_permission_membership_allows,
     scope_to_permission_memberships,
 )
 
@@ -219,6 +228,14 @@ def terms_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([term_to_dict(t) for t in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "schedule:write")
+        # Terms are tenant-global catalogue state. A branch grant has no safe
+        # row boundary on this model and must never be promoted into global
+        # mutation authority.
+        assert_permission_organization_scope(
+            request,
+            permission="schedule:write",
+            account_kinds={"staff"},
+        )
         term = _term_service().create(data=_term_create_data(request))
         return created(term_to_dict(term))
     return _method_not_allowed()
@@ -229,6 +246,14 @@ def terms_collection_view(request: HttpRequest) -> HttpResponse:
 def term_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
     check_perm(request, "schedule:read" if read else "schedule:write")
+    if not read:
+        # Authorize the global operation before resolving ``pk`` so permitted
+        # branch users cannot probe which tenant-global identifiers exist.
+        assert_permission_organization_scope(
+            request,
+            permission="schedule:write",
+            account_kinds={"staff"},
+        )
     term = _term_service().get(pk=pk)
     if term is None:
         raise NotFoundException(code="not_found")
@@ -294,12 +319,10 @@ def time_slots_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
         check_perm(request, "schedule:write")
         data = _slot_create_data(request)
-        assert_permission_membership_scope(
+        _require_schedule_branch_scope(
             request,
-            permission="schedule:write",
             branch_id=data["branch_id"],
-            enforce_department=False,
-            account_kinds={"staff", "teacher"},
+            permission="schedule:write",
         )
         slot = _slot_service().create(data=data)
         return created(time_slot_to_dict(slot))
@@ -310,29 +333,32 @@ def time_slots_collection_view(request: HttpRequest) -> HttpResponse:
 @require_auth
 def time_slot_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
-    check_perm(request, "schedule:read" if read else "schedule:write")
-    slot = _slot_service().get(pk=pk)
+    permission = "schedule:read" if read else "schedule:write"
+    check_perm(request, permission)
+    # Resolve through the exact action permission.  A bare lookup followed by a
+    # 403 made an existing remote id distinguishable from a missing id (404).
+    slot = (
+        scope_to_permission_memberships(
+            request,
+            _slot_service().list_slots(),
+            permission=permission,
+            branch_field="branch_id",
+            account_kinds={"staff", "teacher"},
+        )
+        .filter(pk=pk)
+        .first()
+    )
     if slot is None:
         raise NotFoundException(code="not_found")
-    permission = "schedule:read" if read else "schedule:write"
-    assert_permission_membership_scope(
-        request,
-        permission=permission,
-        branch_id=slot.branch_id,
-        enforce_department=False,
-        account_kinds={"staff", "teacher"},
-    )
     if read:
         return success(time_slot_to_dict(slot))
     if request.method in ("PUT", "PATCH"):
         changes = _slot_changes(request)
         if "branch_id" in changes:
-            assert_permission_membership_scope(
+            _require_schedule_branch_scope(
                 request,
-                permission="schedule:write",
                 branch_id=changes["branch_id"],
-                enforce_department=False,
-                account_kinds={"staff", "teacher"},
+                permission="schedule:write",
             )
         return success(time_slot_to_dict(_slot_service().update(slot, changes=changes)))
     if request.method == "DELETE":
@@ -387,6 +413,11 @@ def lesson_types_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([lesson_type_to_dict(lt) for lt in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "schedule:write")
+        assert_permission_organization_scope(
+            request,
+            permission="schedule:write",
+            account_kinds={"staff"},
+        )
         lt = _lesson_type_service().create(data=_lesson_type_create_data(request))
         return created(lesson_type_to_dict(lt))
     return _method_not_allowed()
@@ -397,6 +428,12 @@ def lesson_types_collection_view(request: HttpRequest) -> HttpResponse:
 def lesson_type_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
     check_perm(request, "schedule:read" if read else "schedule:write")
+    if not read:
+        assert_permission_organization_scope(
+            request,
+            permission="schedule:write",
+            account_kinds={"staff"},
+        )
     lt = _lesson_type_service().get(pk=pk)
     if lt is None:
         raise NotFoundException(code="not_found")
@@ -451,6 +488,27 @@ def _rule_write_data(request: HttpRequest, *, partial: bool) -> dict[str, Any]:
     return changes
 
 
+def _require_schedule_branch_scope(
+    request: HttpRequest,
+    *,
+    branch_id: int,
+    permission: str,
+    department_id: int | None = None,
+    enforce_department: bool = False,
+) -> None:
+    """Fail remote and missing object identifiers through one public contract."""
+    if request_permission_membership_allows(
+        request,
+        permission=permission,
+        branch_id=branch_id,
+        department_id=department_id,
+        enforce_department=enforce_department,
+        account_kinds={"staff", "teacher"},
+    ):
+        return
+    raise NotFoundException(code="not_found")
+
+
 def _assert_rule_branch_scope(request: HttpRequest, changes: dict[str, Any]) -> None:
     """A RecurrenceRule has no branch column of its own — its branch is implied by its
     cohort/teacher/room FKs. A schedule:write holder may only author rules within their
@@ -469,15 +527,14 @@ def _assert_rule_branch_scope(request: HttpRequest, changes: dict[str, Any]) -> 
             continue
         obj = model.objects.filter(pk=changes[field]).first()
         if obj is None:
-            raise _reject(field, f"{field} does not exist.")
+            raise NotFoundException(code="not_found")
         department_id = getattr(obj, "department_id", None)
-        assert_permission_membership_scope(
+        _require_schedule_branch_scope(
             request,
-            permission="schedule:write",
             branch_id=obj.branch_id,
+            permission="schedule:write",
             department_id=department_id,
             enforce_department=field != "room",
-            account_kinds={"staff", "teacher"},
         )
         branches.add(obj.branch_id)
     if len(branches) > 1:
@@ -511,8 +568,14 @@ def rules_collection_view(request: HttpRequest) -> HttpResponse:
 @require_auth
 def rule_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
-    check_perm(request, "schedule:read" if read else "schedule:write")
-    rule = _rule_service().get_scoped(pk=pk, user=request.user, roles=get_user_roles(request))
+    permission = "schedule:read" if read else "schedule:write"
+    check_perm(request, permission)
+    rule = _rule_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=get_user_roles(request),
+        permission=permission,
+    )
     if rule is None:
         raise NotFoundException(code="not_found")
     if read:
@@ -529,7 +592,15 @@ def rule_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
     if request.method in ("PUT", "PATCH"):
         changes = _rule_write_data(request, partial=(request.method == "PATCH"))
-        _assert_rule_branch_scope(request, changes)
+        # Validate the complete effective FK set. A partial update changing only
+        # the teacher/room must not create a cross-branch rule relative to the
+        # unchanged cohort.
+        effective_scope = {
+            "cohort": changes.get("cohort", rule.cohort_id),
+            "teacher": changes.get("teacher", rule.teacher_id),
+            "room": changes.get("room", rule.room_id),
+        }
+        _assert_rule_branch_scope(request, effective_scope)
         return success(rule_to_dict(_rule_service().update(rule, changes=changes)))
     if request.method == "DELETE":
         _rule_service().delete(rule)
@@ -543,7 +614,12 @@ def rule_bulk_reschedule_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "schedule:write")
-    rule = _rule_service().get_scoped(pk=pk, user=request.user, roles=get_user_roles(request))
+    rule = _rule_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=get_user_roles(request),
+        permission="schedule:write",
+    )
     if rule is None:
         raise NotFoundException(code="not_found")
     # Object-level branch scope, same as rule_detail_view's mutating verbs: bulk-reschedule
@@ -612,7 +688,12 @@ def lesson_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "schedule:read")
-    lesson = _lesson_service().get_scoped(pk=pk, user=request.user, roles=get_user_roles(request))
+    lesson = _lesson_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=get_user_roles(request),
+        permission="schedule:read",
+    )
     if lesson is None:
         raise NotFoundException(code="not_found")
     return success(lesson_to_dict(lesson))
@@ -624,7 +705,12 @@ def lesson_cancel_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "schedule:write")
-    lesson = _lesson_service().get_scoped(pk=pk, user=request.user, roles=get_user_roles(request))
+    lesson = _lesson_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=get_user_roles(request),
+        permission="schedule:write",
+    )
     if lesson is None:
         raise NotFoundException(code="not_found")
     # Defense in depth after the scoped lookup: never let an action cross its branch.
@@ -648,7 +734,12 @@ def lesson_move_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "schedule:write")
-    lesson = _lesson_service().get_scoped(pk=pk, user=request.user, roles=get_user_roles(request))
+    lesson = _lesson_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=get_user_roles(request),
+        permission="schedule:write",
+    )
     if lesson is None:
         raise NotFoundException(code="not_found")
     # Branch-scope the write (same as lesson_cancel_view): a move reschedules the class and
@@ -670,6 +761,10 @@ def lesson_move_view(request: HttpRequest, pk: int) -> HttpResponse:
 # --- iCal feed -------------------------------------------------------------
 
 
+@openapi_contract(
+    path="/api/v1/schedule/ical-url/",
+    operations=(ICAL_URL_GET_CONTRACT, ICAL_URL_HEAD_CONTRACT),
+)
 @csrf_exempt
 @require_auth
 def ical_url_view(request: HttpRequest) -> HttpResponse:
@@ -681,6 +776,10 @@ def ical_url_view(request: HttpRequest) -> HttpResponse:
     return success({"url": url})
 
 
+@openapi_contract(
+    path="/api/v1/schedule/ical/{token}/",
+    operations=(ICAL_FEED_GET_CONTRACT, ICAL_FEED_HEAD_CONTRACT),
+)
 @csrf_exempt
 def ical_feed_view(request: HttpRequest, token: str) -> HttpResponse:
     """GET /api/v1/schedule/ical/<token>/ — PUBLIC, token-authed, text/calendar.

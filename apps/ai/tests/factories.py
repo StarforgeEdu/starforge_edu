@@ -6,6 +6,17 @@ import factory
 
 from apps.ai.models import AIFeature, AIPrompt, AIRequest, TenantAIBudget
 
+_USER_TEMPLATES = {
+    AIFeature.ASSIGNMENT_FEEDBACK: ("Assignment: {assignment_title}\n{submission_text}\n{student_name}"),
+    AIFeature.EXAM_GENERATION: ("{subject_name}\n{exam_type}\n{question_count}\n{difficulty}"),
+    AIFeature.CONTENT_SUMMARY: "{file_title}\n{file_type}",
+    AIFeature.PLACEMENT_GENERATION: "{subject}\n{count}\n{difficulty}\n{topic}",
+    AIFeature.FORM_ANALYSIS: "{form_title}\n{aggregate}\n{comments}",
+    AIFeature.WRITING_MARKING: "{items}",
+    AIFeature.MATERIAL_GENERATION: "{title}\n{topic}",
+    AIFeature.TEMPLATE_GENERATION: "{name}\n{purpose}",
+}
+
 
 class AIPromptFactory(factory.django.DjangoModelFactory[AIPrompt]):
     class Meta:
@@ -15,7 +26,7 @@ class AIPromptFactory(factory.django.DjangoModelFactory[AIPrompt]):
     feature = AIFeature.ASSIGNMENT_FEEDBACK
     version = 1
     system_prompt = "You are a helpful teacher."
-    user_template = "Assignment: {assignment_title}\n{submission_text}\n{student_name}"
+    user_template = factory.LazyAttribute(lambda obj: _USER_TEMPLATES[str(obj.feature)])
     max_output_tokens = 1024
     effort = "medium"
     token_cost_cap = 4000

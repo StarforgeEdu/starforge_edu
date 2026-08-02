@@ -27,6 +27,15 @@ def enqueue_print_job(self, print_job_id: int) -> dict[str, object]:
     Idempotent: a redelivery does not create a duplicate audit row (guarded on a
     prior ``print.job_created`` row for this job).
     """
+    try:
+        return _enqueue_print_job_body(print_job_id)
+    except Exception:
+        # Storage/database exceptions can expose object keys or internal
+        # diagnostics. Retry with stable operator-safe evidence only.
+        raise self.retry(exc=RuntimeError("Print-job enqueue failed.")) from None
+
+
+def _enqueue_print_job_body(print_job_id: int) -> dict[str, object]:
     from apps.audit.services import audit_log
     from apps.printing.models import PrintJob
 
@@ -74,3 +83,36 @@ def _already_audited(*, job_id: int) -> bool:
     return AuditLog.objects.filter(
         action="print.job_created", resource_type="printing.PrintJob", resource_id=str(job_id)
     ).exists()
+
+
+@app.task
+def quarantine_stale_print_leases() -> int:
+    """Fan out the bounded stale-lease quarantine to every active tenant."""
+
+    from django_tenants.utils import get_public_schema_name
+
+    from apps.tenancy.models import Center
+
+    schemas = list(
+        Center.objects.filter(is_active=True)
+        .exclude(schema_name=get_public_schema_name())
+        .order_by("schema_name")
+        .values_list("schema_name", flat=True)
+    )
+    for schema in schemas:
+        quarantine_stale_print_leases_for_schema.delay(_schema_name=schema)
+    return len(schemas)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def quarantine_stale_print_leases_for_schema() -> int:
+    """Quarantine one bounded batch; never requeue physical output."""
+
+    from django.conf import settings
+
+    from apps.printing.services import quarantine_stale_print_leases as quarantine
+
+    count = quarantine(batch_size=settings.PRINT_STALE_LEASE_SWEEP_BATCH_SIZE)
+    if count:
+        logger.warning("Quarantined %s expired physical-print lease(s) for review.", count)
+    return count

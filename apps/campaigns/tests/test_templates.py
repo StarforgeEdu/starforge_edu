@@ -36,7 +36,14 @@ def _mock_complete(monkeypatch, text):
     from celery_tasks import ai_tasks
 
     monkeypatch.setattr(
-        ai_tasks, "complete", lambda **kw: {"text": text, "usage": {"input_tokens": 3, "output_tokens": 12}}
+        ai_tasks,
+        "complete",
+        lambda **kw: {
+            "text": text,
+            "raw_id": "msg_template_generation",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 12},
+        },
     )
 
 

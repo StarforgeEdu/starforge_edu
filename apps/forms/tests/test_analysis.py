@@ -55,6 +55,8 @@ def _mock_complete(monkeypatch, capture=None):
             capture["text"] = messages[0]["content"]
         return {
             "text": "Overall positive. Key takeaways: ...",
+            "raw_id": "msg_form_analysis",
+            "stop_reason": "end_turn",
             "usage": {"input_tokens": 10, "output_tokens": 20},
         }
 
@@ -66,7 +68,7 @@ def test_analyze_task_stores_a_narrative(tenant_a, as_role, monkeypatch):
 
     _seed_form_ai(tenant_a)
     _mock_complete(monkeypatch)
-    director, _ = as_role(Role.DIRECTOR)
+    director, director_user = as_role(Role.DIRECTOR)
     student, _ = as_role(Role.STUDENT)
     fid, field = _published_form(director)
     _submit(student, fid, field, "Great class, learned a lot.")
@@ -74,13 +76,22 @@ def test_analyze_task_stores_a_narrative(tenant_a, as_role, monkeypatch):
         from apps.ai.models import AIRequest
         from apps.forms.models import Form
         from apps.forms.services import request_form_analysis
+        from core.role_principals import RolePrincipal
 
         form = Form.objects.get(pk=fid)
-        ai_request = request_form_analysis(form=form, requested_by=None)
+        ai_request = request_form_analysis(
+            form=form,
+            requested_by=director_user,
+            requested_principal=RolePrincipal(
+                kind=director_user.test_principal_kind,
+                principal_id=director_user.test_principal_id,
+                user_id=director_user.pk,
+            ),
+        )
         ai_tasks.run_form_analysis(ai_request.pk, params={"form_id": form.id})
         ai_request.refresh_from_db()
         assert ai_request.status == AIRequest.Status.SUCCEEDED
-        assert ai_request.output_text
+        assert ai_request.protected_output
 
 
 def test_analyze_redacts_respondent_name_before_sending(tenant_a, as_role, monkeypatch):
@@ -89,7 +100,7 @@ def test_analyze_redacts_respondent_name_before_sending(tenant_a, as_role, monke
     _seed_form_ai(tenant_a)
     captured: dict = {}
     _mock_complete(monkeypatch, capture=captured)
-    director, _ = as_role(Role.DIRECTOR)
+    director, director_user = as_role(Role.DIRECTOR)
     student, student_user = as_role(Role.STUDENT)
     with schema_context(tenant_a.schema_name):
         student_user.first_name = "Ali"
@@ -101,9 +112,18 @@ def test_analyze_redacts_respondent_name_before_sending(tenant_a, as_role, monke
         from apps.forms.models import Form
         from apps.forms.services import request_form_analysis
         from celery_tasks import ai_tasks
+        from core.role_principals import RolePrincipal
 
         form = Form.objects.get(pk=fid)
-        ai_request = request_form_analysis(form=form)
+        ai_request = request_form_analysis(
+            form=form,
+            requested_by=director_user,
+            requested_principal=RolePrincipal(
+                kind=director_user.test_principal_kind,
+                principal_id=director_user.test_principal_id,
+                user_id=director_user.pk,
+            ),
+        )
         ai_tasks.run_form_analysis(ai_request.pk, params={"form_id": form.id})
     assert "Valiyev" not in captured["text"]
     assert "Ali Valiyev" not in captured["text"]
@@ -115,7 +135,7 @@ def test_analyze_bounds_huge_comment_volume(tenant_a, as_role, monkeypatch):
     _seed_form_ai(tenant_a)
     captured: dict = {}
     _mock_complete(monkeypatch, capture=captured)
-    director, _ = as_role(Role.DIRECTOR)
+    director, director_user = as_role(Role.DIRECTOR)
     student, _ = as_role(Role.STUDENT)
     fid, field = _published_form(director)
     _submit(student, fid, field, "x" * 50_000)  # a huge single answer
@@ -123,9 +143,18 @@ def test_analyze_bounds_huge_comment_volume(tenant_a, as_role, monkeypatch):
         from apps.forms.models import Form
         from apps.forms.services import request_form_analysis
         from celery_tasks import ai_tasks
+        from core.role_principals import RolePrincipal
 
         form = Form.objects.get(pk=fid)
-        ai_request = request_form_analysis(form=form)
+        ai_request = request_form_analysis(
+            form=form,
+            requested_by=director_user,
+            requested_principal=RolePrincipal(
+                kind=director_user.test_principal_kind,
+                principal_id=director_user.test_principal_id,
+                user_id=director_user.pk,
+            ),
+        )
         ai_tasks.run_form_analysis(ai_request.pk, params={"form_id": form.id})
     assert len(captured["text"]) < 20_000  # bounded, not the raw 50k
 
@@ -133,13 +162,20 @@ def test_analyze_bounds_huge_comment_volume(tenant_a, as_role, monkeypatch):
 def test_analyze_endpoint_returns_202(tenant_a, as_role, monkeypatch):
     _seed_form_ai(tenant_a)
     _mock_complete(monkeypatch)
-    director, _ = as_role(Role.DIRECTOR)
+    director, director_user = as_role(Role.DIRECTOR)
     student, _ = as_role(Role.STUDENT)
     fid, field = _published_form(director)
     _submit(student, fid, field, "ok")
     r = director.post(f"{FORMS}{fid}/analyze/", {}, format="json")
     assert r.status_code == 202, r.content
     assert r.json()["data"]["request_id"]
+    with schema_context(tenant_a.schema_name):
+        from apps.ai.models import AIRequest
+
+        request = AIRequest.objects.get(pk=r.json()["data"]["request_id"])
+        assert request.requested_by_id == director_user.pk
+        assert request.requested_principal_kind == director_user.test_principal_kind
+        assert request.requested_principal_id == director_user.test_principal_id
 
 
 def test_analyze_rejects_a_form_with_no_responses(tenant_a, as_role):

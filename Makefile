@@ -16,7 +16,7 @@ makemigrations:
 	uv run python manage.py makemigrations
 
 seed:
-	uv run python scripts/seed_dev.py
+	STARFORGE_ALLOW_LOCAL_DEMO_SEED=1 uv run python scripts/seed_dev.py
 
 test:
 	uv run pytest -q

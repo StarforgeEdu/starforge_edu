@@ -13,6 +13,8 @@ Covers the full "Tests required" contract:
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import timedelta
 
 import pytest
@@ -25,6 +27,7 @@ from apps.audit.tests.factories import AuditLogFactory
 from apps.users.models import RoleMembership
 from apps.users.tests.factories import UserFactory
 from core.permissions import Role
+from core.role_principals import RolePrincipal
 
 pytestmark = pytest.mark.django_db
 
@@ -38,7 +41,7 @@ def _maintenance_update(queryset, **changes):
     from django.db import connection, transaction
 
     with transaction.atomic(), connection.cursor() as cursor:
-        cursor.execute("SET LOCAL starforge.audit_maintenance = 'on'")
+        cursor.execute("SET LOCAL starforge.audit_test = 'on'")
         return queryset.update(**changes)
 
 
@@ -46,7 +49,7 @@ def _maintenance_delete(queryset):
     from django.db import connection, transaction
 
     with transaction.atomic(), connection.cursor() as cursor:
-        cursor.execute("SET LOCAL starforge.audit_maintenance = 'on'")
+        cursor.execute("SET LOCAL starforge.audit_test = 'on'")
         return queryset.delete()
 
 
@@ -111,6 +114,50 @@ class TestModelReceivers:
                 action=Action.CREATE,
             )
             assert rows.count() == 1
+
+    def test_branch_calendar_writes_are_audited_with_immutable_scope(
+        self,
+        tenant_a,
+        django_capture_on_commit_callbacks,
+    ):
+        from datetime import date, time
+
+        from apps.org.models import BranchHoliday
+        from apps.org.services import replace_working_hours
+        from apps.org.tests.factories import BranchFactory
+
+        with schema_context(tenant_a.schema_name):
+            branch = BranchFactory()
+            with django_capture_on_commit_callbacks(execute=True):
+                hours = replace_working_hours(
+                    branch,
+                    [
+                        {
+                            "weekday": 0,
+                            "opens_at": time(9),
+                            "closes_at": time(18),
+                            "is_closed": False,
+                        }
+                    ],
+                )
+                holiday = BranchHoliday.objects.create(
+                    branch=branch,
+                    date=date(2026, 8, 3),
+                    name="Operational holiday",
+                )
+
+            rows = AuditLog.objects.filter(
+                action=Action.CREATE,
+                resource_type__in=("org.BranchWorkingHours", "org.BranchHoliday"),
+            )
+            assert {
+                (row.resource_type, row.scope_status, row.scope_branch_id)
+                for row in rows
+                if row.resource_id in {str(hours[0].pk), str(holiday.pk)}
+            } == {
+                ("org.BranchWorkingHours", AuditLog.ScopeStatus.SCOPED, branch.pk),
+                ("org.BranchHoliday", AuditLog.ScopeStatus.SCOPED, branch.pk),
+            }
 
     def test_permission_override_create_and_update_are_audited(
         self, tenant_a, django_capture_on_commit_callbacks
@@ -334,6 +381,20 @@ class TestBeforeSnapshotThreadLocal:
 
 # --------------------------------------------------------------------------- #
 # audit_log() helper (D3-D-3)
+
+
+@pytest.mark.django_db
+def test_audit_actions_are_bounded_to_the_documented_registry(tenant_a):
+    with schema_context(tenant_a.schema_name):
+        row = audit_log(
+            action=AuditLog.Action.PRINT_JOB_RECONCILIATION_REQUIRED,
+            resource_type="printing.PrintJob",
+            resource_id="1",
+        )
+        assert row.action == "print.job_reconciliation_required"
+
+        with pytest.raises(ValueError, match="documented audit action"):
+            audit_log(action="print.job_reconcilation_typo")
 # --------------------------------------------------------------------------- #
 
 
@@ -351,6 +412,34 @@ class TestAuditLogHelper:
             assert row.after["medical_notes"] == "***"
             assert row.after["status"] == "active"
 
+    def test_masks_family_safeguarding_fields(self, tenant_a):
+        with schema_context(tenant_a.schema_name):
+            parent = audit_log(
+                actor=None,
+                action=Action.UPDATE,
+                resource_type="parents.ParentProfile",
+                resource_id=8,
+                after={"notes": "court-order detail", "workplace": "School"},
+            )
+            guardian = audit_log(
+                actor=None,
+                action=Action.UPDATE,
+                resource_type="parents.Guardian",
+                resource_id=9,
+                after={"custody_notes": "restricted", "relationship": "mother"},
+            )
+            student = audit_log(
+                actor=None,
+                action=Action.UPDATE,
+                resource_type="students.StudentProfile",
+                resource_id=10,
+                after={"emergency_contacts": [{"phone": "+998900000000"}]},
+            )
+
+        assert parent.after == {"notes": "***", "workplace": "School"}
+        assert guardian.after == {"custody_notes": "***", "relationship": "mother"}
+        assert student.after == {"emergency_contacts": "***"}
+
     def test_extracts_ip_and_ua_from_request(self, tenant_a, rf):
         with schema_context(tenant_a.schema_name):
             request = rf.get("/", HTTP_USER_AGENT="pytest-ua", REMOTE_ADDR="10.0.0.9")
@@ -359,6 +448,62 @@ class TestAuditLogHelper:
             assert row.ip == "10.0.0.9"
             assert row.user_agent == "pytest-ua"
             assert row.actor_repr == request.user.username
+            assert row.actor_attribution_status == AuditLog.ActorAttributionStatus.UNRESOLVED
+
+    def test_explicit_role_principal_is_snapshotted_exactly(self, tenant_a):
+        with schema_context(tenant_a.schema_name):
+            actor = UserFactory()
+            row = audit_log(
+                actor=actor,
+                actor_principal=RolePrincipal(kind="staff", principal_id=71, user_id=actor.pk),
+                action=Action.EXPORT,
+            )
+
+        assert row.actor_attribution_status == AuditLog.ActorAttributionStatus.EXACT
+        assert row.actor_principal_kind == "staff"
+        assert row.actor_principal_id == 71
+
+    def test_request_context_snapshots_the_server_validated_principal(
+        self,
+        tenant_a,
+        rf,
+        monkeypatch,
+    ):
+        from apps.audit.context import bind_request, reset_request
+
+        with schema_context(tenant_a.schema_name):
+            actor = UserFactory()
+            request = rf.post("/api/v1/students/7/block/")
+            request.user = actor
+            request.principal_kind = "staff"
+            request.principal_id = 93
+            monkeypatch.setattr(
+                "core.session_auth.session_validated_request_principal",
+                lambda candidate: candidate is request,
+            )
+            tokens = bind_request(request)
+            try:
+                row = audit_log(actor=actor, action=Action.UPDATE)
+            finally:
+                reset_request(tokens)
+
+        assert row.actor_attribution_status == AuditLog.ActorAttributionStatus.EXACT
+        assert row.actor_principal_kind == "staff"
+        assert row.actor_principal_id == 93
+
+    def test_actor_principal_must_match_the_persisted_bridge_actor(self, tenant_a):
+        with schema_context(tenant_a.schema_name):
+            actor = UserFactory()
+            with pytest.raises(ValueError, match="persisted audit actor"):
+                audit_log(
+                    actor=actor,
+                    actor_principal=RolePrincipal(
+                        kind="teacher",
+                        principal_id=12,
+                        user_id=actor.pk + 1,
+                    ),
+                    action=Action.UPDATE,
+                )
 
     def test_anonymous_actor_never_raises(self, tenant_a):
         from django.contrib.auth.models import AnonymousUser
@@ -367,9 +512,18 @@ class TestAuditLogHelper:
             row = audit_log(actor=AnonymousUser(), action=Action.LOGIN_FAILED)
             assert row.actor_id is None
             assert row.actor_repr == "anonymous"
+            assert row.actor_attribution_status == AuditLog.ActorAttributionStatus.SYSTEM
 
     def test_masked_fields_cover_td9_set(self):
-        for field in ("national_id", "medical_notes", "password", "click_secret_key", "uzum_api_key"):
+        for field in (
+            "national_id",
+            "medical_notes",
+            "emergency_contacts",
+            "custody_notes",
+            "password",
+            "click_secret_key",
+            "uzum_api_key",
+        ):
             assert field in MASKED_FIELDS
         assert mask_snapshot({"password": "x"})["password"] == "***"
         assert mask_snapshot(None) is None
@@ -393,26 +547,36 @@ class TestAuditLogHelper:
 
 class TestAuthFlowAudit:
     def test_login_success_writes_row(self, tenant_a):
-        from apps.auth.services import login_with_password
+        from apps.auth.services import role_login
+        from apps.students.tests.factories import StudentProfileFactory
 
         with schema_context(tenant_a.schema_name):
-            user = UserFactory()
-            user.set_password("Sup3r-Secret!")
-            user.save(update_fields=["password"])
-            login_with_password(username=user.username, password="Sup3r-Secret!", ip="1.2.3.4")
-            rows = AuditLog.objects.filter(action=Action.LOGIN, resource_id=str(user.pk))
+            student = StudentProfileFactory(username="audit.student")
+            student.set_password("Sup3r-Secret!")
+            student.save(update_fields=["password"])
+            role_login(username=student.username, password="Sup3r-Secret!", ip="1.2.3.4")
+            rows = AuditLog.objects.filter(action=Action.LOGIN, resource_id=str(student.user_id))
             assert rows.count() == 1
             assert rows.first().ip == "1.2.3.4"
+            assert rows.first().after is None
+            assert rows.first().actor_attribution_status == AuditLog.ActorAttributionStatus.EXACT
+            assert rows.first().actor_principal_kind == "student"
+            assert rows.first().actor_principal_id == student.pk
 
     def test_login_failure_writes_row(self, tenant_a):
-        from apps.auth.services import login_with_password
+        from apps.auth.services import role_login
         from core.exceptions import AuthenticationException
+        from core.privacy import private_fingerprint
 
         with schema_context(tenant_a.schema_name):
             with pytest.raises(AuthenticationException):
-                login_with_password(username="ghost-user", password="nope", ip="9.9.9.9")
+                role_login(username="ghost-user", password="nope", ip="9.9.9.9")
             rows = AuditLog.objects.filter(action=Action.LOGIN_FAILED)
-            assert rows.filter(after__username="ghost-user").exists()
+            row = rows.latest("pk")
+            assert row.after["identifier_ref"] == private_fingerprint(
+                "ghost-user", namespace="auth-identifier"
+            )
+            assert "ghost-user" not in str(row.after)
 
     def test_otp_request_and_verify_write_rows(self, tenant_a):
         from apps.users.models import OTP
@@ -511,6 +675,55 @@ class TestAuditAPIAppendOnly:
         assert all(r["action"] == "export" for r in body["results"])
         assert len(body["results"]) >= 1
 
+    def test_filters_by_exact_actor_principal_pair(self, tenant_a, as_role):
+        client, _ = as_role(Role.DIRECTOR, tenant_a)
+        with schema_context(tenant_a.schema_name):
+            matching = AuditLogFactory(
+                actor_attribution_status=AuditLog.ActorAttributionStatus.EXACT,
+                actor_principal_kind="staff",
+                actor_principal_id=41,
+            )
+            AuditLogFactory(
+                actor_attribution_status=AuditLog.ActorAttributionStatus.EXACT,
+                actor_principal_kind="teacher",
+                actor_principal_id=41,
+            )
+        body = client.get(AUDIT_URL + "?actor_principal_kind=staff&actor_principal_id=41").json()
+
+        assert [row["id"] for row in body["results"]] == [matching.pk]
+        assert body["results"][0]["actor_principal"] == {
+            "status": "exact",
+            "kind": "staff",
+            "id": 41,
+        }
+
+    @pytest.mark.parametrize("url", [AUDIT_URL, EXPORT_URL])
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "actor_principal_kind=staff",
+            "actor_principal_id=41",
+            "actor_principal_kind=unknown&actor_principal_id=41",
+            "ts_from=2026-08-02T10:00:00Z&ts_to=2026-08-01T10:00:00Z",
+            "ts_from=2026-08-02T10:00:00",
+            "action=not-a-real-action",
+            "branch=1&branch=2",
+            "misspelled_scope=1",
+        ],
+    )
+    def test_decision_register_rejects_ambiguous_or_unknown_filters(
+        self,
+        tenant_a,
+        as_role,
+        url,
+        query,
+    ):
+        client, _ = as_role(Role.DIRECTOR, tenant_a)
+        response = client.get(f"{url}?{query}")
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "validation_error"
+
     def test_cursor_pagination_stable_under_inserts(self, tenant_a, as_role):
         client, _ = as_role(Role.DIRECTOR, tenant_a)
         with schema_context(tenant_a.schema_name):
@@ -564,9 +777,37 @@ class TestAuditExport:
         assert resp["Content-Type"] == "text/csv"
         content = b"".join(resp.streaming_content).decode()
         assert content.splitlines()[0].startswith("id,created_at,actor_id")
+        parsed_rows = list(csv.DictReader(io.StringIO(content)))
+        assert parsed_rows
+        assert all(None not in row for row in parsed_rows)
+        assert all(
+            set(row)
+            == {
+                "id",
+                "created_at",
+                "actor_id",
+                "actor_repr",
+                "actor_attribution_status",
+                "actor_principal_kind",
+                "actor_principal_id",
+                "action",
+                "resource_type",
+                "resource_id",
+                "scope_status",
+                "scope_branch_id",
+                "scope_department_id",
+                "sensitivity",
+                "ip",
+                "user_agent",
+            }
+            for row in parsed_rows
+        )
         with schema_context(tenant_a.schema_name):
             after = AuditLog.objects.filter(action=Action.EXPORT).count()
+            export_event_id = AuditLog.objects.filter(action=Action.EXPORT).latest("pk").pk
         assert after == before + 1
+        exported_ids = {int(row["id"]) for row in parsed_rows}
+        assert export_event_id not in exported_ids
 
     def test_export_neutralizes_csv_formula_injection(self, tenant_a, as_role):
         """R6/PLAUS3: an attacker-controlled User-Agent / actor_repr beginning with a

@@ -259,7 +259,9 @@ def test_template_collection_filters_ordering_pagination_and_head(tenant_a, as_r
     assert response.status_code == 200
     assert len(response.json()["data"]) == 1
     assert response.json()["data"][0]["event_type"] == EventType.COVER_REQUESTED
-    assert client.get(f"{TEMPLATES_URL}?ordering=--event_type").status_code == 200
+    invalid_ordering = client.get(f"{TEMPLATES_URL}?ordering=--event_type")
+    assert invalid_ordering.status_code == 400
+    assert invalid_ordering.json()["errors"] == {"ordering": ["Invalid value."]}
     assert client.head(TEMPLATES_URL).status_code == 200
 
 
@@ -300,15 +302,15 @@ def test_announce_blank_title_rejected(tenant_a, as_role):
     assert resp.status_code == 400
 
 
-def test_announce_nonexistent_cohort_is_clean_400(tenant_a, as_role):
+def test_announce_nonexistent_cohort_is_clean_404(tenant_a, as_role):
     client, _ = as_role(Role.DIRECTOR, tenant_a)
     response = client.post(
         ANNOUNCE_URL,
         {"cohort": 999_999_999, "title": "Notice", "body": "Please read"},
         format="json",
     )
-    assert response.status_code == 400
-    assert "cohort" in response.json()["errors"]
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
 
 
 def test_announce_branch_scoped_for_a2_granted_scoped_role(tenant_a, user_in, as_user):
@@ -331,22 +333,83 @@ def test_announce_branch_scoped_for_a2_granted_scoped_role(tenant_a, user_in, as
     base = {"title": "Notice", "body": "Please read"}
 
     cross = hod.post(ANNOUNCE_URL, {**base, "cohort": cohort_b_id}, format="json")
-    assert cross.status_code == 403, cross.content
-    assert cross.json()["code"] == "branch_out_of_scope"
+    assert cross.status_code == 404, cross.content
+    assert cross.json()["code"] == "not_found"
 
     own = hod.post(ANNOUNCE_URL, {**base, "cohort": cohort_a_id}, format="json")
     assert own.status_code == 202, own.content
+
+
+def test_announcement_grant_cannot_borrow_an_unrelated_membership(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.org.tests.factories import BranchFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        local = BranchFactory(name="Announcement grant", slug="announcement-grant")
+        remote = BranchFactory(name="Announcement unrelated", slug="announcement-unrelated")
+        local_cohort = CohortFactory(branch=local)
+        remote_cohort = CohortFactory(branch=remote)
+        writer_type = AccountType.objects.create(
+            name="Announcement writer",
+            slug="announcement-writer",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=writer_type,
+            permission="notifications:write",
+        )
+        unrelated_type = AccountType.objects.create(
+            name="Unrelated announcement membership",
+            slug="unrelated-announcement-membership",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=local,
+            account_type=writer_type,
+            role=writer_type.compatibility_role,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=remote,
+            account_type=unrelated_type,
+            role=unrelated_type.compatibility_role,
+        )
+        actor.refresh_from_db()
+
+    client = as_user(tenant_a, actor)
+    body = {"title": "Scoped", "body": "Only the authorized branch"}
+    assert client.post(ANNOUNCE_URL, {**body, "cohort": local_cohort.pk}, format="json").status_code == 202
+    hidden = client.post(ANNOUNCE_URL, {**body, "cohort": remote_cohort.pk}, format="json")
+    assert hidden.status_code == 404
+    assert hidden.json()["code"] == "not_found"
 
 
 # ---------------------------------------------------------------------------
 # Query budget (own-rows feed must not scale with rows)
 # ---------------------------------------------------------------------------
 def test_feed_query_budget(tenant_a, user_in, as_user, django_assert_max_num_queries):
+    from apps.notifications.tests.helpers import principal_kwargs
+
     user = user_in(tenant_a, roles=[Role.PARENT])
+    snapshot = principal_kwargs(user)
     with schema_context(tenant_a.schema_name):
         Notification.objects.bulk_create(
             [
-                Notification(user=user, event_type=EventType.ATTENDANCE_ABSENT, title=f"n{i}")
+                Notification(
+                    user=user,
+                    event_type=EventType.ATTENDANCE_ABSENT,
+                    title=f"n{i}",
+                    attribution_status="captured",
+                    **snapshot,
+                )
                 for i in range(40)
             ]
         )

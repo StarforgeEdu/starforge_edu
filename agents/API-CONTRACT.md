@@ -52,18 +52,24 @@ Cache `base_url`/`ws_url` in app storage; ALL subsequent calls go to that host. 
 
 ## 3. Auth lifecycle
 
-All endpoints in `apps/auth/urls.py` under `/api/v1/auth/`. **Login is username + password** (owner decision 2026-06-11). OTP codes exist only for **password reset** (sent to the phone/email on file). Accounts are created by staff; the generated username + initial password are handed to the user.
+Tenant authentication lives under `/api/v1/auth/`. **Login is role-native username +
+password.** OTP codes exist only for **password reset** (sent to the role account's
+phone/email). Accounts are created by staff; the generated username + initial password
+are handed to the user. Generic Django-User login is a separate public/apex control-center
+operation and is not routed on tenant hosts.
 
 > **The token is an opaque session key, NOT a JWT.** Login returns a single `access` string — the id of a `Session` row in the tenant schema (`core/session_auth.py`). Send it as `Authorization: Bearer <access>` on every authed call. There is **no refresh token and no `/auth/refresh/` endpoint**: the session has a hard **7-day** expiry (`SESSION_TTL_DAYS`), after which any call returns `401` and the client must **log in again**. Roles/permissions are read **live from the DB on every request**, so a role change / revoke / password change takes effect immediately — there are no token claims and no `token_version`/`tv` dance to implement.
 
-### 3.1 Login — `POST /api/v1/auth/login/`
+### 3.1 Tenant role login — `POST /api/v1/auth/role-login/`
 
 ```http
-POST /api/v1/auth/login/
+POST /api/v1/auth/role-login/
 {"username": "aziz.karimov", "password": "<password>",
  "device_id": "a1b2c3-stable-uuid", "platform": "android"}     # device fields optional
 
-200 {"access": "<opaque session key>"}     # ONE token — store it. There is NO refresh token.
+200 {"success": true, "data": {
+       "access": "<opaque session key>", "role": "teacher",
+       "must_change_password": false}}
 ```
 
 Failures are deliberately indistinguishable — unknown username, wrong password, and deactivated account all return:
@@ -74,11 +80,15 @@ Failures are deliberately indistinguishable — unknown username, wrong password
 
 Throttles: `login_user` 5/min per username, `login_ip` 10/min per IP → `429 throttled`. `device_id` is a client-generated stable UUID (keep it in app storage); the server upserts a `Device` row (TASKS §3, D1-C).
 
+`POST /api/v1/auth/login/` is present only in the public-schema OpenAPI document and
+accepts active Django staff/superusers for `/api/v1/platform/*`. A tenant request to that
+path returns the normal 404 envelope.
+
 ### 3.2 Password reset — `POST /api/v1/auth/password/reset/{request,confirm}/` (D1)
 
 ```http
 POST /api/v1/auth/password/reset/request/
-{"identifier": "+998901234567"}                # phone (E.164) or email ON FILE
+{"identifier": "+998901234567", "account_type": "teacher"}
 
 202 (empty body)    # ALWAYS 202 — even for unknown identifiers (anti-enumeration).
                     # A 6-digit code goes out via SMS (Eskiz) or email when an account matches.
@@ -86,7 +96,8 @@ POST /api/v1/auth/password/reset/request/
 
 ```http
 POST /api/v1/auth/password/reset/confirm/
-{"identifier": "+998901234567", "code": "123456", "new_password": "<new>"}
+{"identifier": "+998901234567", "account_type": "teacher",
+ "code": "123456", "new_password": "<new>"}
 
 204                 # password set; EVERY session ended — user logs in fresh
 ```
@@ -122,10 +133,12 @@ The token is opaque — there are no claims to read client-side. The server vali
 ```http
 POST /api/v1/auth/logout/
 Authorization: Bearer <access>
-→ 204     # ends ALL of this user's sessions (every device); then discard the token locally
+200 {"success": true, "data": {"message": "Signed out."}}
 ```
 
-Logout is **global** — `/auth/logout/` revokes every session for the user, so there is no separate `/auth/logout-all/`. (An impersonation/read-only session cannot force-logout — `403 read_only_token`.)
+`/auth/logout/` idempotently revokes only the presented session (including a read-only
+impersonation session). `POST /api/v1/auth/logout-all/` idempotently revokes every session
+for the current principal; a read-only impersonation session cannot invoke logout-all.
 
 ### 3.6 Who am I — `GET /api/v1/users/me/` (D0)
 
@@ -168,7 +181,7 @@ Platform admins can mint a short-lived, **read-only session** for a tenant (`cre
 
 | Header | Value | When |
 |---|---|---|
-| `Authorization` | `Bearer <access>` (the opaque session key from login) | Every call except `auth/login/`, `auth/password/reset/*`, `platform/resolve/`, `webhooks/*` |
+| `Authorization` | `Bearer <access>` (the opaque session key from login) | Every call except tenant `auth/role-login/`, public `auth/login/`, `auth/password/reset/*`, `platform/resolve/`, `webhooks/*` |
 | `Accept-Language` | `uz` \| `ru` \| `en` | Every call (§4.6) |
 | `Content-Type` | `application/json` | Every request with a body (S3 PUTs excepted, §5) |
 | `Idempotency-Key` | UUIDv4 | Required on payment-adjacent POSTs (§4.7) |
@@ -293,21 +306,30 @@ Rejections at step 1: type not in the Center's allowlist or size over the per-Ce
 
 ## 6. Realtime — WebSocket (auth D0; real consumers D4-C, TD-15)
 
-Connect to the **tenant host** on the ASGI port. Auth (`infrastructure/websocket/middleware.py`) accepts the **session-key access token** (the same opaque token from login — the middleware class retains a legacy `JWT` name but validates a session key) via either transport:
+Connect to the **tenant host**. Auth (`infrastructure/websocket/middleware.py`)
+accepts the same opaque session key as HTTP. Browser Origin must match the target
+origin or an exact operator allowlist; host, tenant, session, role principal, and
+scope are all validated before a group is joined.
 
 ```
-A) Subprotocol (recommended for browsers — keeps the token out of URLs/logs):
-   new WebSocket("ws://demo.localhost:8001/ws/notifications/", ["bearer." + accessToken])
-   — server accepts with subprotocol "bearer"
-B) Query string (Flutter/non-browser):
-   ws://demo.localhost:8001/ws/notifications/?token=<access>
+A) Subprotocol (JavaScript-held credential):
+   new WebSocket("ws://demo.localhost:8001/ws/notifications/",
+                 ["starforge.v1", "bearer." + accessToken])
+   — server selects only `starforge.v1`; it never echoes the credential.
+B) Secure HttpOnly API cookie (recommended same-origin browser transport):
+   open the socket normally; the browser supplies the host-only cookie.
 ```
+
+Query-string credentials are rejected in every environment, even when a valid
+cookie or bearer subprotocol is also present. URLs are routinely retained in
+browser history, reverse-proxy logs, and telemetry.
 
 | Path | Stream | Since |
 |---|---|---|
 | `/ws/ping/` | Smoke test: sends `{"type":"hello","user_id":N}`; `{"type":"ping"}` → `{"type":"pong"}` | D0 |
-| `/ws/notifications/` | Per-user in-app notification stream — joins `{schema}.user.{id}` + `{schema}.branch.{b}` per active RoleMembership | D4 |
+| `/ws/notifications/` | Exact role-principal in-app notification stream — joins only `{schema}.n.{principal_kind}.{principal_id}`. | D4 |
 | `/ws/cohorts/{id}/attendance/` | Live attendance marks for one cohort — joins `{schema}.cohort.{id}` (requires `attendance:read` + branch scope) | D4 |
+| `/ws/messaging/threads/{id}/` | Exact-participant pointer stream for one thread. Ordered/recoverable through `/api/v1/messaging/threads/{id}/events/`; message content stays on REST. | V1 realtime |
 
 Group names are **schema-prefixed** server-side (shared-Redis tenant isolation); clients never address groups directly — they just open the path and receive frames.
 
@@ -316,8 +338,11 @@ Group names are **schema-prefixed** server-side (shared-Redis tenant isolation);
 | Code | Meaning | Client action |
 |---|---|---|
 | **4401** | Unauthorized — anonymous, a token minted on another center's host, or a session that was revoked/expired (logout, role change, password change, deactivation) | Reconnect once with the stored token; if it 4401s again the session is gone — send the user to login (there is no refresh). |
-| **4403** | Forbidden — authenticated but not permitted: `/ws/cohorts/{id}/attendance/` requires `attendance:read` AND (director OR a RoleMembership in the cohort's branch); unknown cohort also closes 4403 | Do NOT retry this path with the same token; the user lacks access. Other sockets stay open. |
+| **4403** | Forbidden — invalid browser Origin, unauthorized cohort scope, unknown cohort, or an ambiguous multi-principal notification feed | Do NOT retry this path with the same session until scope/account state changes. |
 | **4408** | Heartbeat timeout — the server sent two pings with no intervening `pong` | Treat as a dead connection; reconnect (backoff below). |
+| **4409** | Application message is larger than 64 KiB | Fix the client; do not retry the same frame. |
+| **4429** | Handshake or inbound-frame rate limit | Reconnect with exponential backoff. |
+| **1011** | A required authorization/channel dependency failed | Retry with backoff and resync from REST. |
 
 **Message envelopes** (server→client, D4 consumers):
 
@@ -330,20 +355,40 @@ Group names are **schema-prefixed** server-side (shared-Redis tenant isolation);
 // /ws/cohorts/{id}/attendance/
 {"type": "attendance.update",
  "payload": {"record_id": 9, "student_id": 7, "lesson_id": 12, "status": "absent", "auto": false}}
+
+// /ws/messaging/threads/{id}/ — ready contract is explicit about unsupported semantics
+{"type":"thread.ready","payload":{"protocol":"starforge.messaging.thread.v1",
+ "thread_id":14,"high_watermark":81,"recovery_floor":1,"max_sync_events":50,
+ "event_delivery":"best_effort_pointer_with_durable_recovery",
+ "live_ordering":"not_guaranteed","recovery_ordering":"sequence_ascending",
+ "deduplication_key":"sequence","gap_recovery":"thread.sync",
+ "capabilities":{"missed_event_recovery":true,
+ "read_receipts":true,"typing":false,"delivery_receipts":false,"presence":"not_provided"}}}
+
+// durable pointer; fetch content from the participant-scoped messages resource
+{"type":"thread.event","payload":{"thread_id":14,"sequence":82,
+ "kind":"message.created","message_id":901,"actor_principal_kind":"teacher",
+ "actor_principal_id":7,"created_at":"2026-08-02T09:30:00+05:00"}}
+
+// client recovery command and response (at most 50 events per WebSocket page)
+{"type":"thread.sync","after":78,"limit":50}
+{"type":"thread.sync","payload":{"thread_id":14,"events":[],"requested_after":78,
+ "next_cursor":78,"high_watermark":82,"recovery_floor":1,
+ "has_more":false,"reset_required":false}}
 ```
 
 Unknown `type` values must be ignored, not crash the client.
 
-**Heartbeat (server-driven, D4-C):** the **server** sends `{"type":"ping"}` every **30 s**; the client MUST reply `{"type":"pong"}`. Two consecutive server pings with no `pong` in between → the server closes **4408**. Clients should also treat 60 s of total silence as a dead link and reconnect. The session lives 7 days — on a **4401**, reconnect once, and if it recurs route the user to login (no refresh).
+**Heartbeat (server-driven, D4-C):** the **server** sends `{"type":"ping"}` every **30 s**; the client MUST reply `{"type":"pong"}`. Two consecutive server pings with no `pong` in between → the server closes **4408**. Session, tenant-active state, role principal, and scoped authorization are rechecked periodically and immediately before every outbound domain event. Clients should also treat 60 s of total silence as a dead link and reconnect.
 
 **Reconnect procedure (both clients):**
 
 1. On close/error (except 4403, which is a permanent deny for that path): schedule reconnect with **exponential backoff + jitter** (1 s → 2 → 4 → 8 → … cap **30 s**); reset backoff to 1 s after a connection survives 60 s.
 2. If the prior close was **4401**, re-check the stored session token is still present; a second consecutive 4401 means the session is gone → go to login (there is no token to refresh).
-3. On successful (re)connect: **resync via REST** — `GET /api/v1/notifications/` (cursor feed) for missed items; for an attendance dashboard, re-fetch `GET /api/v1/attendance/records/?lesson=...`. Re-subscribe (reopen the same paths) after reconnect.
+3. On successful (re)connect: **resync from the system of record** — `GET /api/v1/notifications/` for notifications; re-fetch attendance records for an attendance dashboard; for a messaging thread send `thread.sync` with the last durably processed sequence (or call `GET /api/v1/messaging/threads/{id}/events/?after=...`). Process in ascending sequence and deduplicate by sequence. Fetch new content through `GET .../messages/?after_id=...`. If `reset_required` is true, refetch thread/messages fully and resume from `high_watermark`.
 4. Pause attempts when the app is backgrounded (mobile) or the tab is hidden (web); reconnect on foreground.
 
-**Contract: WS is best-effort, REST is the source of truth.** Messages missed while disconnected are NOT replayed over WS — a dropped socket simply misses the frame. The in-app feed (`GET /api/v1/notifications/`) and the attendance records endpoint are authoritative on reconnect. Never make a business decision from a WS payload alone — a WS event is a hint to re-fetch, the REST record is the fact.
+**Contract: WS is best-effort, REST is the source of truth.** Notification and attendance frames are hints to re-fetch. Live messaging hints can be lost, duplicated, or observed out of order across producers. The durable recovery page is ordered by sequence; clients detect a gap, recover it, and deduplicate by sequence. The scoped Message row is still the content authority. Never make a business decision from a WS payload alone.
 
 ---
 
@@ -367,7 +412,7 @@ Tenant host, prefix `/api/v1/` (`config/urls.py`); platform rows are apex (`conf
 | `GET users/` · `GET users/{id}/` | User directory | `users:read` | D0 |
 | `GET/POST/DELETE users/devices/` | Devices + push tokens (§3.6) | authenticated (own) | D0/D1 |
 | `CRUD org/branches/` · `org/departments/` · `org/rooms/` | Org structure, rooms, hours, holidays | `org:read/write` | D1 |
-| `GET org/settings/` · `PATCH org/settings/` | `CenterSettings` singleton (TD-13) | `org:read` / `org:write` | D1 |
+| `GET org/settings/` · `PATCH org/settings/` | `CenterSettings` singleton (TD-13); organization-wide policy only | `organization_settings:read` / `organization_settings:write` | D1 |
 | `CRUD students/` | StudentProfile + enrollment state machine | `students:read/write` | D1 |
 | `GET students/{id}/dashboard/` | Aggregate: grades+attendance+assignments+finance | `students:read` (self/parent scoped) | D1 skeleton, full D3 |
 | `POST students/import/` | Bulk CSV/Excel import (async, returns task) | `students:write` | D1 |
@@ -386,7 +431,8 @@ Tenant host, prefix `/api/v1/` (`config/urls.py`); platform rows are apex (`conf
 | `CRUD finance/invoices/` · `discounts/` · `refunds/` | Invoicing, allocation | `finance:read/write` | D3 |
 | `GET finance/students/{id}/statement/` | Statement of account PDF (202 → signed URL) | `finance:read_own`/`finance:read` | D3 |
 | `POST payments/` (Idempotency-Key required) · `GET payments/{id}/` | Initiate + poll status (§7) | `payments:write` / `payments:read` | D3 |
-| `GET payments/{id}/receipt/` | Receipt PDF + fiscal QR (TD-7, `[OWNER:O-5]` mock-first) | `payments:read` | D3 |
+| `GET payments/{id}/receipt/` | Observe receipt/PDF readiness or obtain a short-lived URL; side-effect free | `payments:read` | D3 |
+| `POST payments/{id}/receipt/` | Explicitly enqueue idempotent receipt-PDF generation | `payments:read` | D3 |
 | `GET notifications/feed/` (cursor) · `POST notifications/{id}/read/` | In-app feed + read receipts | authenticated (own) | D3 |
 | `GET/PATCH notifications/preferences/` | Per-event × channel prefs, quiet hours | authenticated (own) | D3 |
 | `GET billing/subscription/` | Center's plan/status/period (TD-8) — 402-allowlisted | `org:read` | D3 |
@@ -395,7 +441,8 @@ Tenant host, prefix `/api/v1/` (`config/urls.py`); platform rows are apex (`conf
 | `GET ai/requests/{id}/` · `GET ai/usage/` | Poll AI result · Center budget usage | per-feature / `org:read` | D4 |
 | `GET reports/` · `POST reports/{id}/run/` · `GET reports/runs/{id}/` | Report library, 202 run → signed URL (PDF/XLSX) | `reports:read` | D4 |
 | `CRUD printing/printers/` · `GET printing/jobs/` · `POST printing/jobs/` | Admin: printers + job queue | `printing:read/write` | D4 |
-| `POST printing/agent/claim/` · `POST printing/agent/jobs/{id}/status/` | Branch print agent (separate repo) — Branch-bound long-lived token, NOT JWT | agent token | D4 |
+| `POST printing/agent/claim/` · `POST printing/agent/jobs/{id}/{heartbeat,status}/` | Branch print agent (separate repo) — Branch-bound token plus per-attempt lease, NOT JWT | agent token | D4 |
+| `GET printing/jobs/{id}/reconciliations/` · `POST printing/jobs/{id}/reconcile/` | Branch-scoped evidence and manual resolution for ambiguous physical output | `printing:read/write` | D4 |
 | **apex** `GET/POST platform/centers/` + `suspend/` `activate/` | Center CRUD + lifecycle (TD-10) | platform staff (TD-3) | D0 broken → D1 |
 | **apex** `GET platform/centers/{id}/usage/` · `subscriptions/` ops | Per-center usage, plan management `[OWNER:O-12]` | platform staff | D4 |
 | **apex** `POST platform/impersonate/` | Mint read-only impersonation token (§3.7) | platform staff | D4 |

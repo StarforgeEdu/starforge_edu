@@ -44,6 +44,30 @@ def test_create_and_read_location_and_previous_school(tenant_a, user_in, as_user
     assert body["previous_school"] == "School #110"
     assert body["is_blocked"] is False
     assert body["blocked_at"] is None
+    assert body["branch_name"] == branch.name
+    assert body["current_cohort_name"] is None
+
+
+def test_directory_omits_detail_only_safeguarding_and_account_fields(tenant_a, user_in, as_user):
+    branch, client = _branch_and_client(tenant_a, user_in, as_user)
+    with schema_context(tenant_a.schema_name):
+        student = create_student(
+            branch=branch,
+            phone="+998905557002",
+            emergency_contacts=[{"name": "Private contact", "phone": "+998900000000"}],
+        )
+        student.block_reason = "Sensitive family context"
+        student.save(update_fields=["block_reason"])
+
+    listing = client.get("/api/v1/students/")
+    assert listing.status_code == 200
+    row = listing.json()["data"][0]
+    assert {"must_change_password", "last_login_at", "block_reason", "emergency_contacts"}.isdisjoint(row)
+
+    detail = client.get(f"/api/v1/students/{student.id}/")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["block_reason"] == "Sensitive family context"
+    assert detail.json()["data"]["emergency_contacts"][0]["name"] == "Private contact"
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +122,32 @@ def test_student_filters(tenant_a, user_in, as_user):
 
     # garbage typed param -> 400, never a 500
     assert client.get("/api/v1/students/?age_min=abc").status_code == 400
+    assert client.get("/api/v1/students/?age_min=13&age_max=12").status_code == 400
+    assert client.get("/api/v1/students/?age_min=-1").status_code == 400
+    assert client.get("/api/v1/students/?age_max=12.5").status_code == 400
+    assert client.get("/api/v1/students/?joined_after=2026-08-02&joined_before=2026-08-01").status_code == 400
+    assert client.get("/api/v1/students/?gender=unknown").status_code == 400
+    assert client.get("/api/v1/students/?status=unknown").status_code == 400
+
+
+def test_student_gender_and_teacher_filters_use_public_profile_ids(tenant_a, user_in, as_user):
+    from apps.cohorts.tests.factories import CohortFactory, CohortTeacherFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    branch, client = _branch_and_client(tenant_a, user_in, as_user)
+    with schema_context(tenant_a.schema_name):
+        teacher = TeacherProfileFactory(branch=branch)
+        cohort = CohortFactory(branch=branch)
+        CohortTeacherFactory(cohort=cohort, teacher=teacher)
+        taught = StudentProfileFactory(branch=branch, current_cohort=cohort, gender="f")
+        StudentProfileFactory(branch=branch, gender="m")
+
+    gender_rows = client.get("/api/v1/students/?gender=f").json()["data"]
+    teacher_rows = client.get(f"/api/v1/students/?teacher={teacher.pk}").json()["data"]
+
+    assert {row["id"] for row in gender_rows} == {taught.pk}
+    assert {row["id"] for row in teacher_rows} == {taught.pk}
 
 
 # --------------------------------------------------------------------------- #

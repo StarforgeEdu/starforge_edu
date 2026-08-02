@@ -57,9 +57,7 @@ def paginated(
     if pagination_extra:
         # Endpoint-specific metadata may extend, but never replace, the canonical
         # pagination contract used by every layered API collection.
-        pagination.update(
-            {key: value for key, value in pagination_extra.items() if key not in pagination}
-        )
+        pagination.update({key: value for key, value in pagination_extra.items() if key not in pagination})
     return JsonResponse(
         {
             "success": True,

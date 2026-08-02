@@ -6,6 +6,8 @@ token containing "dead" reports failure so the bounce path is testable.
 
 from __future__ import annotations
 
+from typing import Any
+
 from infrastructure.push.fcm_client import FCMClient, MockFCMClient, PushClient, get_push_client
 
 
@@ -51,10 +53,15 @@ def test_fcm_module_imports_without_firebase_admin():
 def test_real_fcm_message_has_private_chat_routing_metadata(monkeypatch):
     from firebase_admin import messaging
 
-    captured = []
+    captured: list[Any] = []
+
+    def capture_send(message: Any) -> str:
+        captured.append(message)
+        return "fcm-1"
+
     client = FCMClient(credentials_file="unused-in-test.json")
     monkeypatch.setattr(client, "_ensure_app", lambda: object())
-    monkeypatch.setattr(messaging, "send", lambda message: captured.append(message) or "fcm-1")
+    monkeypatch.setattr(messaging, "send", capture_send)
 
     result = client.send(
         token="device-token",

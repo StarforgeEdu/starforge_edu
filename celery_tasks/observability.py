@@ -54,7 +54,9 @@ def push_to_dlq(*, task_name: str, task_id: str | None, args: Any, kwargs: Any, 
         # provider credentials, or full generated documents.
         "arg_types": [type(value).__name__ for value in (args or ())],
         "kwarg_keys": sorted(str(key) for key in (kwargs or {})),
-        "exc": f"{type(exc).__name__}: {exc}",
+        # Exception messages routinely contain PII, paths, provider responses, or
+        # secrets. The DLQ is operational metadata, not a second error-log store.
+        "exc_type": type(exc).__name__,
         "schema": _current_schema(),
         "ts": time.time(),
     }
@@ -80,7 +82,12 @@ def on_task_failure(sender=None, task_id=None, exception=None, args=None, kwargs
         kwargs=kwargs,
         exc=exception or Exception("unknown"),
     )
-    logger.error("task %s failed (id=%s) -> DLQ: %s", task_name, task_id, exception)
+    logger.error(
+        "task %s failed (id=%s) -> DLQ (type=%s)",
+        task_name,
+        task_id,
+        type(exception).__name__ if exception is not None else "unknown",
+    )
 
 
 def on_task_prerun(sender=None, task_id=None, task=None, **_extra) -> None:

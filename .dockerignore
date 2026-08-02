@@ -22,3 +22,15 @@ config/settings/local_run.py
 .github/
 docs/
 *.md
+**/tests/
+tests/
+conftest.py
+pytest.ini
+mypy.ini
+.pre-commit-config.yaml
+# The release image executes this bounded, read-only broker probe during
+# cutover. Keep every other operator/development script outside the image.
+scripts/*
+!scripts/capture_broker_depth.py
+!scripts/drain_celery_for_release.py
+!scripts/run_leadership_release_smoke.py

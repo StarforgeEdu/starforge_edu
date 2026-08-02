@@ -38,7 +38,15 @@ class ILoanService(ABC):
     def resolve_borrower(self, *, user_id: int) -> User | None: ...
 
     @abstractmethod
-    def create(self, data: CreateLoanDTO, *, requested_by, branch, borrower) -> ApprovalRequest: ...
+    def create(
+        self,
+        data: CreateLoanDTO,
+        *,
+        requested_by,
+        branch,
+        borrower,
+        allowed_branch_ids: set[int] | None,
+    ) -> ApprovalRequest: ...
 
     @abstractmethod
     def repay(

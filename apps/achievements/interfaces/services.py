@@ -35,7 +35,13 @@ class IAchievementService(ABC):
     ) -> AchievementGrant: ...
 
     @abstractmethod
-    def resolve_student(self, student_id: int): ...
+    def resolve_student(
+        self,
+        student_id: int,
+        *,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ): ...
 
     @abstractmethod
     def wall_for(self, user) -> QuerySet[AchievementGrant]: ...

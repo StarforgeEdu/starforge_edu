@@ -20,12 +20,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.permissions import PermissionRoleSet, Role
-from core.scoping import permission_membership_scope_q
+from apps.reports.authorization import (
+    ORGANIZATION_ONLY_REPORTS,
+    compatible_membership_scopes,
+    domain_permission,
+    has_organization_scope,
+)
+from core.permissions import PermissionRoleSet, Role, has_permission_code
+from core.spreadsheets import safe_cell
 
-# Only directors see a whole tenant. HoDs/accountants are branch-scoped and a
-# teacher is narrowed further to cohorts they own (see teacher_cohort_ids).
-STAFF_ROLES = {Role.DIRECTOR}
+# Plain-role callers exist only in direct generator tests. Runtime callers use
+# canonical account kinds from PermissionRoleSet membership scopes.
+_LEGACY_STAFF_ROLES = set(Role.ALL) - {Role.TEACHER, Role.STUDENT, Role.PARENT}
 
 # Locale set every report template ships (TD-14).
 TEMPLATE_LOCALES = ("uz", "ru", "en")
@@ -54,24 +60,6 @@ def enforce_report_row_cap(qs) -> None:
         )
 
 
-# Characters that make Excel/LibreOffice treat a cell as a formula. Report cells
-# carry tenant-user-controlled strings (student/cohort/library names), so any of
-# these as a leading char must be neutralized to block CSV/XLSX formula injection.
-_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
-
-
-def safe_cell(value):
-    """Neutralize a spreadsheet formula-injection vector in a string cell.
-
-    A leading ``= + - @`` (or tab/CR) turns user text into an active formula when
-    a director/accountant opens the workbook. Prefix such strings with an
-    apostrophe so the spreadsheet renders them as literal text. Non-strings
-    (numbers/Decimals/None) pass through unchanged."""
-    if isinstance(value, str) and value[:1] in _FORMULA_PREFIXES:
-        return "'" + value
-    return value
-
-
 def teacher_cohort_ids(user) -> set[int]:
     """Cohort ids a teacher owns: primary teacher, co-teacher, or lesson teacher.
 
@@ -84,37 +72,186 @@ def teacher_cohort_ids(user) -> set[int]:
     return set(qs.values_list("id", flat=True).distinct())
 
 
-def membership_branch_ids(user) -> set[int]:
-    """Active branch scope for a non-director report requester."""
+def _legacy_membership_boundaries(*, user, roles: set[str]) -> list[tuple[int, int | None]]:
+    """Compatibility boundaries without borrowing unrelated role assignments."""
     if user is None:
-        return set()
-    return set(user.role_memberships.filter(revoked_at__isnull=True).values_list("branch_id", flat=True))
-
-
-def staff_report_scope_q(*, roles: set[str], user, branch_field: str, department_field: str | None = None):
-    """Per-membership report scope for custom STAFF account types.
-
-    Plain role sets are retained for direct selector tests/internal callers and use
-    the legacy branch fallback. Runtime ``PermissionRoleSet`` values bind the grant
-    to the exact membership that supplied ``reports:read``.
-    """
+        return []
     from django.db.models import Q
 
-    scoped = permission_membership_scope_q(
-        roles=roles,
-        permission="reports:read",
-        branch_field=branch_field,
-        department_field=department_field,
-        account_kinds={"staff"},
+    return list(
+        user.role_memberships.filter(revoked_at__isnull=True, role__in=roles)
+        .filter(Q(account_type__isnull=True) | Q(account_type__is_active=True))
+        .values_list("branch_id", "department_id")
     )
-    if not isinstance(roles, PermissionRoleSet):
-        scoped |= Q(**{f"{branch_field}__in": membership_branch_ids(user)})
+
+
+def report_generation_is_authorized(*, report_key: str, user, roles: set[str]) -> bool:
+    """Fail-closed generator gate independent of the request/service layer."""
+    if user is None or not getattr(user, "is_active", False):
+        return False
+    if bool(getattr(user, "is_superuser", False)):
+        return domain_permission(report_key) is not None
+    if isinstance(roles, PermissionRoleSet):
+        return bool(
+            compatible_membership_scopes(
+                roles=roles,
+                report_key=report_key,
+                report_permission="reports:write",
+            )
+        )
+    source_permission = domain_permission(report_key)
+    if source_permission is None:
+        return False
+    role_set = set(roles)
+    if report_key in ORGANIZATION_ONLY_REPORTS and Role.DIRECTOR not in role_set:
+        return False
+    return has_permission_code(role_set, "reports:write") and has_permission_code(role_set, source_permission)
+
+
+def assert_report_generation_authorized(*, report_key: str, user, roles: set[str]) -> None:
+    if report_generation_is_authorized(report_key=report_key, user=user, roles=roles):
+        return
+    from core.exceptions import PermissionException
+
+    raise PermissionException(code="report_forbidden")
+
+
+def _scope_q_for_memberships(*, memberships, branch_field: str, department_field: str | None):
+    from django.db.models import Q
+
+    if any(membership.is_organization_wide for membership in memberships):
+        return Q(pk__isnull=False)
+    scoped = Q(pk__in=[])
+    for membership in memberships:
+        if membership.department_id is None or department_field is None:
+            scoped |= Q(**{branch_field: membership.branch_id})
+        else:
+            scoped |= Q(
+                **{
+                    branch_field: membership.branch_id,
+                    department_field: membership.department_id,
+                }
+            )
     return scoped
 
 
-def is_full_scope(*, user, roles: set[str]) -> bool:
-    """True when the caller sees the whole tenant (superuser / director / head)."""
-    return bool(getattr(user, "is_superuser", False)) or bool(roles & STAFF_ROLES)
+def staff_report_scope_q(
+    *,
+    report_key: str,
+    roles: set[str],
+    user,
+    branch_field: str,
+    department_field: str | None = None,
+    report_permission: str = "reports:write",
+):
+    """Per-membership report scope for custom STAFF account types.
+
+    Plain role sets are retained for direct generator tests/internal callers.
+    Runtime ``PermissionRoleSet`` values bind both the reports and source-domain
+    grants to the same exact staff membership.
+    """
+    from django.db.models import Q
+
+    if isinstance(roles, PermissionRoleSet):
+        memberships = compatible_membership_scopes(
+            roles=roles,
+            report_key=report_key,
+            report_permission=report_permission,
+            account_kinds={"staff"},
+        )
+        return _scope_q_for_memberships(
+            memberships=memberships,
+            branch_field=branch_field,
+            department_field=department_field,
+        )
+    if set(roles) & _LEGACY_STAFF_ROLES and report_generation_is_authorized(
+        report_key=report_key, user=user, roles=roles
+    ):
+        visible = Q(pk__in=[])
+        for branch_id, department_id in _legacy_membership_boundaries(
+            user=user, roles=set(roles) & _LEGACY_STAFF_ROLES
+        ):
+            if department_id is None:
+                visible |= Q(**{branch_field: branch_id})
+            elif department_field is not None:
+                visible |= Q(
+                    **{
+                        branch_field: branch_id,
+                        department_field: department_id,
+                    }
+                )
+        return visible
+    return Q(pk__in=[])
+
+
+def teacher_report_scope_q(
+    *,
+    report_key: str,
+    roles: set[str],
+    user,
+    branch_field: str,
+    department_field: str | None,
+    cohort_field: str,
+    report_permission: str = "reports:write",
+):
+    """Natural teacher scope intersected with the exact compound grant.
+
+    Omitting ``cohort_id`` never expands a teacher to their membership branch;
+    the result remains their taught cohorts. A grant in a different branch or
+    department cannot be borrowed.
+    """
+    from django.db.models import Q
+
+    taught = teacher_cohort_ids(user)
+    if not taught:
+        return Q(pk__in=[])
+    if not isinstance(roles, PermissionRoleSet):
+        if Role.TEACHER not in set(roles) or not report_generation_is_authorized(
+            report_key=report_key, user=user, roles=roles
+        ):
+            return Q(pk__in=[])
+        visible = Q(pk__in=[])
+        for branch_id, department_id in _legacy_membership_boundaries(user=user, roles={Role.TEACHER}):
+            boundary = {f"{cohort_field}__in": taught, branch_field: branch_id}
+            if department_id is not None:
+                if department_field is None:
+                    continue
+                boundary[department_field] = department_id
+            visible |= Q(**boundary)
+        return visible
+
+    memberships = compatible_membership_scopes(
+        roles=roles,
+        report_key=report_key,
+        report_permission=report_permission,
+        account_kinds={"teacher"},
+    )
+    visible = Q(pk__in=[])
+    for membership in memberships:
+        boundary = {
+            f"{cohort_field}__in": taught,
+            branch_field: membership.branch_id,
+        }
+        if membership.department_id is not None:
+            if department_field is None:
+                # A department grant cannot safely expand across a source with
+                # no department attribution.
+                continue
+            boundary[department_field] = membership.department_id
+        visible |= Q(**boundary)
+    return visible
+
+
+def is_full_scope(
+    *, user, roles: set[str], report_key: str, report_permission: str = "reports:write"
+) -> bool:
+    """Whether the exact compound report grant is organization-wide."""
+    return has_organization_scope(
+        roles=roles,
+        report_key=report_key,
+        report_permission=report_permission,
+        is_superuser=bool(getattr(user, "is_active", False) and getattr(user, "is_superuser", False)),
+    )
 
 
 def _fallback_locales(locale: str) -> list[str]:

@@ -3,12 +3,18 @@ the DB/Redis probes are mocked, requests come from RequestFactory."""
 
 import json
 import re
+from contextlib import contextmanager
 from unittest import mock
 
 from django.http import HttpResponse
 from django.test import RequestFactory, override_settings
 
-from core.middleware import HealthCheckMiddleware, RequestIDMiddleware
+from core.middleware import (
+    HealthCheckMiddleware,
+    OrganizationTimezoneMiddleware,
+    RequestIDMiddleware,
+)
+from core.privacy import private_fingerprint
 
 UUID_HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -78,7 +84,7 @@ def test_healthz_ready_503_when_db_down():
     assert response.status_code == 503
     body = json.loads(response.content)
     assert body["code"] == "not_ready"
-    assert body["message"] == "Database unavailable."
+    assert body["message"] == "Service is not ready."
 
 
 def test_healthz_ready_503_when_redis_down():
@@ -91,7 +97,7 @@ def test_healthz_ready_503_when_redis_down():
     assert response.status_code == 503
     body = json.loads(response.content)
     assert body["code"] == "not_ready"
-    assert body["message"] == "Cache unavailable."
+    assert body["message"] == "Service is not ready."
 
 
 def test_healthz_ready_200_when_all_healthy():
@@ -113,9 +119,9 @@ def test_healthz_ready_requires_recent_beat_worker_heartbeat():
     ):
         get_redis.return_value.ping.return_value = True
         get_redis.return_value.get.return_value = None
-        response = HealthCheckMiddleware(_boom)(RequestFactory().get("/healthz/ready"))
+    response = HealthCheckMiddleware(_boom)(RequestFactory().get("/healthz/ready"))
     assert response.status_code == 503
-    assert json.loads(response.content)["message"] == "Background workers unavailable."
+    assert json.loads(response.content)["message"] == "Service is not ready."
 
 
 @override_settings(HEALTH_READY_RATELIMIT="2/min")
@@ -133,10 +139,35 @@ def test_healthz_ready_has_bounded_pre_tenant_probe_rate():
     assert response.status_code == 429
 
 
+@override_settings(HEALTH_READY_RATELIMIT="2/min")
+def test_healthz_ready_rate_bucket_never_retains_plain_client_ip():
+    HealthCheckMiddleware._probe_buckets.clear()
+    raw_ip = "198.51.100.77"
+    request = RequestFactory().get("/healthz/ready", REMOTE_ADDR=raw_ip)
+
+    assert HealthCheckMiddleware._admit_probe(request) is True
+
+    expected = private_fingerprint(raw_ip, namespace="health-ready-probe")
+    assert set(HealthCheckMiddleware._probe_buckets) == {expected}
+    assert raw_ip not in repr(HealthCheckMiddleware._probe_buckets)
+
+
+@override_settings(HEALTH_READY_RATELIMIT="0/min")
+def test_invalid_health_probe_rate_returns_stable_not_ready_response():
+    response = HealthCheckMiddleware(_boom)(RequestFactory().get("/healthz/ready"))
+
+    assert response.status_code == 503
+    assert json.loads(response.content) == {
+        "success": False,
+        "code": "not_ready",
+        "message": "Service is not ready.",
+    }
+
+
 def test_redis_url_setting_defined_so_get_redis_constructs():
     """Regression (found deploying): the readiness probe + task DLQ go through the REAL
     (unmocked) get_redis(), which reads settings.REDIS_URL — but nothing defined it, so it
-    raised AttributeError → /healthz/ready always 503 'Cache unavailable' + the observability
+    raised AttributeError → /healthz/ready always returned not-ready + the observability
     DLQ push 500'd. The other health tests mock get_redis, hiding it. Assert the setting
     resolves and a real client constructs (lazy — no connection needed)."""
     from django.conf import settings
@@ -151,3 +182,25 @@ def test_redis_url_setting_defined_so_get_redis_constructs():
         assert client is not None
     finally:
         get_redis.cache_clear()
+
+
+def test_organization_timezone_context_wraps_the_entire_downstream_request(monkeypatch):
+    events: list[str] = []
+
+    @contextmanager
+    def timezone_context():
+        events.append("entered")
+        try:
+            yield
+        finally:
+            events.append("restored")
+
+    def downstream(_request):
+        events.append("view")
+        return HttpResponse("ok")
+
+    monkeypatch.setattr("core.timezones.organization_timezone_context", timezone_context)
+    response = OrganizationTimezoneMiddleware(downstream)(RequestFactory().get("/api/v1/tasks/"))
+
+    assert response.status_code == 200
+    assert events == ["entered", "view", "restored"]

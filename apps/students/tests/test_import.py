@@ -9,6 +9,7 @@ from django_tenants.utils import schema_context
 from apps.org.models import CenterSettings
 from apps.org.tests.factories import BranchFactory
 from apps.students.models import StudentProfile
+from apps.students.services import MAX_IMPORT_BYTES
 from core.permissions import Role
 
 pytestmark = pytest.mark.django_db
@@ -84,6 +85,14 @@ def test_csv_import_over_size_cap_400(registrar, tenant_a):
         settings_obj.max_upload_mb = 1
         settings_obj.save()
     payload = b"phone\n" + b"x" * (1024 * 1024)  # > 1 MB
+    resp = _post_csv(client, branch, payload)
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "file_too_large"
+
+
+def test_csv_import_never_inherits_large_generic_content_limit(registrar):
+    client, branch = registrar
+    payload = b"phone\n" + b"x" * MAX_IMPORT_BYTES
     resp = _post_csv(client, branch, payload)
     assert resp.status_code == 400
     assert resp.json()["code"] == "file_too_large"

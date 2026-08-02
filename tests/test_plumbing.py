@@ -41,7 +41,12 @@ async def test_ws_authed_connect_accepted(tenant_a, user_in):
             return user.pk, issue_token(user)["access"]
 
     user_pk, token = await _mint()
-    comm = WebsocketCommunicator(application, f"/ws/ping/?token={token}", headers=HOST_HEADERS)
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/ping/",
+        headers=HOST_HEADERS,
+        subprotocols=[f"bearer.{token}"],
+    )
     connected, _ = await comm.connect()
     assert connected
     assert await comm.receive_json_from() == {"type": "hello", "user_id": user_pk}
@@ -63,7 +68,12 @@ async def test_ws_cross_tenant_token_rejected(tenant_a, tenant_b, user_in):
             return issue_token(user)["access"]
 
     token = await _mint()
-    comm = WebsocketCommunicator(application, f"/ws/ping/?token={token}", headers=HOST_HEADERS_B)
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/ping/",
+        headers=HOST_HEADERS_B,
+        subprotocols=[f"bearer.{token}"],
+    )
     connected, close_code = await comm.connect()
     assert not connected
     assert close_code == 4401
@@ -87,7 +97,12 @@ async def test_ws_revoked_session_rejected(tenant_a, user_in):
         return token
 
     token = await _mint_and_revoke()
-    comm = WebsocketCommunicator(application, f"/ws/ping/?token={token}", headers=HOST_HEADERS)
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/ping/",
+        headers=HOST_HEADERS,
+        subprotocols=[f"bearer.{token}"],
+    )
     connected, close_code = await comm.connect()
     assert not connected
     assert close_code == 4401

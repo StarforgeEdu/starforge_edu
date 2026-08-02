@@ -36,12 +36,12 @@ class CohortRepository(BaseRepository[Cohort], ICohortRepository):
         return cohort.memberships.exists()
 
     def active_members(self, cohort: Cohort) -> QuerySet[CohortMembership]:
-        # `cohort` is join-loaded (alongside student__user) so membership_to_dict's
+        # `cohort` and the role-owned student profile are join-loaded so the
         # cohort_name/student_name add no query per row on the members list.
         return (
             CohortMembership.objects.filter(cohort=cohort, end_date__isnull=True)
-            .select_related("student__user", "cohort")
-            .order_by("student__user__last_name")
+            .select_related("student", "cohort")
+            .order_by("student__last_name", "student__first_name", "id")
         )
 
     def teacher_types(self) -> QuerySet[TeacherType]:

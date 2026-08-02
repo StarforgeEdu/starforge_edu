@@ -8,6 +8,7 @@ from typing import Any
 from rest_framework import serializers
 
 from apps.reports.models import Report, ReportFormat, ReportKey, ReportRun, ReportSchedule
+from core.tenant_context import assert_tenant_context
 
 
 class UtcDateTimeField(serializers.DateTimeField):
@@ -43,6 +44,7 @@ class ReportSerializer(serializers.ModelSerializer):
 class ReportRunReadSerializer(serializers.ModelSerializer):
     report_key = serializers.CharField(source="report.key", read_only=True)
     params = serializers.SerializerMethodField()
+    error = serializers.SerializerMethodField()
     download_url = serializers.SerializerMethodField()
     created_at = UtcDateTimeField(read_only=True)
     started_at = UtcDateTimeField(read_only=True)
@@ -66,6 +68,19 @@ class ReportRunReadSerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
+    def to_representation(self, instance: ReportRun) -> dict[str, Any]:
+        """Serialize tenant-owned rows only while their schema is active.
+
+        ``report_key`` traverses the tenant-local ``report`` relation.  A
+        detached ``ReportRun`` may no longer have that relation cached, so
+        allowing representation under the public schema would issue a lazy
+        query against the wrong schema.  Fail closed before DRF can perform
+        that query; request views and report workers already establish the
+        tenant context explicitly.
+        """
+        assert_tenant_context()
+        return super().to_representation(instance)
+
     def get_download_url(self, obj: ReportRun) -> str | None:
         # A fresh presign, only when the run is done.
         from apps.reports.services import presign_run
@@ -76,6 +91,10 @@ class ReportRunReadSerializer(serializers.ModelSerializer):
 
     def get_params(self, obj: ReportRun) -> dict:
         return {key: value for key, value in (obj.params or {}).items() if not key.startswith("_")}
+
+    def get_error(self, obj: ReportRun) -> str:
+        """Return a stable public code, including for legacy raw error rows."""
+        return "report_generation_failed" if obj.error or obj.status == ReportRun.Status.FAILED else ""
 
 
 class ReportRunCreateSerializer(serializers.Serializer):

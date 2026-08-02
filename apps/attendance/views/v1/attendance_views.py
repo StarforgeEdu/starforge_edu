@@ -29,9 +29,11 @@ from core.http import int_field, str_field
 from core.listing import apply_filters, paginate
 from core.permissions import get_user_roles
 from core.responses import error, paginated, success
+from core.spreadsheets import safe_cell
 
 _RESOURCE = "attendance"
 _VALID_STATUSES = {value for value, _label in AttendanceRecord.Status.choices}
+MAX_EXPORT_ROWS = 50_000
 
 
 def _service() -> IAttendanceService:
@@ -156,7 +158,14 @@ def export_view(request: HttpRequest) -> HttpResponseBase:
         qs = qs.filter(lesson__cohort_id=cohort)
     if term is not None:
         qs = qs.filter(lesson__term_id=term)
-    qs = qs.select_related("marked_by").order_by("lesson__starts_at", "student_id")
+    qs = qs.select_related("lesson", "student__user", "marked_by").order_by("lesson__starts_at", "student_id")
+    total = qs.count()
+    if total > MAX_EXPORT_ROWS:
+        raise ValidationException(
+            "Too many attendance rows to export; narrow the filters.",
+            code="export_too_large",
+            fields={"rows": [f"{total} rows match (max {MAX_EXPORT_ROWS})."]},
+        )
 
     response = StreamingHttpResponse(_csv_rows(qs), content_type="text/csv")
     response["Content-Disposition"] = 'attachment; filename="attendance.csv"'
@@ -286,14 +295,16 @@ def _parse_dt(request: HttpRequest, name: str):
 def _csv_rows(records):
     writer = csv.writer(_Echo())
     yield writer.writerow(["date", "lesson", "student", "status", "marked_by"])
-    for record in records.iterator():
+    for record in records.iterator(chunk_size=1000):
         yield writer.writerow(
             [
                 timezone.localdate(record.lesson.starts_at).isoformat(),
-                record.lesson.title,
-                record.student.get_full_name(),
-                record.status,
-                getattr(record.marked_by, "username", "") or ("auto" if record.auto_marked else ""),
+                safe_cell(record.lesson.title),
+                safe_cell(record.student.get_full_name()),
+                safe_cell(record.status),
+                safe_cell(
+                    getattr(record.marked_by, "username", "") or ("auto" if record.auto_marked else "")
+                ),
             ]
         )
 

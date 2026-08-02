@@ -26,7 +26,7 @@ from core.http import decimal_field, int_field, read_json, trimmed_str_field
 from core.listing import apply_filters, paginate
 from core.permissions import get_user_roles
 from core.responses import created, error, paginated, success
-from core.scoping import is_unscoped, permission_membership_branch_ids
+from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 
 _RESOURCE = "sale"
 _MAX_QUANTITY = 1_000_000  # old serializer IntegerField(max_value=1_000_000)
@@ -42,7 +42,9 @@ def _scope(request: HttpRequest, permission: str) -> tuple[bool, set[int]]:
     the branches of their (non-null-branch) role memberships."""
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     roles = get_user_roles(req)
-    return is_unscoped(req), permission_membership_branch_ids(roles=roles, permission=permission)
+    return is_permission_unscoped(req, permission=permission), permission_membership_branch_ids(
+        roles=roles, permission=permission
+    )
 
 
 @csrf_exempt

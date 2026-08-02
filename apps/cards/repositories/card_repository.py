@@ -83,9 +83,8 @@ class CardRepository(BaseRepository[Card], ICardRepository):
 class WalletRepository(BaseRepository[Wallet], IWalletRepository):
     model = Wallet
 
-    def get_or_create_for(self, *, student) -> Wallet:
-        wallet, _created = Wallet.objects.get_or_create(student=student)
-        return wallet
+    def get_for(self, *, student) -> Wallet | None:
+        return Wallet.objects.filter(student=student).first()
 
     def recent_transactions(self, *, wallet: Wallet, limit: int = 50) -> list[WalletTransaction]:
         return list(wallet.transactions.all()[:limit])

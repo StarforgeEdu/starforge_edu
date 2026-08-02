@@ -40,6 +40,3 @@ class PaymentRepository(BaseRepository[Payment], IPaymentRepository):
 
     def scoped(self) -> QuerySet[Payment]:
         return selectors.payments_qs()
-
-    def get(self, *, pk: int) -> Payment | None:
-        return selectors.payments_qs().filter(pk=pk).first()

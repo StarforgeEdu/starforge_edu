@@ -11,26 +11,60 @@ from apps.notifications.interfaces.repositories import (
     INotificationRepository,
     INotificationTemplateRepository,
 )
-from apps.notifications.models import Notification, NotificationPreference, NotificationTemplate
+from apps.notifications.models import (
+    DELIVERABLE_ATTRIBUTION_STATUSES,
+    Notification,
+    NotificationPreference,
+    NotificationTemplate,
+)
 from core.repositories import BaseRepository
 
 
 class NotificationRepository(BaseRepository[Notification], INotificationRepository):
     model = Notification
 
-    def feed(self, *, user) -> QuerySet[Notification]:
+    def feed(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[Notification]:
         # feed_for_user orders (-created_at); add the id tiebreaker for keyset cursor
         # pagination (deterministic, no skipped/duplicated rows on same-ms ties).
-        return selectors.feed_for_user(user=user).order_by("-created_at", "-id")
+        return selectors.feed_for_user(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        ).order_by("-created_at", "-id")
 
-    def get_own(self, *, user, pk: int) -> Notification | None:
-        return Notification.objects.filter(user=user, pk=pk).first()
+    def get_own(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        pk: int,
+    ) -> Notification | None:
+        return Notification.objects.filter(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+            attribution_status__in=DELIVERABLE_ATTRIBUTION_STATUSES,
+            pk=pk,
+        ).first()
 
-    def unread_count(self, *, user) -> int:
-        return selectors.unread_count(user=user)
+    def unread_count(self, *, user, recipient_principal_kind: str, recipient_principal_id: int) -> int:
+        return selectors.unread_count(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        )
 
-    def preferences(self, *, user) -> QuerySet[NotificationPreference]:
-        return selectors.preferences_for_user(user=user)
+    def preferences(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[NotificationPreference]:
+        return selectors.preferences_for_user(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        )
 
 
 class NotificationTemplateRepository(BaseRepository[NotificationTemplate], INotificationTemplateRepository):

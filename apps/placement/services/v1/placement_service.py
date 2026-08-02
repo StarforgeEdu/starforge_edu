@@ -74,8 +74,15 @@ class PlacementService(IPlacementService):
     def reject_test(self, *, test: PlacementTest, reviewer: Any, reason: str) -> PlacementTest:
         return domain.reject_test(test=test, reviewer=reviewer, reason=reason)
 
-    def request_generation(self, *, test: PlacementTest, requested_by: Any, **params: Any) -> Any:
-        return domain.request_placement_generation(test=test, requested_by=requested_by, **params)
+    def request_generation(
+        self, *, test: PlacementTest, requested_by: Any, requested_principal: Any, **params: Any
+    ) -> Any:
+        return domain.request_placement_generation(
+            test=test,
+            requested_by=requested_by,
+            requested_principal=requested_principal,
+            **params,
+        )
 
     # --- attempt lifecycle ---
     def assign(self, *, test: PlacementTest, student: Any, assigned_by: Any) -> PlacementAttempt:
@@ -84,8 +91,14 @@ class PlacementService(IPlacementService):
     def submit_attempt(self, *, attempt: PlacementAttempt, answers: list[dict]) -> PlacementAttempt:
         return domain.submit_attempt(attempt=attempt, answers=answers)
 
-    def request_writing_marking(self, *, attempt: PlacementAttempt, requested_by: Any) -> Any:
-        return domain.request_writing_marking(attempt=attempt, requested_by=requested_by)
+    def request_writing_marking(
+        self, *, attempt: PlacementAttempt, requested_by: Any, requested_principal: Any
+    ) -> Any:
+        return domain.request_writing_marking(
+            attempt=attempt,
+            requested_by=requested_by,
+            requested_principal=requested_principal,
+        )
 
     def mark_writing_manual(self, *, attempt: PlacementAttempt, marks: list[dict]) -> PlacementAttempt:
         return domain.mark_writing_manually(attempt=attempt, marks=marks)

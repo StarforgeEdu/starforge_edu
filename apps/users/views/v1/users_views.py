@@ -12,28 +12,96 @@ from typing import Any
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
+from django.db.models import Prefetch, Q, QuerySet
 from django.http import HttpRequest, HttpResponse
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.users.interfaces.services import IUserService
-from apps.users.models import Device, User
-from apps.users.presenters import device_to_dict, role_account_to_dict, user_to_dict
+from apps.users.models import Device, RoleMembership, User
+from apps.users.openapi_contracts import (
+    ME_GET_CONTRACT,
+    ME_HEAD_CONTRACT,
+    ME_PATCH_CONTRACT,
+    SESSION_DELETE_CONTRACT,
+    SESSIONS_GET_CONTRACT,
+    SESSIONS_HEAD_CONTRACT,
+)
+from apps.users.presenters import (
+    device_to_dict,
+    permission_context_to_dict,
+    role_account_to_dict,
+    session_to_dict,
+    user_directory_row_to_dict,
+    user_to_dict,
+)
 from core.api_auth import check_perm, deny_read_only_token, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
-from core.http import read_json, str_field
-from core.listing import apply_filters, paginate
+from core.http import read_json, reject_unknown_fields, str_field
+from core.listing import apply_filters, paginate, validate_pagination_filters
+from core.openapi_contracts import openapi_contract
+from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
+from core.scoping import is_permission_unscoped, permission_membership_scope_q
 from core.utils import current_schema, user_agent
 
 _GENDERS = frozenset(g[0] for g in User.Gender.choices)
 _LANGUAGES = frozenset(lang[0] for lang in User.Language.choices)
 _PLATFORMS = frozenset(p[0] for p in Device.PLATFORM_CHOICES)
+_DIRECTORY_SEARCH = ("username", "first_name", "middle_name", "last_name", "phone")
+_DIRECTORY_ORDERING = ("id", "username", "first_name", "last_name", "date_joined", "last_seen_at")
+_ME_WRITABLE_FIELDS = frozenset(
+    {
+        "first_name",
+        "last_name",
+        "middle_name",
+        "phone",
+        "email",
+        "birthdate",
+        "gender",
+        "preferred_language",
+    }
+)
 
 
 def _service() -> IUserService:
     return container.resolve(IUserService)  # type: ignore[type-abstract]
+
+
+def _organization_presentation_defaults() -> dict[str, str]:
+    """Authoritative tenant-wide display defaults from CenterSettings."""
+    from django.conf import settings as django_settings
+
+    from apps.org.selectors import get_center_settings
+
+    center_settings = get_center_settings()
+    locale = center_settings.default_language or str(django_settings.LANGUAGE_CODE).split("-")[0]
+    return {
+        "organization_locale": locale,
+        "organization_timezone": center_settings.organization_timezone,
+        "primary_currency": center_settings.currency_primary,
+    }
+
+
+def _session_presentation(request: HttpRequest) -> dict[str, Any]:
+    """Public current-session metadata without exposing the credential digest."""
+
+    from core.session_auth import session_idle_timeout
+
+    session = getattr(request, "auth", None)
+    if session is None:
+        return {}
+    idle_expires_at = min(session.expires_at, session.last_used_at + session_idle_timeout())
+    return {
+        "session_id": session.pk,
+        "session_created_at": session.created_at.isoformat(),
+        "session_last_activity_at": session.last_used_at.isoformat(),
+        "session_expires_at": session.expires_at.isoformat(),
+        "session_idle_expires_at": idle_expires_at.isoformat(),
+        "server_time": timezone.now().isoformat(),
+    }
 
 
 def _role_account(request: HttpRequest):
@@ -48,7 +116,15 @@ def _role_account(request: HttpRequest):
 
     model = _role_account_models().get(kind)
     account = (
-        model.objects.select_related("user").filter(pk=account_id, user=request.user).first()
+        model.objects.select_related("user")
+        .prefetch_related(
+            Prefetch(
+                "user__role_memberships",
+                queryset=RoleMembership.objects.select_related("account_type", "branch", "department"),
+            )
+        )
+        .filter(pk=account_id, user=request.user)
+        .first()
         if model
         else None
     )
@@ -105,14 +181,51 @@ def _choice(raw: Any, name: str, choices: frozenset[str]) -> str:
     return raw
 
 
+def _directory_query(request: HttpRequest) -> QuerySet[User]:
+    """Return only users covered by the exact memberships granting ``users:read``.
+
+    A branch-wide grant sees active assignments anywhere in that branch.  A
+    department grant sees only active assignments at the same branch/department
+    boundary.  Target memberships whose account type is inactive (or whose
+    assignment is revoked) neither make a user visible nor appear in the detail
+    payload.  Director/superuser authority remains organization-wide.
+
+    Replacing the repository's general prefetch is security-significant: a user
+    visible through Branch A may also hold a Branch B assignment, and that second
+    assignment must not leak through ``role_memberships`` on the detail response.
+    """
+    queryset = _service().query()
+    if is_permission_unscoped(request, permission="users:read"):
+        return queryset
+
+    visible_memberships = (
+        RoleMembership.objects.filter(revoked_at__isnull=True)
+        .filter(Q(account_type__isnull=True) | Q(account_type__is_active=True))
+        .filter(
+            permission_membership_scope_q(
+                roles=get_user_roles(request),
+                permission="users:read",
+                branch_field="branch_id",
+                department_field="department_id",
+            )
+        )
+        .select_related("account_type", "branch", "department")
+    )
+    return (
+        queryset.filter(role_memberships__in=visible_memberships)
+        .distinct()
+        .prefetch_related(None)
+        .prefetch_related(Prefetch("role_memberships", queryset=visible_memberships))
+    )
+
+
 # --- /me self-service update ------------------------------------------------
 
 
 def _me_changes(request: HttpRequest) -> dict[str, Any]:
-    """Build the changes-dict for the writable UserSerializer fields present in the
-    body. Read-only fields (username/is_staff/roles/date_joined/last_seen_at) are
-    simply not read, so a PATCH attempting them is a no-op on them (parity)."""
+    """Build a validated changes mapping for a legacy User-backed session."""
     data = read_json(request)
+    reject_unknown_fields(data, allowed=_ME_WRITABLE_FIELDS)
     changes: dict[str, Any] = {}
     # NOT-NULL blank strings: reject explicit null, allow "", bounded at 150 (trimmed).
     for field in ("first_name", "last_name", "middle_name"):
@@ -141,8 +254,6 @@ def _me_changes(request: HttpRequest) -> dict[str, Any]:
     # birthdate: nullable date.
     if "birthdate" in data:
         changes["birthdate"] = _date_value(data["birthdate"])
-    if "is_active" in data:
-        raise _reject("is_active", "Account activation can only be changed by an administrator.")
     return changes
 
 
@@ -187,9 +298,21 @@ def users_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "users:read")
-    qs = apply_filters(request, _service().query(), default_ordering="id")
+    qs = apply_filters(
+        request,
+        _directory_query(request),
+        filter_fields=("is_active",),
+        search_fields=_DIRECTORY_SEARCH,
+        ordering_fields=_DIRECTORY_ORDERING,
+        default_ordering="id",
+    )
     items, total, page, size = paginate(request, qs)
-    return paginated([user_to_dict(u) for u in items], total=total, page=page, page_size=size)
+    return paginated(
+        [user_directory_row_to_dict(user) for user in items],
+        total=total,
+        page=page,
+        page_size=size,
+    )
 
 
 @csrf_exempt
@@ -198,12 +321,16 @@ def user_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "users:read")
-    user = _service().get(pk)
+    user = _directory_query(request).filter(pk=pk).first()
     if user is None:
         raise NotFoundException(code="not_found")
     return success(user_to_dict(user))
 
 
+@openapi_contract(
+    path="/api/v1/users/me/",
+    operations=(ME_GET_CONTRACT, ME_HEAD_CONTRACT, ME_PATCH_CONTRACT),
+)
 @csrf_exempt
 @require_auth
 def me_view(request: HttpRequest) -> HttpResponse:
@@ -211,7 +338,21 @@ def me_view(request: HttpRequest) -> HttpResponse:
     kind, account = _role_account(request)
 
     def payload() -> dict[str, Any]:
-        profile = role_account_to_dict(kind, account) if account is not None else user_to_dict(user)
+        if account is not None:
+            from core.permissions import get_role_memberships
+
+            profile = role_account_to_dict(
+                kind,
+                account,
+                memberships=get_role_memberships(request),
+            )
+        else:
+            hydrated_user = _service().get(user.pk) or user
+            profile = user_to_dict(hydrated_user)
+        profile.update(permission_context_to_dict(request))
+        profile.update(_organization_presentation_defaults())
+        profile.update(_session_presentation(request))
+        profile["read_only_session"] = bool(getattr(getattr(request, "auth", None), "read_only", False))
         profile["tenant_slug"] = current_schema()
         return profile
 
@@ -224,16 +365,30 @@ def me_view(request: HttpRequest) -> HttpResponse:
         deny_read_only_token(request)
         if account is not None:
             body = read_json(request)
-            if "is_active" in body:
-                raise _reject(
-                    "is_active",
-                    "Account activation can only be changed by an administrator.",
+            reject_unknown_fields(body, allowed=_ME_WRITABLE_FIELDS)
+            changes: dict[str, Any] = {}
+            for field in ("first_name", "last_name", "middle_name"):
+                if field in body:
+                    changes[field] = _str_notnull(
+                        _reject_null(body[field], field),
+                        field,
+                        max_length=150,
+                        strip=True,
+                    )
+            if "phone" in body:
+                changes["phone"] = (
+                    ""
+                    if body["phone"] is None
+                    else _str_notnull(
+                        body["phone"],
+                        "phone",
+                        max_length=32,
+                        strip=True,
+                    )
                 )
-            changes = {
-                field: body[field]
-                for field in ("first_name", "last_name", "middle_name", "phone", "email")
-                if field in body
-            }
+            if "email" in body:
+                email = _email_value(body["email"])
+                changes["email"] = email or ""
             if "birthdate" in body:
                 changes["birthdate"] = _date_value(body["birthdate"])
             if "gender" in body:
@@ -242,15 +397,117 @@ def me_view(request: HttpRequest) -> HttpResponse:
                 if not isinstance(raw_gender, str) or (raw_gender and raw_gender not in choices):
                     raise _reject("gender", f"Must be blank or one of: {', '.join(sorted(choices))}.")
                 changes["gender"] = raw_gender
+            preferred_language = None
+            if "preferred_language" in body:
+                preferred_language = _choice(
+                    _reject_null(body["preferred_language"], "preferred_language"),
+                    "preferred_language",
+                    _LANGUAGES,
+                )
             from apps.users.services import update_role_identity
 
-            update_role_identity(account, changes)
+            update_role_identity(
+                account,
+                changes,
+                preferred_language=preferred_language,
+            )
             return success(payload())
         updated = _service().update_me(user=user, changes=_me_changes(request))
-        profile = user_to_dict(updated)
+        profile = user_to_dict(_service().get(updated.pk) or updated)
+        profile.update(permission_context_to_dict(request))
+        profile.update(_organization_presentation_defaults())
+        profile.update(_session_presentation(request))
+        profile["read_only_session"] = bool(getattr(getattr(request, "auth", None), "read_only", False))
         profile["tenant_slug"] = current_schema()
         return success(profile)
     return _method_not_allowed()
+
+
+def _session_principal(request: HttpRequest) -> tuple[str, int | None]:
+    session = getattr(request, "auth", None)
+    return (
+        str(getattr(session, "principal_kind", "") or ""),
+        getattr(session, "principal_id", None),
+    )
+
+
+def _validate_sessions_query(request: HttpRequest) -> None:
+    allowed = {"page", "page_size"}
+    unknown = sorted(set(request.GET) - allowed)
+    duplicates = sorted(name for name in request.GET if len(request.GET.getlist(name)) != 1)
+    if unknown or duplicates:
+        fields = {
+            name: ["Unknown query parameter." if name in unknown else "Supply this query parameter once."]
+            for name in sorted(set(unknown) | set(duplicates))
+        }
+        raise ValidationException(
+            "Invalid session-register query.",
+            code="validation_error",
+            fields=fields,
+        )
+    validate_pagination_filters(request)
+
+
+@openapi_contract(
+    path="/api/v1/users/sessions/",
+    operations=(SESSIONS_GET_CONTRACT, SESSIONS_HEAD_CONTRACT),
+)
+@csrf_exempt
+@require_auth
+def sessions_collection_view(request: HttpRequest) -> HttpResponse:
+    if request.method not in ("GET", "HEAD"):
+        return _method_not_allowed()
+    _validate_sessions_query(request)
+    principal_kind, principal_id = _session_principal(request)
+    user: Any = request.user
+    queryset = _service().sessions_for(
+        user=user,
+        principal_kind=principal_kind,
+        principal_id=principal_id,
+    )
+    items, total, page, size = paginate(request, queryset)
+    current_session_id = int(getattr(getattr(request, "auth", None), "pk", 0))
+    return paginated(
+        [session_to_dict(item, current_session_id=current_session_id) for item in items],
+        total=total,
+        page=page,
+        page_size=size,
+    )
+
+
+@openapi_contract(
+    path="/api/v1/users/sessions/{pk}/",
+    operations=(SESSION_DELETE_CONTRACT,),
+)
+@csrf_exempt
+@require_auth
+def session_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method != "DELETE":
+        return _method_not_allowed()
+    deny_read_only_token(request)
+    principal_kind, principal_id = _session_principal(request)
+    user: Any = request.user
+    if not _service().revoke_session(
+        user=user,
+        principal_kind=principal_kind,
+        principal_id=principal_id,
+        session_id=pk,
+    ):
+        raise NotFoundException(code="not_found")
+    response = no_content()
+    if (
+        pk == getattr(getattr(request, "auth", None), "pk", None)
+        and getattr(request, "auth_transport", "") == "cookie"
+    ):
+        from django.conf import settings
+
+        response.delete_cookie(
+            getattr(settings, "API_SESSION_COOKIE_NAME", "starforge_session"),
+            samesite=getattr(settings, "API_SESSION_COOKIE_SAMESITE", "Lax"),
+            path=getattr(settings, "API_SESSION_COOKIE_PATH", "/"),
+        )
+        response["Cache-Control"] = "no-store"
+    return response
 
 
 @csrf_exempt

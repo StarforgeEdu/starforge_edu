@@ -7,6 +7,8 @@ UserSerializer; this proves the endpoint round-trips it and stays self-scoped.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 pytestmark = pytest.mark.django_db
@@ -34,8 +36,8 @@ def test_patch_me_rejects_invalid_language(tenant_a, user_in, as_user):
     assert resp.json()["code"] == "validation_error"
 
 
-def test_patch_me_ignores_read_only_fields(tenant_a, user_in, as_user):
-    """username / is_staff are read-only — a PATCH attempting them is a no-op on them."""
+def test_patch_me_rejects_unknown_and_read_only_fields_atomically(tenant_a, user_in, as_user):
+    """A typo or read-only field must not yield a misleading successful update."""
     user = user_in(tenant_a, preferred_language="uz")
     original_username = user.username
     client = as_user(tenant_a, user)
@@ -46,9 +48,11 @@ def test_patch_me_ignores_read_only_fields(tenant_a, user_in, as_user):
         format="json",
     )
 
-    assert resp.status_code == 200, resp.content
+    assert resp.status_code == 400, resp.content
+    assert resp.json()["code"] == "validation_error"
+    assert set(resp.json()["errors"]) == {"is_staff", "username"}
     user.refresh_from_db()
-    assert user.preferred_language == "en"
+    assert user.preferred_language == "uz"
     assert user.username == original_username
     assert user.is_staff is False
 
@@ -93,3 +97,139 @@ def test_patch_me_cannot_deactivate_own_account(tenant_a, user_in, as_user):
     assert "is_active" in response.json()["errors"]
     user.refresh_from_db()
     assert user.is_active is True
+
+
+def test_role_session_round_trips_preferred_language(tenant_a, client_for):
+    from django_tenants.utils import schema_context
+
+    from apps.students.tests.factories import StudentProfileFactory
+    from core.session_auth import create_session
+
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory(username="localized.student")
+        student.user.preferred_language = "uz"
+        student.user.save(update_fields=["preferred_language"])
+        access = create_session(
+            student.user,
+            principal_kind="student",
+            principal_id=student.pk,
+        ).key
+
+    client = client_for(tenant_a)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+    response = client.patch(
+        "/api/v1/users/me/",
+        {"preferred_language": "ru"},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert response.json()["data"]["preferred_language"] == "ru"
+    with schema_context(tenant_a.schema_name):
+        student.user.refresh_from_db()
+        assert student.user.preferred_language == "ru"
+
+
+def test_role_preference_update_does_not_rewrite_identity(tenant_a):
+    """A preference-only write must not touch role identity or bridge lifecycle."""
+    from django_tenants.utils import schema_context
+
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.users.services import update_role_identity
+
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory(username="preference-only.student")
+        with (
+            patch.object(student, "save") as role_save,
+            patch("apps.users.services.sync_role_user_bridge") as bridge_sync,
+        ):
+            update_role_identity(student, {}, preferred_language="ru")
+
+        role_save.assert_not_called()
+        bridge_sync.assert_not_called()
+        student.user.refresh_from_db()
+        assert student.user.preferred_language == "ru"
+
+
+def test_role_identity_update_writes_only_requested_columns(tenant_a):
+    """A stale PATCH must not persist unrelated values from its model instance."""
+    from django_tenants.utils import schema_context
+
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.users.services import update_role_identity
+
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory(username="partial-identity.student")
+        with (
+            patch.object(student, "save", wraps=student.save) as role_save,
+            patch("apps.users.services.sync_role_user_bridge"),
+        ):
+            update_role_identity(student, {"first_name": "Updated"})
+
+        assert role_save.call_args.kwargs == {
+            "update_fields": ["first_name", "updated_at"],
+        }
+
+
+def test_role_session_rejects_unknown_profile_fields(tenant_a, client_for):
+    from django_tenants.utils import schema_context
+
+    from apps.students.tests.factories import StudentProfileFactory
+    from core.session_auth import create_session
+
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory(username="strict-profile.student")
+        access = create_session(
+            student.user,
+            principal_kind="student",
+            principal_id=student.pk,
+        ).key
+
+    client = client_for(tenant_a)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+    response = client.patch(
+        "/api/v1/users/me/",
+        {"preferred_language": "en", "is_active": False},
+        format="json",
+    )
+
+    assert response.status_code == 400, response.content
+    assert response.json()["errors"] == {"is_active": ["This field is not supported."]}
+    with schema_context(tenant_a.schema_name):
+        student.user.refresh_from_db()
+        assert student.user.preferred_language == "uz"
+
+
+def test_role_session_can_clear_nullable_contact_fields(tenant_a, client_for):
+    from django_tenants.utils import schema_context
+
+    from apps.students.tests.factories import StudentProfileFactory
+    from core.session_auth import create_session
+
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory(
+            username="clear-contact.student",
+            phone="+998901112233",
+            email="clear-contact@example.test",
+        )
+        access = create_session(
+            student.user,
+            principal_kind="student",
+            principal_id=student.pk,
+        ).key
+
+    client = client_for(tenant_a)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+    response = client.patch(
+        "/api/v1/users/me/",
+        {"phone": None, "email": None},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert response.json()["data"]["phone"] == ""
+    assert response.json()["data"]["email"] == ""
+    with schema_context(tenant_a.schema_name):
+        student.refresh_from_db()
+        assert student.phone == ""
+        assert student.email == ""

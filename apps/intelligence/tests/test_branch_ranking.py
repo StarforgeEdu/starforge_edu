@@ -176,6 +176,32 @@ def test_branch_ranking_scoped_to_membership(tenant_a, as_role, user_in, as_user
     assert poor.id not in ids  # a branch-scoped manager sees only their own branch
 
 
+def test_department_only_membership_does_not_expand_to_branch_ranking(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.org.tests.factories import DepartmentFactory
+    from apps.users.models import RoleMembership
+
+    branch = _make_branch(tenant_a, [{"present": 5, "grade": 90}] * 3)
+    with schema_context(tenant_a.schema_name):
+        department = DepartmentFactory(branch=branch)
+        viewer = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=viewer,
+            role=Role.HEAD_OF_DEPT,
+            branch=branch,
+            department=department,
+        )
+        viewer.refresh_from_db()
+
+    response = as_user(tenant_a, viewer).get(BRANCHES)
+
+    assert response.status_code == 200
+    assert response.json()["data"]["results"] == []
+
+
 def test_finance_signal_is_gated_out_of_overdue_and_at_risk(tenant_a, as_role, user_in, as_user):
     # students healthy on attendance + grades, at-risk ONLY via the overdue invoice
     branch = _make_branch(tenant_a, [{"present": 5, "grade": 90, "overdue": True}] * 3)

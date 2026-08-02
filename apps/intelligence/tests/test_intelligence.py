@@ -63,6 +63,34 @@ def test_low_grades_and_overdue_flags_via_api(tenant_a, as_role):
     assert row["level"] == "medium"
 
 
+def test_transferred_student_does_not_carry_source_branch_debt_into_risk_feed(
+    tenant_a,
+    as_role,
+):
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.finance.models import Invoice
+    from apps.finance.tests.factories import InvoiceFactory
+    from apps.org.tests.factories import BranchFactory
+    from apps.students.tests.factories import StudentProfileFactory
+
+    director, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        source = BranchFactory.create()
+        destination = BranchFactory.create()
+        source_cohort = CohortFactory.create(branch=source)
+        destination_cohort = CohortFactory.create(branch=destination)
+        student = StudentProfileFactory.create(branch=source, current_cohort=source_cohort)
+        InvoiceFactory.create(student=student, status=Invoice.Status.OVERDUE)
+        student.branch = destination
+        student.current_cohort = destination_cohort
+        student.save(update_fields=("branch", "current_cohort", "updated_at"))
+
+    body = director.get(RISK).json()["data"]
+    assert all(row["student"] != student.pk for row in body["results"])
+    detail = director.get(f"{RISK}{student.pk}/").json()["data"]
+    assert detail["flags"] == []
+
+
 def test_healthy_student_is_not_flagged(tenant_a, as_role):
     from apps.academics.tests.factories import ExamFactory, ExamResultFactory
     from apps.students.tests.factories import StudentProfileFactory
@@ -327,9 +355,59 @@ def test_risk_pagination_invalid_filter_and_head(tenant_a, as_role):
     invalid = director.get(f"{RISK}?cohort=not-an-integer")
     assert invalid.status_code == 400
     assert "cohort" in invalid.json()["errors"]
+    for query, field in (
+        ("cohort=0", "cohort"),
+        ("cohort=1&cohort=2", "cohort"),
+        ("page=0", "page"),
+        ("page_size=101", "page_size"),
+        ("brach=1", "brach"),
+    ):
+        rejected = director.get(f"{RISK}?{query}")
+        assert rejected.status_code == 400
+        assert field in rejected.json()["errors"]
+    for url in (
+        "/api/v1/intelligence/branches/?brach=1",
+        "/api/v1/intelligence/families/?page=1&page=2",
+        "/api/v1/intelligence/teachers/?page_size=101",
+        f"{RISK}{student.id}/?unexpected=true",
+        f"{RULES}?unexpected=true",
+    ):
+        assert director.get(url).status_code == 400
     assert director.head(RISK).status_code == 200
     assert director.head(f"{RISK}{student.id}/").status_code == 200
     assert director.head("/api/v1/intelligence/branches/").status_code == 200
     assert director.head("/api/v1/intelligence/families/").status_code == 200
     assert director.head("/api/v1/intelligence/teachers/").status_code == 200
     assert director.head(RULES).status_code == 200
+
+
+def test_risk_page_query_count_is_population_invariant(tenant_a, as_role):
+    from apps.academics.tests.factories import ExamFactory, ExamResultFactory
+    from apps.students.tests.factories import StudentProfileFactory
+
+    director, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory.create()
+        exam = ExamFactory.create(is_published=True)
+        ExamResultFactory.create(exam=exam, student=student, score=Decimal("10"))
+
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as small_capture:
+        small = director.get(f"{RISK}?page_size=1")
+    with schema_context(tenant_a.schema_name):
+        for _ in range(40):
+            student = StudentProfileFactory.create()
+            exam = ExamFactory.create(is_published=True)
+            ExamResultFactory.create(exam=exam, student=student, score=Decimal("10"))
+    with CaptureQueriesContext(connection) as large_capture:
+        large = director.get(f"{RISK}?page_size=1")
+
+    assert small.status_code == 200, small.content
+    assert large.status_code == 200, large.content
+    assert small.json()["data"]["count"] == 1
+    assert large.json()["data"]["count"] == 41
+    assert len(small.json()["data"]["results"]) == 1
+    assert len(large.json()["data"]["results"]) == 1
+    assert len(large_capture) <= len(small_capture) + 1

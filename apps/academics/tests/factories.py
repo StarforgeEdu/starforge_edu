@@ -51,6 +51,16 @@ class ExamResultFactory(factory.django.DjangoModelFactory[ExamResult]):
     student = factory.SubFactory(StudentProfileFactory)
     score = Decimal("80")
 
+    @classmethod
+    def _create(cls, model_class, *args, **kwargs):
+        # Factories intentionally build historical fixtures in any lifecycle
+        # state. Production writes must go through the services; this narrow test
+        # helper enters the same DB-guard capability explicitly.
+        from apps.academics.integrity import assessment_integrity_write
+
+        with assessment_integrity_write():
+            return super()._create(model_class, *args, **kwargs)
+
 
 class GradeFactory(factory.django.DjangoModelFactory[Grade]):
     class Meta:

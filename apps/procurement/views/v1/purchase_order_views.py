@@ -29,7 +29,7 @@ from core.permissions import get_user_roles
 from core.responses import created, error, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_branch_ids,
 )
 
@@ -48,7 +48,14 @@ def _scope(request: HttpRequest) -> tuple[bool, set[int]]:
     handler_branch_ids = permission_membership_branch_ids(
         roles=roles, permission="approvals:approve"
     ) | permission_membership_branch_ids(roles=roles, permission="approvals:disburse")
-    return is_unscoped(req), handler_branch_ids
+    visibility_permissions = {
+        f"{_RESOURCE}:read",
+        "approvals:approve",
+        "approvals:disburse",
+    }
+    return any(
+        is_permission_unscoped(req, permission=permission) for permission in visibility_permissions
+    ), handler_branch_ids
 
 
 @csrf_exempt
@@ -166,7 +173,7 @@ def _resolve_branch(request: HttpRequest, body: dict[str, Any]):
     an absent/null branch is a centre-wide PO."""
     if body.get("branch") is None:
         req: Any = request
-        if is_unscoped(req):
+        if is_permission_unscoped(req, permission=f"{_RESOURCE}:write"):
             return None
         write_branch_ids = permission_membership_branch_ids(
             roles=get_user_roles(req), permission=f"{_RESOURCE}:write"

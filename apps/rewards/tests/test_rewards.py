@@ -26,11 +26,19 @@ def _rows(body):
     return body
 
 
-def test_cash_reward_routes_through_a1_to_the_ledger(tenant_a, as_role):
-    director, _ = as_role(Role.DIRECTOR)
-    hod_client, _h = as_role(Role.HEAD_OF_DEPT)
-    teacher_client, teacher = as_role(Role.TEACHER)
-    cashier, _c = as_role(Role.CASHIER)
+def test_cash_reward_routes_through_a1_to_the_ledger(tenant_a, user_in, as_user):
+    with schema_context(tenant_a.schema_name):
+        from apps.org.tests.factories import BranchFactory
+
+        branch = BranchFactory()
+    director_user = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
+    hod_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
+    teacher = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    cashier_user = user_in(tenant_a, roles=[Role.CASHIER], branch=branch)
+    director = as_user(tenant_a, director_user)
+    hod_client = as_user(tenant_a, hod_user)
+    teacher_client = as_user(tenant_a, teacher)
+    cashier = as_user(tenant_a, cashier_user)
     with schema_context(tenant_a.schema_name):
         from apps.finance.models import PaymentMethod
 

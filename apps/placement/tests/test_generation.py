@@ -79,7 +79,12 @@ def _mock_complete(monkeypatch, text):
     monkeypatch.setattr(
         ai_tasks,
         "complete",
-        lambda **kw: {"text": text, "usage": {"input_tokens": 10, "output_tokens": 20}},
+        lambda **kw: {
+            "text": text,
+            "raw_id": "msg_placement_generation",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        },
     )
 
 
@@ -118,7 +123,10 @@ def test_generate_tolerates_unparseable_output(tenant_a, user_in, as_user, monke
         from apps.placement.services import request_placement_generation
 
         ai_request = request_placement_generation(test=test, count=4, requested_by=s["teacher_u"])
-        ai_tasks.run_placement_generation(ai_request.pk, params={"test_id": test.id, "count": 4})
+        ai_tasks.run_placement_generation(
+            ai_request.pk,
+            params={"test_id": test.id, "count": 4, "difficulty": "medium", "topic": ""},
+        )
         ai_request.refresh_from_db()
         # generation "succeeded" (it returned text); parsing added nothing — never a hard failure
         assert ai_request.status == AIRequest.Status.SUCCEEDED
@@ -138,7 +146,10 @@ def test_generate_strips_markdown_fences(tenant_a, user_in, as_user, monkeypatch
         from apps.placement.services import request_placement_generation
 
         ai_request = request_placement_generation(test=test, count=1, requested_by=s["teacher_u"])
-        ai_tasks.run_placement_generation(ai_request.pk, params={"test_id": test.id, "count": 1})
+        ai_tasks.run_placement_generation(
+            ai_request.pk,
+            params={"test_id": test.id, "count": 1, "difficulty": "medium", "topic": ""},
+        )
         assert PlacementQuestion.objects.filter(test=test).count() == 1
 
 
@@ -157,7 +168,10 @@ def test_generate_does_not_mutate_a_non_draft_test(tenant_a, user_in, as_user, m
         ai_request = request_placement_generation(test=test, count=1, requested_by=s["teacher_u"])
         # the test advances out of DRAFT before the task runs
         PlacementTest.objects.filter(pk=test.id).update(status=PlacementTest.Status.PENDING)
-        ai_tasks.run_placement_generation(ai_request.pk, params={"test_id": test.id, "count": 1})
+        ai_tasks.run_placement_generation(
+            ai_request.pk,
+            params={"test_id": test.id, "count": 1, "difficulty": "medium", "topic": ""},
+        )
         assert PlacementQuestion.objects.filter(test=test).count() == 0
 
 

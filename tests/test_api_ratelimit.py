@@ -10,6 +10,7 @@ buckets around every test.
 from __future__ import annotations
 
 import pytest
+from django.conf import settings
 from django.test import override_settings
 
 from core.middleware import _parse_rate
@@ -53,6 +54,21 @@ def test_authenticated_flood_is_throttled_per_user(tenant_a, as_role):
     assert other.get(URL).status_code == 200
 
 
+@override_settings(API_RATELIMIT_ANON="1/min", API_RATELIMIT_USER="3/min")
+def test_cookie_authenticated_requests_use_the_user_bucket(tenant_a, as_role):
+    client, _ = as_role(Role.DIRECTOR)
+    authorization = client._credentials["HTTP_AUTHORIZATION"]
+    session_key = authorization.removeprefix("Bearer ")
+    client.credentials()
+    client.cookies[settings.API_SESSION_COOKIE_NAME] = session_key
+
+    # Two safe requests exceed the anonymous cap but remain within the user's
+    # authenticated allowance. The view's authenticator still validates the
+    # opaque key and charges the normal tenant:user bucket.
+    assert client.get(URL).status_code == 200
+    assert client.get(URL).status_code == 200
+
+
 @override_settings(API_RATELIMIT_PREAUTH="2/min", API_RATELIMIT_ANON="100/min")
 def test_rotating_invalid_bearers_cannot_bypass_ip_cap(tenant_a, client_for):
     client = client_for(tenant_a)
@@ -60,6 +76,16 @@ def test_rotating_invalid_bearers_cannot_bypass_ip_cap(tenant_a, client_for):
         client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
         assert client.get(URL).status_code == 401
     client.credentials(HTTP_AUTHORIZATION="Bearer random-three")
+    assert client.get(URL).status_code == 429
+
+
+@override_settings(API_RATELIMIT_PREAUTH="2/min", API_RATELIMIT_ANON="100/min")
+def test_rotating_invalid_cookie_keys_cannot_bypass_ip_cap(tenant_a, client_for):
+    client = client_for(tenant_a)
+    for token in ("random-one", "random-two"):
+        client.cookies[settings.API_SESSION_COOKIE_NAME] = token
+        assert client.get(URL).status_code == 401
+    client.cookies[settings.API_SESSION_COOKIE_NAME] = "random-three"
     assert client.get(URL).status_code == 429
 
 

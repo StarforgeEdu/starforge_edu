@@ -20,8 +20,12 @@ from apps.audit.services import audit_log
 from apps.org.models import Branch, Department
 from apps.users.models import RoleMembership
 from core.exceptions import ConflictException, NotFoundException, ValidationException
-from core.permissions import _code_allowed, _role_grant_revoke
-from core.scoping import assert_branch_id_in_scope, scope_to_branches
+from core.permissions import Role, _code_allowed, _role_grant_revoke
+from core.scoping import (
+    assert_permission_membership_scope,
+    assert_permission_organization_scope,
+    scope_to_permission_memberships,
+)
 
 _PRINCIPAL_MODELS: dict[str, tuple[str, str]] = {
     AccountType.AccountKind.STAFF: ("org", "StaffProfile"),
@@ -30,12 +34,30 @@ _PRINCIPAL_MODELS: dict[str, tuple[str, str]] = {
     AccountType.AccountKind.PARENT: ("parents", "ParentProfile"),
 }
 
+_PRINCIPAL_RELATIONS: dict[str, str] = {
+    AccountType.AccountKind.STAFF: "staff_profile",
+    AccountType.AccountKind.TEACHER: "teacher_profile",
+    AccountType.AccountKind.STUDENT: "student_profile",
+    AccountType.AccountKind.PARENT: "parent_profile",
+}
+
+_LEGACY_ROLES_BY_PRINCIPAL_KIND: dict[str, frozenset[str]] = {
+    AccountType.AccountKind.STUDENT: frozenset({Role.STUDENT}),
+    AccountType.AccountKind.TEACHER: frozenset({Role.TEACHER}),
+    AccountType.AccountKind.PARENT: frozenset({Role.PARENT}),
+    AccountType.AccountKind.STAFF: frozenset(set(Role.ALL) - {Role.STUDENT, Role.TEACHER, Role.PARENT}),
+}
+
 
 def account_type_queryset() -> QuerySet[AccountType]:
     return AccountType.objects.prefetch_related("permission_rows").all()
 
 
-def assignment_queryset(request: Any) -> QuerySet[RoleMembership]:
+def assignment_queryset(
+    request: Any,
+    *,
+    permission: str = "access:read",
+) -> QuerySet[RoleMembership]:
     queryset = (
         RoleMembership.objects.filter(
             revoked_at__isnull=True,
@@ -52,7 +74,14 @@ def assignment_queryset(request: Any) -> QuerySet[RoleMembership]:
         )
         .order_by("account_type__name", "branch__name", "pk")
     )
-    return scope_to_branches(request, queryset)
+    return scope_to_permission_memberships(
+        request,
+        queryset,
+        permission=permission,
+        branch_field="branch_id",
+        department_field="department_id",
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
 
 
 def get_account_type(pk: int, *, for_update: bool = False) -> AccountType:
@@ -77,6 +106,11 @@ def create_account_type(
     actor: Any,
     request: Any,
 ) -> AccountType:
+    assert_permission_organization_scope(
+        request,
+        permission="access:write",
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
     name = validate_account_type_name(name)
     slug = validate_account_type_slug(slug)
     account_kind = validate_account_kind(account_kind)
@@ -109,6 +143,11 @@ def update_account_type(
     actor: Any,
     request: Any,
 ) -> AccountType:
+    assert_permission_organization_scope(
+        request,
+        permission="access:write",
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
     account_type = get_account_type(account_type.pk, for_update=True)
     if account_type.is_owner_type:
         raise ConflictException(
@@ -152,6 +191,11 @@ def update_account_type(
 
 @transaction.atomic
 def delete_account_type(account_type: AccountType, *, actor: Any, request: Any) -> None:
+    assert_permission_organization_scope(
+        request,
+        permission="access:write",
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
     account_type = get_account_type(account_type.pk, for_update=True)
     if account_type.is_system:
         raise ConflictException(
@@ -184,6 +228,11 @@ def replace_account_type_permissions(
     actor: Any,
     request: Any,
 ) -> AccountType:
+    assert_permission_organization_scope(
+        request,
+        permission="access:write",
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
     account_type = get_account_type(account_type.pk, for_update=True)
     if account_type.is_owner_type:
         raise ConflictException(
@@ -226,7 +275,22 @@ def assign_account_type(
             code="principal_kind_mismatch",
             fields={"principal_kind": [_("This principal kind does not match the account type.")]},
         )
-    assert_branch_id_in_scope(request, branch_id)
+    if account_type.is_owner_type:
+        # An owner assignment is organization-wide regardless of the branch
+        # column retained for compatibility. A branch-scoped access writer must
+        # never mint tenant-wide authority through that row.
+        assert_permission_organization_scope(
+            request,
+            permission="access:write",
+            account_kinds={AccountType.AccountKind.STAFF},
+        )
+    assert_permission_membership_scope(
+        request,
+        permission="access:write",
+        branch_id=branch_id,
+        department_id=department_id,
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
     branch = Branch.objects.filter(pk=branch_id, archived_at__isnull=True).first()
     if branch is None:
         raise NotFoundException(_("Branch not found."), code="branch_not_found")
@@ -287,7 +351,7 @@ def assign_account_type(
         after=_assignment_snapshot(membership, principal_kind, principal_id),
         request=request,
     )
-    return assignment_queryset(request).get(pk=membership.pk)
+    return assignment_queryset(request, permission="access:write").get(pk=membership.pk)
 
 
 @transaction.atomic
@@ -306,9 +370,20 @@ def revoke_account_type_assignment(
     if locked_membership is None:
         raise NotFoundException(_("Assignment not found."), code="assignment_not_found")
     membership = locked_membership
-    assert_branch_id_in_scope(request, membership.branch_id)
+    assert_permission_membership_scope(
+        request,
+        permission="access:write",
+        branch_id=membership.branch_id,
+        department_id=membership.department_id,
+        account_kinds={AccountType.AccountKind.STAFF},
+    )
     account_type = cast(AccountType, membership.account_type)
     if account_type.is_owner_type:
+        assert_permission_organization_scope(
+            request,
+            permission="access:write",
+            account_kinds={AccountType.AccountKind.STAFF},
+        )
         other_owner_exists = (
             RoleMembership.objects.filter(
                 account_type=account_type,
@@ -341,7 +416,16 @@ def effective_permissions_for_principal(principal_kind: str, principal_id: int) 
     principal = resolve_principal(principal_kind, principal_id)
     memberships = list(
         RoleMembership.objects.filter(revoked_at__isnull=True, user_id=principal.user_id)
-        .filter(Q(account_type__isnull=True) | Q(account_type__is_active=True))
+        .filter(
+            Q(
+                account_type__account_kind=principal_kind,
+                account_type__is_active=True,
+            )
+            | Q(
+                account_type__isnull=True,
+                role__in=_LEGACY_ROLES_BY_PRINCIPAL_KIND[principal_kind],
+            )
+        )
         .select_related("account_type")
     )
     type_ids = {membership.account_type_id for membership in memberships if membership.account_type_id}
@@ -397,16 +481,25 @@ def resolve_principal(principal_kind: str, principal_id: int) -> Any:
     return principal
 
 
+def assignment_principal_identity(membership: RoleMembership) -> tuple[str, int | None]:
+    """Return the assignment's expected principal kind and its profile id, if present.
+
+    Historical role memberships can point at a plain compatibility ``User`` whose
+    role-native profile was never created.  Reads must keep those security grants
+    visible so an owner can audit them, but must never claim that an unrelated
+    profile on the same user is the assignment's principal.
+    """
+    account_type = cast(AccountType, membership.account_type)
+    principal_kind = account_type.account_kind
+    relation = _PRINCIPAL_RELATIONS.get(principal_kind)
+    principal = getattr(membership.user, relation, None) if relation is not None else None
+    return principal_kind, principal.pk if principal is not None else None
+
+
 def principal_identity(membership: RoleMembership) -> tuple[str, int]:
-    for kind, relation in (
-        (AccountType.AccountKind.STAFF, "staff_profile"),
-        (AccountType.AccountKind.TEACHER, "teacher_profile"),
-        (AccountType.AccountKind.STUDENT, "student_profile"),
-        (AccountType.AccountKind.PARENT, "parent_profile"),
-    ):
-        principal = getattr(membership.user, relation, None)
-        if principal is not None:
-            return kind, principal.pk
+    principal_kind, principal_id = assignment_principal_identity(membership)
+    if principal_id is not None:
+        return principal_kind, principal_id
     raise ConflictException(
         _("Assignment has no compatible role profile."),
         code="principal_missing",

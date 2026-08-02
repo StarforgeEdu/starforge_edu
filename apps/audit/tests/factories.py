@@ -13,6 +13,13 @@ class AuditLogFactory(factory.django.DjangoModelFactory[AuditLog]):
 
     actor = None
     actor_repr = "system"
+    actor_attribution_status = factory.LazyAttribute(
+        lambda row: (
+            AuditLog.ActorAttributionStatus.SYSTEM
+            if row.actor is None
+            else AuditLog.ActorAttributionStatus.UNRESOLVED
+        )
+    )
     action = AuditLog.Action.CREATE
     resource_type = "users.User"
     resource_id = factory.Sequence(lambda n: str(n + 1))

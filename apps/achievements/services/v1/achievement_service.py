@@ -62,7 +62,10 @@ class AchievementService(IAchievementService):
             scope=data.scope,
             description=data.description,
             emoji=data.emoji,
-            cohort=self._resolve_cohort(data.cohort_id),
+            cohort=self._resolve_cohort(
+                data.cohort_id,
+                allowed_branch_ids=None if not is_scoped else branch_ids,
+            ),
         )
 
     def decide(self, *, achievement_id: int, approve: bool, actor) -> Achievement:
@@ -85,12 +88,20 @@ class AchievementService(IAchievementService):
             note=data.note,
         )
 
-    def resolve_student(self, student_id: int):
-        """Public resolver for the view's object-level scope check (returns the
-        StudentProfile or None; the view decides 400-invalid vs 403-out-of-branch)."""
+    def resolve_student(
+        self,
+        student_id: int,
+        *,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ):
+        """Resolve only a student visible to the achievement-write boundary."""
         from apps.students.models import StudentProfile
 
-        return StudentProfile.objects.filter(pk=student_id).first()
+        students = StudentProfile.objects.filter(pk=student_id)
+        if not is_unscoped:
+            students = students.filter(branch_id__in=branch_ids)
+        return students.first()
 
     def wall_for(self, user) -> QuerySet[AchievementGrant]:
         return self._grants.wall_for(user)
@@ -100,13 +111,22 @@ class AchievementService(IAchievementService):
 
     # --- helpers -----------------------------------------------------------
     @staticmethod
-    def _resolve_cohort(cohort_id: int | None):
+    def _resolve_cohort(
+        cohort_id: int | None,
+        *,
+        allowed_branch_ids: set[int] | None,
+    ):
         if cohort_id is None:
             return None
         from apps.cohorts.models import Cohort
 
-        cohort = Cohort.objects.filter(pk=cohort_id).first()
-        if cohort is None:  # mirrors the old PrimaryKeyRelatedField -> 400 field error
+        cohorts = Cohort.objects.filter(pk=cohort_id)
+        if allowed_branch_ids is not None:
+            cohorts = cohorts.filter(branch_id__in=allowed_branch_ids)
+        cohort = cohorts.first()
+        if cohort is None:
+            # Missing and outside-scope cohort ids intentionally share one field
+            # error so a scoped author cannot enumerate another branch's groups.
             raise ValidationException(
                 _("Invalid cohort."), code="validation_error", fields={"cohort": ["Not found."]}
             )

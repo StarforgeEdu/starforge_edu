@@ -135,6 +135,66 @@ def test_family_health_denied_for_non_retention_roles(tenant_a, as_role):
     assert cashier.get(FAMILIES).status_code == 403
 
 
+def test_family_health_cannot_borrow_parent_visibility_from_another_branch(
+    tenant_a,
+    user_in,
+    client_for,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.users.models import RoleMembership
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
+
+    intelligence_branch = _branch(tenant_a)
+    parent_branch = _branch(tenant_a)
+    _family(tenant_a, intelligence_branch, [{"present": 5, "grade": 90}])
+    with schema_context(tenant_a.schema_name):
+        intelligence_type = AccountType.objects.create(
+            name="Local intelligence only",
+            slug="local-intelligence-only",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        parent_type = AccountType.objects.create(
+            name="Remote parents only",
+            slug="remote-parents-only",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=intelligence_type,
+            permission="intelligence:read",
+        )
+        AccountTypePermission.objects.create(
+            account_type=parent_type,
+            permission="parents:read",
+        )
+        viewer = user_in(tenant_a)
+        staff = ensure_role_principal(viewer, roles=[Role.SUPPORT], branch=intelligence_branch)
+        RoleMembership.objects.create(
+            user=viewer,
+            branch=intelligence_branch,
+            role=intelligence_type.compatibility_role,
+            account_type=intelligence_type,
+        )
+        RoleMembership.objects.create(
+            user=viewer,
+            branch=parent_branch,
+            role=parent_type.compatibility_role,
+            account_type=parent_type,
+        )
+        viewer.refresh_from_db()
+
+    client = exact_session_client(
+        client_for,
+        tenant_a,
+        viewer,
+        principal_kind="staff",
+        principal_id=staff.pk,
+    )
+    response = client.get(FAMILIES)
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "not_permitted"
+
+
 def test_family_spanning_branches_is_branch_scoped(tenant_a, as_role, user_in, as_user):
     from apps.parents.tests.factories import GuardianFactory, ParentProfileFactory
     from apps.students.tests.factories import StudentProfileFactory

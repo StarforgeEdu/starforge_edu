@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.db.models import Q
-
 from apps.reports.generators.base import (
     ReportGenerator,
+    assert_report_generation_authorized,
     enforce_report_row_cap,
     is_full_scope,
     staff_report_scope_q,
-    teacher_cohort_ids,
+    teacher_report_scope_q,
 )
 from apps.students.models import StudentProfile
 
@@ -28,6 +27,7 @@ class EnrollmentGenerator(ReportGenerator):
     template_base = "enrollment"
 
     def collect(self, params: dict[str, Any], *, user, roles: set[str]) -> dict[str, Any]:
+        assert_report_generation_authorized(report_key=self.key, user=user, roles=roles)
         qs = (
             StudentProfile.objects.filter(status__in=_SEAT_STATUSES)
             .select_related("user", "branch", "current_cohort")
@@ -38,15 +38,22 @@ class EnrollmentGenerator(ReportGenerator):
         if params.get("cohort_id"):
             qs = qs.filter(current_cohort_id=params["cohort_id"])
 
-        if not is_full_scope(user=user, roles=roles):
+        if not is_full_scope(user=user, roles=roles, report_key=self.key):
             visible = staff_report_scope_q(
+                report_key=self.key,
                 roles=roles,
                 user=user,
                 branch_field="branch_id",
                 department_field="current_cohort__department_id",
             )
-            if "teacher" in roles:
-                visible |= Q(current_cohort_id__in=teacher_cohort_ids(user))
+            visible |= teacher_report_scope_q(
+                report_key=self.key,
+                roles=roles,
+                user=user,
+                branch_field="branch_id",
+                department_field="current_cohort__department_id",
+                cohort_field="current_cohort_id",
+            )
             qs = qs.filter(visible).distinct()
 
         enforce_report_row_cap(qs)

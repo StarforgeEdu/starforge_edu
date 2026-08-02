@@ -14,16 +14,27 @@ from core.interfaces import IBaseRepository
 
 
 class INotificationRepository(IBaseRepository[Notification]):
-    def feed(self, *, user) -> QuerySet[Notification]:
+    def feed(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[Notification]:
         raise NotImplementedError
 
-    def get_own(self, *, user, pk: int) -> Notification | None:
+    def get_own(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        pk: int,
+    ) -> Notification | None:
         raise NotImplementedError
 
-    def unread_count(self, *, user) -> int:
+    def unread_count(self, *, user, recipient_principal_kind: str, recipient_principal_id: int) -> int:
         raise NotImplementedError
 
-    def preferences(self, *, user) -> QuerySet[NotificationPreference]:
+    def preferences(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[NotificationPreference]:
         raise NotImplementedError
 
 

@@ -34,6 +34,7 @@ from core.exceptions import (
     ThrottledException,
     ValidationException,
 )
+from core.privacy import private_fingerprint
 from core.utils import current_schema, generate_otp
 from core.validators import normalize_phone
 from infrastructure.email.email_client import send_email
@@ -68,6 +69,12 @@ def login_with_password(*, username: str, password: str, ip: str = "", user_agen
     for unknown username, wrong password, and inactive account alike) and a
     dummy hash check keeps the unknown-username path timing-equivalent.
     """
+    from django_tenants.utils import get_public_schema_name
+
+    from core.exceptions import NotFoundException
+
+    if current_schema() != get_public_schema_name():
+        raise NotFoundException(code="not_found")
     username = username.strip()
     user = User.objects.filter(username=username).first()
     if user is None:
@@ -75,7 +82,7 @@ def login_with_password(*, username: str, password: str, ip: str = "", user_agen
         _fire_login_failed(username, ip, user_agent, reason="unknown_username")
         raise AuthenticationException(_("Invalid username or password."), code="invalid_credentials")
 
-    if not user.check_password(password) or not user.is_active:
+    if not user.check_password(password) or not user.is_active or not (user.is_staff or user.is_superuser):
         reason = "wrong_password" if user.is_active else "inactive_user"
         _fire_login_failed(username, ip, user_agent, reason=reason)
         raise AuthenticationException(_("Invalid username or password."), code="invalid_credentials")
@@ -110,13 +117,20 @@ def _role_account_models() -> dict:
 
 def find_role_account(username: str):
     """The single role account (student/teacher/parent/staff) with this username, or
-    ``(None, None)``. Usernames are globally unique across the role tables (backfilled
-    from the globally-unique ``User.username``), so at most one matches."""
+    ``(None, None)``.
+
+    Cross-table uniqueness is a service invariant rather than one database
+    constraint. Query every table so imports/races that violate it fail closed
+    instead of authenticating whichever model happens to be searched first.
+    The fixed four-query shape also avoids exposing the matching role table via
+    early-return timing on an incorrect-password attempt.
+    """
+    matches = []
     for kind, model in _role_account_models().items():
         account = model.objects.select_related("user").filter(username=username).first()
         if account is not None:
-            return kind, account
-    return None, None
+            matches.append((kind, account))
+    return matches[0] if len(matches) == 1 else (None, None)
 
 
 def _has_privileged_bridge(account) -> bool:
@@ -195,6 +209,8 @@ def role_login(
         user_agent=user_agent,
         device_id=device.device_id if device is not None else "",
         is_new_device=device is not None and not was_known_device,
+        principal_kind=kind,
+        principal_id=account.pk,
         schema_name=current_schema(),
     )
     session = create_session(
@@ -212,7 +228,11 @@ def change_password(*, user: User, old_password: str, new_password: str) -> dict
     """Verify the old password, set the new one (ending every other session by bumping
     tv), and return a fresh access token so THIS device stays logged in."""
     if not user.check_password(old_password):
-        raise ValidationException(_("Current password is incorrect."), code="wrong_password")
+        raise ValidationException(
+            _("The current password is incorrect."),
+            code="wrong_password",
+            fields={"old_password": [_("The current password is incorrect.")]},
+        )
     _validate_new_password(new_password, user)
     set_user_password(user, new_password)  # bumps tv -> every existing token dies
     user.refresh_from_db(fields=["token_version"])
@@ -220,10 +240,39 @@ def change_password(*, user: User, old_password: str, new_password: str) -> dict
 
 
 def _validate_new_password(raw: str, user: User | None) -> None:
+    # Reject an oversized value before any similarity/common-password work. This
+    # bounds attacker-controlled validator cost and, critically, precedes hashing.
+    if len(raw) > 128:
+        raise ValidationException(
+            _("Choose a stronger password."),
+            code="weak_password",
+            fields={"new_password": [str(_("Use no more than 128 characters."))]},
+        )
+    messages: list[StrOrPromise] = []
+    if len(raw) < 10:
+        messages.append(_("Use at least 10 characters."))
     try:
         validate_password(raw, user=user)
     except DjangoValidationError as exc:
-        raise ValidationException("; ".join(exc.messages), code="weak_password") from exc
+        # Every configured Django validator runs through validate_password. Replace
+        # only the configured minimum-length prose with our stable public contract;
+        # preserve similarity/common/numeric (and any future configured validator)
+        # messages exactly once.
+        errors = getattr(exc, "error_list", ())
+        if errors:
+            for error in errors:
+                if len(raw) < 10 and getattr(error, "code", "") == "password_too_short":
+                    continue
+                messages.extend(error.messages)
+        else:  # defensive compatibility with alternate ValidationError shapes
+            messages.extend(exc.messages)
+    deduped = list(dict.fromkeys(str(message) for message in messages))
+    if deduped:
+        raise ValidationException(
+            _("Choose a stronger password."),
+            code="weak_password",
+            fields={"new_password": deduped},
+        )
 
 
 def _fire_login_failed(username: str, ip: str, user_agent: str, *, reason: str) -> None:
@@ -310,16 +359,33 @@ def _enforce_cooldown(
 
 
 def _enforce_ip_cap(ip: str, identifier: str) -> None:
-    """Reject when one IP fans out across too many distinct identifiers per hour."""
+    """Reject when one IP fans out across too many distinct identifiers per hour.
+
+    The cache stores only HMAC references. One atomic ``add`` per IP/identifier
+    pair prevents concurrent repeats from incrementing the distinct counter.
+    Once tripped, a separate block marker prevents the over-limit identifier
+    from succeeding on its second attempt.
+    """
     if not ip:
         return
     cap = int(getattr(settings, "OTP_IP_DISTINCT_IDENTIFIER_CAP", 5))
-    key = f"otp_ip_idents:{ip}"
-    identifiers = set(cache.get(key) or [])
-    identifiers.add(identifier)
-    cache.set(key, list(identifiers), timeout=3600)
-    if len(identifiers) > cap:
-        raise ThrottledException(_("Too many requests from your network."))
+    window = 60 * 60
+    schema = current_schema()
+    ip_ref = private_fingerprint(ip, namespace=f"otp-ip:{schema}")
+    identifier_ref = private_fingerprint(identifier, namespace=f"otp-identifier:{schema}")
+    blocked_key = f"otp_ip_distinct_blocked:{ip_ref}"
+    if cache.get(blocked_key):
+        raise ThrottledException(_("Too many requests from your network."), wait=window)
+    pair_key = f"otp_ip_ident_seen:{ip_ref}:{identifier_ref}"
+    if not cache.add(pair_key, 1, timeout=window):
+        return
+    from core.ratelimit import check_rate
+
+    try:
+        check_rate(scope="otp_ip_distinct", key=ip_ref, limit=cap, window=window)
+    except ThrottledException:
+        cache.set(blocked_key, 1, timeout=window)
+        raise ThrottledException(_("Too many requests from your network."), wait=window) from None
 
 
 @transaction.atomic
@@ -478,11 +544,10 @@ def request_password_reset(
     # Distributed SMS-cost protection. Run before account lookup so known and
     # unknown identifiers remain indistinguishable, and hash PII in cache keys.
     from core.ratelimit import check_rate
-    from core.utils import stable_hash
 
     check_rate(
         scope="otp_identifier",
-        key=stable_hash(identifier),
+        key=private_fingerprint(identifier, namespace=f"otp-rate:{current_schema()}"),
         limit=settings.OTP_IDENTIFIER_RATE_LIMIT,
         window=settings.OTP_IDENTIFIER_RATE_WINDOW_SECONDS,
     )

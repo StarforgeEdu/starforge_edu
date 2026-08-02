@@ -34,7 +34,11 @@ class TemplateService(ITemplateService):
 
         return update_template(template_id=template.pk, fields=changes)
 
-    def generate(self, template: MessageTemplate, *, requested_by) -> Any:
+    def generate(self, template: MessageTemplate, *, requested_by, requested_principal) -> Any:
         from apps.campaigns.services import request_template_generation
 
-        return request_template_generation(template=template, requested_by=requested_by)
+        return request_template_generation(
+            template=template,
+            requested_by=requested_by,
+            requested_principal=requested_principal,
+        )

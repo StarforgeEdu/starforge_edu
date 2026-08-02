@@ -20,15 +20,22 @@ pytestmark = pytest.mark.django_db
 REQ = "/api/v1/approvals/requests/"
 
 
-def _student_id(tenant) -> int:
+def _student_id(tenant, requester=None) -> int:
     with schema_context(tenant.schema_name):
-        return StudentProfileFactory.create().id
+        branch_id = (
+            requester.role_memberships.filter(revoked_at__isnull=True)
+            .values_list("branch_id", flat=True)
+            .first()
+            if requester is not None
+            else None
+        )
+        return StudentProfileFactory.create(**({"branch_id": branch_id} if branch_id else {})).id
 
 
 def test_approving_discount_request_materializes_discount(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, director_user = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
 
     r = teacher.post(
         REQ,
@@ -65,9 +72,9 @@ def test_approving_discount_request_materializes_discount(tenant_a, as_role):
 
 
 def test_discount_request_fixed_amount(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
 
     rid = teacher.post(
         REQ,
@@ -101,8 +108,8 @@ def test_discount_request_requires_valid_student(tenant_a, as_role):
 
 
 def test_discount_request_amount_is_xor(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     # both set -> rejected
     both = teacher.post(
         REQ,
@@ -124,8 +131,8 @@ def test_discount_request_amount_is_xor(tenant_a, as_role):
 
 
 def test_discount_percent_out_of_range(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     r = teacher.post(
         REQ,
         {"kind": "discount", "title": "x", "payload": {"student_id": sid, "percent": "150"}},
@@ -136,8 +143,8 @@ def test_discount_percent_out_of_range(tenant_a, as_role):
 
 
 def test_discount_type_invalid_rejected(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     r = teacher.post(
         REQ,
         {
@@ -153,8 +160,8 @@ def test_discount_type_invalid_rejected(tenant_a, as_role):
 
 def test_fixed_amount_overflow_rejected(tenant_a, as_role):
     # NUMERIC(18,2) -> at most 16 integer digits; reject as a clean 400, not a DB 500.
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     r = teacher.post(
         REQ,
         {
@@ -171,8 +178,8 @@ def test_fixed_amount_overflow_rejected(tenant_a, as_role):
 def test_discount_nan_amounts_rejected_not_500(tenant_a, as_role):
     """A non-finite Decimal in the freeform payload is unordered — the range
     comparison would raise InvalidOperation (a 500). It must be a clean 400."""
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     for field, code in (
         ("percent", "discount_percent_invalid"),
         ("fixed_amount_uzs", "discount_fixed_invalid"),
@@ -189,8 +196,8 @@ def test_discount_nan_amounts_rejected_not_500(tenant_a, as_role):
 def test_discount_fixed_amount_that_rounds_up_to_overflow_rejected(tenant_a, as_role):
     """A value < 1e16 that ROUNDS UP to 1e16 at NUMERIC(18,2) would 500 at insert;
     the post-quantize re-check rejects it as a clean 400."""
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     r = teacher.post(
         REQ,
         {
@@ -207,9 +214,9 @@ def test_discount_fixed_amount_that_rounds_up_to_overflow_rejected(tenant_a, as_
 def test_percent_quantized_to_two_places(tenant_a, as_role):
     """The audited payload must equal the discount that actually bills the student
     (Postgres NUMERIC(5,2) would otherwise silently round on insert)."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     body = teacher.post(
         REQ,
         {"kind": "discount", "title": "x", "payload": {"student_id": sid, "percent": "33.333"}},
@@ -250,9 +257,9 @@ def test_cannot_approve_own_request(tenant_a, as_role):
 def test_rejecting_approved_discount_deactivates_it(tenant_a, as_role):
     """A rejected price cut must stop cutting prices: reject-after-approve
     deactivates the standing Discount so billing no longer applies it."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     rid = teacher.post(
         REQ,
         {"kind": "discount", "title": "x", "payload": {"student_id": sid, "percent": "15"}},
@@ -274,11 +281,11 @@ def test_rejecting_approved_discount_deactivates_it(tenant_a, as_role):
 
 
 def test_discount_student_deleted_before_approve(tenant_a, as_role):
-    """The existence guard at approve time rolls the whole approval back (422,
+    """The target guard at approve time rolls the whole approval back (404,
     request stays pending, no orphan Discount)."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     rid = teacher.post(
         REQ,
         {"kind": "discount", "title": "x", "payload": {"student_id": sid, "percent": "15"}},
@@ -291,8 +298,8 @@ def test_discount_student_deleted_before_approve(tenant_a, as_role):
         StudentProfile.objects.filter(pk=sid).delete()
 
     resp = director.post(f"{REQ}{rid}/approve/", {}, format="json")
-    assert resp.status_code == 422
-    assert resp.json()["code"] == "discount_student_missing"
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "not_found"
     with schema_context(tenant_a.schema_name):
         from apps.approvals.models import ApprovalRequest
         from apps.finance.models import Discount

@@ -3,8 +3,15 @@ get_prep_value/from_db_value pair directly."""
 
 from unittest import mock
 
+import pytest
+
 from core import fields as fields_module
-from core.fields import EncryptedCharField, EncryptedTextField
+from core.fields import (
+    EncryptedCharField,
+    EncryptedFieldDecryptionError,
+    EncryptedJSONField,
+    EncryptedTextField,
+)
 
 
 def test_text_field_round_trip():
@@ -21,6 +28,15 @@ def test_char_field_round_trip():
     assert field.from_db_value(token, None, None) == "AB1234567"
 
 
+def test_json_field_round_trip_preserves_native_value():
+    field = EncryptedJSONField()
+    contacts = [{"name": "Ona", "phone": "+998901234567", "verified": True}]
+    token = field.get_prep_value(contacts)
+    assert token.startswith("gAAAA")
+    assert "+998901234567" not in token
+    assert field.from_db_value(token, None, None) == contacts
+
+
 def test_none_and_empty_pass_through():
     field = EncryptedTextField()
     assert field.get_prep_value(None) is None
@@ -29,13 +45,25 @@ def test_none_and_empty_pass_through():
     assert field.from_db_value("", None, None) == ""
 
 
-def test_tampered_token_logs_warning_and_returns_raw():
-    """Rotation passthrough: an undecryptable value is returned as-is, but the
-    failure must be observable via a starforge.crypto warning."""
+def test_tampered_token_logs_and_fails_closed():
     field = EncryptedTextField()
     field.name = "medical_notes"  # normally set by contribute_to_class
-    with mock.patch.object(fields_module.logger, "warning") as warn:
-        out = field.from_db_value("not-a-fernet-token", None, None)
-    assert out == "not-a-fernet-token"
-    warn.assert_called_once()
-    assert "medical_notes" in warn.call_args.args  # field context is logged
+    with (
+        mock.patch.object(fields_module.logger, "error") as logged,
+        pytest.raises(EncryptedFieldDecryptionError),
+    ):
+        field.from_db_value("not-a-fernet-token", None, None)
+    logged.assert_called_once()
+    assert "medical_notes" in logged.call_args.args  # field context is logged
+    assert "not-a-fernet-token" not in repr(logged.call_args)
+
+
+def test_json_field_tampering_and_invalid_decrypted_json_fail_closed():
+    field = EncryptedJSONField()
+    field.name = "emergency_contacts"
+    invalid_json_token = fields_module._fernet().encrypt(b"not-json").decode()
+
+    with pytest.raises(EncryptedFieldDecryptionError):
+        field.from_db_value("not-a-fernet-token", None, None)
+    with pytest.raises(EncryptedFieldDecryptionError):
+        field.from_db_value(invalid_json_token, None, None)

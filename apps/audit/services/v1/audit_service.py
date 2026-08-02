@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from django.db.models import QuerySet
 
-from apps.audit.dto.audit_dto import AuditFilterDTO
+from apps.audit.dto.audit_dto import AuditFilterDTO, AuditVisibilityDTO
 from apps.audit.interfaces.repositories import IAuditRepository
 from apps.audit.interfaces.services import IAuditService
 from apps.audit.models import AuditLog
@@ -19,8 +19,12 @@ class AuditService(IAuditService):
     def __init__(self, logs: IAuditRepository) -> None:
         self._logs = logs
 
-    def filtered(self, filters: AuditFilterDTO) -> QuerySet[AuditLog]:
-        return self._logs.filtered(filters)
+    def filtered(
+        self,
+        filters: AuditFilterDTO,
+        visibility: AuditVisibilityDTO,
+    ) -> QuerySet[AuditLog]:
+        return self._logs.filtered(filters, visibility)
 
-    def get(self, pk: int) -> AuditLog | None:
-        return self._logs.get_by_id(pk)
+    def get(self, pk: int, visibility: AuditVisibilityDTO) -> AuditLog | None:
+        return self._logs.get_visible(pk, visibility)

@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from apps.academics.models import Exam, ExamResult, ExamType, Grade, Subject, Transcript
+from apps.academics.models import (
+    Exam,
+    ExamLifecycleEvent,
+    ExamResult,
+    ExamType,
+    Grade,
+    Subject,
+    Transcript,
+)
 
 
 def _dec(value, places: int) -> str:
@@ -44,6 +52,10 @@ def exam_to_dict(exam: Exam) -> dict:
         "subject_name": exam.subject.name,
         "cohort": exam.cohort_id,
         "cohort_name": exam.cohort.name,
+        "branch": exam.cohort.branch_id,
+        "branch_name": exam.cohort.branch.name,
+        "department": exam.cohort.department_id,
+        "department_name": exam.cohort.department.name if exam.cohort.department else None,
         "term": exam.term_id,
         "term_name": exam.term.name,
         # Expanded per-Center type object (null if the type was retired); keep the id
@@ -56,6 +68,12 @@ def exam_to_dict(exam: Exam) -> dict:
         "weight": _dec(exam.weight, 3),
         "is_published": exam.is_published,
         "published_at": _iso(exam.published_at),
+        "version": exam.version,
+        "requires_republish": exam.requires_republish,
+        "created_by": exam.created_by_id,
+        "created_by_name": str(exam.created_by) if exam.created_by else None,
+        "created_at": _iso(exam.created_at),
+        "updated_at": _iso(exam.updated_at),
     }
 
 
@@ -64,6 +82,7 @@ def exam_result_to_dict(result: ExamResult) -> dict:
         "id": result.id,
         "exam": result.exam_id,
         "student": result.student_id,
+        "student_code": result.student.student_id,
         "student_name": result.student.get_full_name(),
         "score": _dec(result.score, 2),
         "note": result.note,
@@ -85,7 +104,28 @@ def grade_to_dict(grade: Grade) -> dict:
         "components": grade.components,
         "is_published": grade.is_published,
         "published_at": _iso(grade.published_at),
+        "is_valid": grade.is_valid,
+        "invalidated_at": _iso(grade.invalidated_at),
+        "invalidation_reason": grade.invalidation_reason,
         "computed_at": _iso(grade.computed_at),
+    }
+
+
+def exam_lifecycle_event_to_dict(event: ExamLifecycleEvent) -> dict:
+    return {
+        "id": event.pk,
+        "exam": event.exam_id,
+        "event_type": event.event_type,
+        "exam_version": event.exam_version,
+        "reason": event.reason,
+        "details": event.details,
+        "actor": event.actor_id,
+        "actor_name": event.actor_repr,
+        "scope": {
+            "branch": event.branch_id_snapshot,
+            "department": event.department_id_snapshot,
+        },
+        "created_at": _iso(event.created_at),
     }
 
 
@@ -98,7 +138,13 @@ def transcript_to_dict(transcript: Transcript) -> dict:
         "term": transcript.term_id,
         "status": transcript.status,
         "download_url": presign_transcript(transcript),
-        "error": transcript.error,
+        # Older rows may contain renderer/storage exception text. Never disclose it
+        # through the student-facing transcript contract.
+        "error": (
+            "transcript_generation_failed"
+            if transcript.error or transcript.status == Transcript.Status.FAILED
+            else ""
+        ),
         "generated_at": _iso(transcript.generated_at),
         "created_at": _iso(transcript.created_at),
     }

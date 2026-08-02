@@ -10,6 +10,8 @@ from apps.users.views.v1 import users_views as views
 
 urlpatterns = [
     path("me/", views.me_view, name="user-me"),
+    path("sessions/", views.sessions_collection_view, name="session-collection"),
+    path("sessions/<int:pk>/", views.session_detail_view, name="session-detail"),
     path("devices/", views.devices_collection_view, name="device-collection"),
     path("devices/<int:pk>/", views.device_detail_view, name="device-detail"),
     path("", views.users_collection_view, name="user-collection"),

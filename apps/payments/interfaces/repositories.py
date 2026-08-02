@@ -30,6 +30,3 @@ class IProviderConfigRepository(IBaseRepository[ProviderConfig]):
 class IPaymentRepository(IBaseRepository[Payment]):
     def scoped(self) -> QuerySet[Payment]:
         raise NotImplementedError
-
-    def get(self, *, pk: int) -> Payment | None:
-        raise NotImplementedError

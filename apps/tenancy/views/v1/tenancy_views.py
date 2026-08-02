@@ -21,7 +21,7 @@ from apps.tenancy.platform_auth import require_platform_admin
 from apps.tenancy.presenters import center_to_dict, domain_to_dict
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
-from core.http import bool_field, int_field, read_json, str_field
+from core.http import bool_field, int_field, read_json, reject_unknown_fields, str_field
 from core.listing import apply_filters, paginate
 from core.ratelimit import check_rate
 from core.responses import created, error, paginated, success
@@ -91,11 +91,39 @@ def _validate_email_value(value: str, name: str) -> str:
     return value
 
 
+def _validate_query(request: HttpRequest, *, allowed: set[str]) -> None:
+    unknown = sorted(set(request.GET) - allowed)
+    if unknown:
+        raise ValidationException(
+            "Unsupported query parameter.",
+            code="validation_error",
+            fields={field: ["This query parameter is not supported."] for field in unknown},
+        )
+    repeated = sorted(field for field in allowed if len(request.GET.getlist(field)) > 1)
+    if repeated:
+        raise ValidationException(
+            "Query parameters must have one value.",
+            code="validation_error",
+            fields={field: ["Provide this query parameter only once."] for field in repeated},
+        )
+
+
 # --- centers ---------------------------------------------------------------
 
 
 def _create_data(request: HttpRequest) -> dict[str, Any]:
     data = read_json(request)
+    reject_unknown_fields(
+        data,
+        allowed={
+            "name",
+            "slug",
+            "primary_domain",
+            "contact_name",
+            "contact_phone",
+            "contact_email",
+        },
+    )
     return {
         "name": _str_required(_require(data, "name"), "name", max_length=200),
         # provision_center._validate_slug does the real slug validation
@@ -114,6 +142,10 @@ def _update_changes(request: HttpRequest) -> dict[str, Any]:
     """PATCH contact metadata (name + contact_*). Present-keys-only; lifecycle
     (is_active / trial) is never touched here (dedicated audited actions do it)."""
     data = read_json(request)
+    reject_unknown_fields(
+        data,
+        allowed={"name", "contact_name", "contact_phone", "contact_email"},
+    )
     changes: dict[str, Any] = {}
     if "name" in data:
         changes["name"] = _str_required(data["name"], "name", max_length=200)
@@ -133,6 +165,10 @@ def _update_changes(request: HttpRequest) -> dict[str, Any]:
 @require_platform_admin
 def centers_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
+        _validate_query(
+            request,
+            allowed={"is_active", "on_trial", "search", "ordering", "page", "page_size"},
+        )
         qs = apply_filters(
             request,
             _service().query(),
@@ -144,6 +180,7 @@ def centers_collection_view(request: HttpRequest) -> HttpResponse:
         items, total, page, size = paginate(request, qs)
         return paginated([center_to_dict(c) for c in items], total=total, page=page, page_size=size)
     if request.method == "POST":
+        _validate_query(request, allowed=set())
         center = _service().provision(data=_create_data(request), actor=request.user)
         return created(center_to_dict(center))
     return _method_not_allowed()
@@ -159,6 +196,9 @@ def _get_center(pk: int):
 @csrf_exempt
 @require_platform_admin
 def center_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method not in ("GET", "HEAD", "PATCH"):
+        return _method_not_allowed()
+    _validate_query(request, allowed=set())
     if request.method in ("GET", "HEAD"):
         return success(center_to_dict(_get_center(pk)))
     if request.method == "PATCH":
@@ -169,7 +209,7 @@ def center_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
             actor=request.user,
         )
         return success(center_to_dict(center))
-    return _method_not_allowed()
+    return _method_not_allowed()  # pragma: no cover - guarded above
 
 
 @csrf_exempt
@@ -177,8 +217,11 @@ def center_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
 def center_suspend_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
     center = _get_center(pk)
-    reason = str_field(read_json(request), "reason", max_length=512)
+    body = read_json(request)
+    reject_unknown_fields(body, allowed={"reason"})
+    reason = str_field(body, "reason", max_length=512)
     center = _service().suspend(center=center, actor=request.user, reason=reason)
     return success(center_to_dict(center))
 
@@ -188,6 +231,8 @@ def center_suspend_view(request: HttpRequest, pk: int) -> HttpResponse:
 def center_activate_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
+    reject_unknown_fields(read_json(request), allowed=set())
     center = _service().activate(center=_get_center(pk), actor=request.user)
     return success(center_to_dict(center))
 
@@ -197,8 +242,11 @@ def center_activate_view(request: HttpRequest, pk: int) -> HttpResponse:
 def center_extend_trial_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
     center = _get_center(pk)
-    days = int_field(read_json(request), "days", required=True)
+    body = read_json(request)
+    reject_unknown_fields(body, allowed={"days"})
+    days = int_field(body, "days", required=True)
     if days is None or not (1 <= days <= 365):
         raise _reject("days", "Ensure this value is between 1 and 365.")
     center = _service().extend_trial(center=center, days=days, actor=request.user)
@@ -222,6 +270,7 @@ def _parse_days(raw: str | None) -> int:
 def center_usage_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
+    _validate_query(request, allowed={"days"})
     center = _get_center(pk)
     payload = _service().usage(center=center, days=_parse_days(request.GET.get("days")))
     return success(payload)
@@ -232,8 +281,11 @@ def center_usage_view(request: HttpRequest, pk: int) -> HttpResponse:
 def center_impersonate_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
     center = _get_center(pk)
-    user_id = int_field(read_json(request), "user_id", required=True)
+    body = read_json(request)
+    reject_unknown_fields(body, allowed={"user_id"})
+    user_id = int_field(body, "user_id", required=True)
     if user_id is None or user_id < 1:
         raise _reject("user_id", "Ensure this value is greater than or equal to 1.")
     result = _service().impersonate(center=center, user_id=user_id, impersonator=request.user)
@@ -243,11 +295,15 @@ def center_impersonate_view(request: HttpRequest, pk: int) -> HttpResponse:
 @csrf_exempt
 @require_platform_admin
 def center_domains_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method not in ("GET", "HEAD", "POST"):
+        return _method_not_allowed()
+    _validate_query(request, allowed=set())
     center = _get_center(pk)
     if request.method in ("GET", "HEAD"):
         return success([domain_to_dict(d) for d in _service().list_domains(center=center)])
     if request.method == "POST":
         data = read_json(request)
+        reject_unknown_fields(data, allowed={"domain", "is_primary"})
         domain_name = _str_required(_require(data, "domain"), "domain", max_length=253)
         is_primary = bool_field(data, "is_primary")
         row = _service().add_domain(
@@ -257,7 +313,7 @@ def center_domains_view(request: HttpRequest, pk: int) -> HttpResponse:
             actor=request.user,
         )
         return created(domain_to_dict(row))
-    return _method_not_allowed()
+    return _method_not_allowed()  # pragma: no cover - guarded above
 
 
 @csrf_exempt
@@ -265,6 +321,8 @@ def center_domains_view(request: HttpRequest, pk: int) -> HttpResponse:
 def center_set_primary_domain_view(request: HttpRequest, pk: int, domain_id: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
+    reject_unknown_fields(read_json(request), allowed=set())
     center = _get_center(pk)
     row = _service().set_primary_domain(center=center, domain_id=domain_id, actor=request.user)
     return success(domain_to_dict(row))
@@ -275,6 +333,8 @@ def center_set_primary_domain_view(request: HttpRequest, pk: int, domain_id: int
 def center_verify_domain_view(request: HttpRequest, pk: int, claim_id) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
+    reject_unknown_fields(read_json(request), allowed=set())
     row = _service().verify_domain(
         center=_get_center(pk),
         claim_id=claim_id,
@@ -290,6 +350,7 @@ def center_verify_domain_view(request: HttpRequest, pk: int, claim_id) -> HttpRe
 def resolve_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
+    _validate_query(request, allowed={"slug"})
     check_rate(
         scope="platform_resolve",
         key=client_ip(request),

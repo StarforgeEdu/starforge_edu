@@ -118,18 +118,44 @@ class RecurrenceRuleRepository(BaseRepository[RecurrenceRule], IRecurrenceRuleRe
             .first()
         )
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[RecurrenceRule]:
-        return selectors.scoped_rules(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[RecurrenceRule]:
+        return selectors.scoped_rules(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> RecurrenceRule | None:
-        return selectors.scoped_rules(user=user, roles=roles).filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> RecurrenceRule | None:
+        return selectors.scoped_rules(user=user, roles=roles, permission=permission).filter(pk=pk).first()
 
 
 class LessonRepository(BaseRepository[Lesson], ILessonRepository):
     model = Lesson
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[Lesson]:
-        return selectors.scoped_lessons(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[Lesson]:
+        return selectors.scoped_lessons(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> Lesson | None:
-        return selectors.scoped_lessons(user=user, roles=roles).filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> Lesson | None:
+        return selectors.scoped_lessons(user=user, roles=roles, permission=permission).filter(pk=pk).first()

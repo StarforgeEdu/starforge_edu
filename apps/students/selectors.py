@@ -10,8 +10,9 @@ from django.db.models.functions import ExtractDay, ExtractMonth
 from django.utils import timezone
 
 from apps.students.models import EnrollmentEvent, StudentProfile
-from core.permissions import PermissionRoleSet, Role
+from core.permissions import PermissionRoleSet, Role, get_unambiguous_user_roles
 from core.scoping import (
+    permission_membership_is_unscoped,
     permission_membership_scope_q,
     permission_membership_scopes,
     role_membership_scope_q,
@@ -30,7 +31,10 @@ BRANCH_STAFF_ROLES = {Role.HEAD_OF_DEPT, Role.TEACHER, Role.REGISTRAR, Role.IT}
 
 
 def _base_qs() -> QuerySet[StudentProfile]:
-    return StudentProfile.objects.select_related("user", "branch", "current_cohort")
+    return StudentProfile.objects.select_related("user", "branch", "current_cohort").defer(
+        "medical_notes",
+        "emergency_contacts",
+    )
 
 
 def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentProfile]:
@@ -38,8 +42,15 @@ def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentP
     if user.is_superuser:
         return qs
     if roles is None:
-        roles = {m.role for m in user.role_memberships.filter(revoked_at__isnull=True)}
-    if roles & TENANT_WIDE_ROLES:
+        roles = get_unambiguous_user_roles(user)
+    if isinstance(roles, PermissionRoleSet):
+        if permission_membership_is_unscoped(
+            roles=roles,
+            permission="students:read",
+            account_kinds={"staff", "teacher"},
+        ):
+            return qs
+    elif roles & TENANT_WIDE_ROLES:
         return qs
 
     visible = Q(pk__in=[])
@@ -78,7 +89,10 @@ def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentP
             )
         )
     if parent_reader:  # read_own_children
-        visible |= Q(guardians__parent__user=user)
+        visible |= Q(
+            guardians__parent__user=user,
+            guardians__revoked_at__isnull=True,
+        )
     if student_reader:  # read_self
         visible |= Q(user=user)
     return qs.filter(visible).distinct()
@@ -115,7 +129,12 @@ def students_with_upcoming_birthdays(
 
 
 def student_profile_for(user) -> StudentProfile | None:
-    return StudentProfile.objects.select_related("current_cohort").filter(user=user).first()
+    return (
+        StudentProfile.objects.select_related("current_cohort")
+        .defer("medical_notes", "emergency_contacts")
+        .filter(user=user)
+        .first()
+    )
 
 
 def _classroom_rank(student: StudentProfile) -> dict | None:

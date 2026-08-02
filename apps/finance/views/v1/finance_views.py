@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 from django.core.cache import cache
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 from django.http import HttpRequest, HttpResponse
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
@@ -29,24 +29,36 @@ from apps.finance.presenters import (
     discount_to_dict,
     expense_to_dict,
     fee_schedule_to_dict,
+    invoice_list_to_dict,
     invoice_to_dict,
     outstanding_to_dict,
     payment_method_to_dict,
     payment_plan_to_dict,
     refund_to_dict,
 )
+from apps.finance.selectors import has_natural_finance_scope
 from apps.org.models import Branch
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
+from core.historical_scope import ATTRIBUTED_SCOPE_STATUSES
 from core.http import decimal_field, int_field, read_json, str_field
-from core.listing import apply_filters, paginate
-from core.permissions import Role, get_user_roles, has_permission_code
+from core.listing import (
+    apply_date_range_filters,
+    apply_filters,
+    paginate,
+    parse_date_range_filters,
+    positive_int_filter,
+)
+from core.permissions import PermissionRoleSet, Role, get_user_roles, has_permission_code
 from core.responses import created, error, no_content, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
+    assert_permission_organization_scope,
+    is_permission_unscoped,
     permission_membership_scope_q,
+    permission_membership_scopes,
+    request_permission_membership_allows,
     scope_to_permission_memberships,
 )
 from core.utils import stable_hash
@@ -55,6 +67,9 @@ _BILLING_PERIODS = frozenset(c[0] for c in FeeSchedule.BillingPeriod.choices)
 _LINE_TYPES = frozenset(c[0] for c in InvoiceLine.LineType.choices)
 _LOCALES = frozenset({"uz", "ru", "en"})
 _STATEMENT_TTL = 3600
+_STATEMENT_MAX_INVOICES = 5000
+_MAX_INVOICE_LINES = 500
+_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
 def _service() -> IFinanceService:
@@ -63,6 +78,36 @@ def _service() -> IFinanceService:
 
 def _method_not_allowed() -> HttpResponse:
     return error("Method not allowed.", code="method_not_allowed", status=405)
+
+
+def _trusted_statement_key(result: dict[str, Any], *, schema: str) -> str | None:
+    """Validate the complete server-derived tenant/student statement key."""
+    key = result.get("key")
+    student_id = result.get("student_id")
+    if (
+        not isinstance(key, str)
+        or len(key) > 512
+        or isinstance(student_id, bool)
+        or not isinstance(student_id, int)
+        or student_id <= 0
+    ):
+        return None
+    pattern = (
+        rf"\A{re.escape(schema)}/documents/"
+        rf"statement_{student_id}_[0-9]{{14}}_[0-9a-f]{{32}}\.pdf\Z"
+    )
+    return key if re.fullmatch(pattern, key) is not None else None
+
+
+def _trusted_statement_invoice_ids(result: dict[str, Any]) -> tuple[int, ...] | None:
+    """Return a bounded, canonical invoice-id set from the task result."""
+    raw = result.get("invoice_ids")
+    if not isinstance(raw, list) or not raw or len(raw) > _STATEMENT_MAX_INVOICES:
+        return None
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in raw):
+        return None
+    invoice_ids = tuple(raw)
+    return invoice_ids if invoice_ids == tuple(sorted(set(invoice_ids))) else None
 
 
 def _reject(field: str, message: str) -> ValidationException:
@@ -173,9 +218,97 @@ def _roles(request: HttpRequest) -> set[str]:
     return get_user_roles(request)
 
 
+def _scope_cashier_shifts(request: HttpRequest, queryset: QuerySet, *, permission: str) -> QuerySet:
+    """Apply exact permission and per-assignment cashier ownership together.
+
+    A cashier assignment may expose only that user's shifts in its own branch.
+    A separate support/accounting assignment can expose all shifts only inside
+    the branches where *that same assignment* grants the requested permission.
+    """
+    if request.user.is_superuser:
+        return queryset
+    roles = _roles(request)
+    if not isinstance(roles, PermissionRoleSet):
+        # Retain the legacy role-only behavior for explicit compatibility
+        # callers. Authenticated request paths normally always use the richer
+        # PermissionRoleSet produced by ``get_user_roles``.
+        scoped = scope_to_permission_memberships(
+            request,
+            queryset,
+            permission=permission,
+            branch_field="branch_id",
+            account_kinds={"staff"},
+        )
+        if Role.CASHIER in roles and not ({Role.DIRECTOR, Role.ACCOUNTANT} & roles):
+            return scoped.filter(cashier=request.user)
+        return scoped
+
+    visible = Q(pk__in=[])
+    for membership in permission_membership_scopes(
+        roles=roles,
+        permission=permission,
+        account_kinds={"staff"},
+    ):
+        member_scope = (
+            Q(pk__isnull=False) if membership.is_organization_wide else Q(branch_id=membership.branch_id)
+        )
+        if membership.role == Role.CASHIER:
+            member_scope &= Q(cashier=request.user)
+        visible |= member_scope
+    return queryset.filter(visible)
+
+
 def _student_department_id(student: Any) -> int | None:
     cohort = student.current_cohort
     return cohort.department_id if cohort is not None else None
+
+
+def _permission_scope_pairs(
+    request: HttpRequest,
+    *,
+    permission: str,
+) -> set[tuple[int, int | None]] | None:
+    """Exact branch/department boundaries supplying ``permission``.
+
+    ``None`` is the explicit organization-wide/superuser authority marker; an
+    empty set is a valid fail-closed result for a scoped caller.
+    """
+    if is_permission_unscoped(
+        request,
+        permission=permission,
+        account_kinds={"staff"},
+    ):
+        return None
+    return {
+        (membership.branch_id, membership.department_id)
+        for membership in permission_membership_scopes(
+            roles=_roles(request),
+            permission=permission,
+            account_kinds={"staff"},
+        )
+    }
+
+
+def _apply_register_filters(
+    request: HttpRequest,
+    queryset: QuerySet,
+    *,
+    branch_field: str,
+    date_field: str,
+    datetime_field: bool = False,
+) -> QuerySet:
+    """Apply CEO register filters only after the endpoint's authorization scope."""
+    branch_id = positive_int_filter(request, "branch")
+    if branch_id is not None:
+        queryset = queryset.filter(**{branch_field: branch_id})
+    date_from, date_to = parse_date_range_filters(request)
+    return apply_date_range_filters(
+        queryset,
+        field=date_field,
+        date_from=date_from,
+        date_to=date_to,
+        datetime_field=datetime_field,
+    )
 
 
 # --- fee schedules (CRUD) --------------------------------------------------
@@ -190,6 +323,12 @@ def _fee_data(request: HttpRequest, *, require_required: bool) -> dict[str, Any]
         out["amount_uzs"] = _money(data, "amount_uzs", min_value=Decimal("0"))
     if "cohort" in data:
         out["cohort"] = _resolve_cohort(request, data["cohort"])
+        if out["cohort"] is None:
+            assert_permission_organization_scope(
+                request,
+                permission="finance:write",
+                account_kinds={"staff"},
+            )
     if "billing_period" in data:
         out["billing_period"] = _choice(data["billing_period"], "billing_period", _BILLING_PERIODS)
     if "due_day_of_month" in data:
@@ -212,7 +351,11 @@ def fee_schedules_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, "finance:read")
         schedules = _service().fee_schedules()
-        if not is_unscoped(request):
+        if not is_permission_unscoped(
+            request,
+            permission="finance:read",
+            account_kinds={"staff"},
+        ):
             schedules = schedules.filter(
                 Q(cohort__isnull=True)
                 | permission_membership_scope_q(
@@ -235,7 +378,14 @@ def fee_schedules_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([fee_schedule_to_dict(f) for f in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "finance:write")
-        fs = _service().create_fee_schedule(data=_fee_data(request, require_required=True))
+        fee_data = _fee_data(request, require_required=True)
+        if "cohort" not in fee_data:
+            assert_permission_organization_scope(
+                request,
+                permission="finance:write",
+                account_kinds={"staff"},
+            )
+        fs = _service().create_fee_schedule(data=fee_data)
         return created(fee_schedule_to_dict(fs))
     return _method_not_allowed()
 
@@ -251,6 +401,12 @@ def _get_fee_schedule(request: HttpRequest, pk: int, *, permission: str) -> FeeS
             permission=permission,
             branch_id=cohort.branch_id,
             department_id=cohort.department_id,
+            account_kinds={"staff"},
+        )
+    elif permission == "finance:write":
+        assert_permission_organization_scope(
+            request,
+            permission=permission,
             account_kinds={"staff"},
         )
     return fs
@@ -287,6 +443,8 @@ def _invoice_lines(data: dict[str, Any]) -> list[dict] | None:
     raw_lines = data["lines"]
     if not isinstance(raw_lines, list):
         raise _reject("lines", "lines must be a list of line objects.")
+    if len(raw_lines) > _MAX_INVOICE_LINES:
+        raise _reject("lines", f"lines may contain at most {_MAX_INVOICE_LINES} items.")
     out: list[dict] = []
     for item in raw_lines:
         if not isinstance(item, dict):
@@ -313,16 +471,22 @@ def _invoice_lines(data: dict[str, Any]) -> list[dict] | None:
 def invoices_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, "finance:read")
-        qs = apply_filters(
+        invoices = _apply_register_filters(
             request,
             _service().invoices(user=request.user, roles=_roles(request)),
+            branch_field="branch_at_issue_id",
+            date_field="issue_date",
+        )
+        qs = apply_filters(
+            request,
+            invoices,
             filter_fields=("status", "student", "cohort", "fee_schedule"),
             search_fields=("number",),
             ordering_fields=("created_at", "due_date", "total_uzs"),
             default_ordering="-created_at",
         )
         items, total, page, size = paginate(request, qs)
-        return paginated([invoice_to_dict(i) for i in items], total=total, page=page, page_size=size)
+        return paginated([invoice_list_to_dict(i) for i in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "finance:write")
         data = read_json(request)
@@ -362,22 +526,36 @@ def invoices_collection_view(request: HttpRequest) -> HttpResponse:
             lines=_invoice_lines(data),
             period=period,
             created_by=request.user,
+            allowed_scope_pairs=_permission_scope_pairs(
+                request,
+                permission="finance:write",
+            ),
         )
-        fresh = _service().reload_invoice(pk=invoice.pk, user=request.user, roles=_roles(request))
+        fresh = _service().reload_invoice(
+            pk=invoice.pk,
+            user=request.user,
+            roles=_roles(request),
+            permission="finance:write",
+        )
         return created(invoice_to_dict(fresh or invoice))
     return _method_not_allowed()
 
 
 def _get_invoice(request: HttpRequest, pk: int, *, permission: str = "finance:read"):
-    inv = _service().invoice(pk=pk, user=request.user, roles=_roles(request))
+    inv = _service().invoice(
+        pk=pk,
+        user=request.user,
+        roles=_roles(request),
+        permission=permission,
+    )
     if inv is None:
         raise NotFoundException(code="not_found")
     if permission != "finance:read":
         assert_permission_membership_scope(
             request,
             permission=permission,
-            branch_id=inv.student.branch_id,
-            department_id=_student_department_id(inv.student),
+            branch_id=inv.branch_at_issue_id,
+            department_id=inv.department_at_issue_id,
             account_kinds={"staff"},
         )
     return inv
@@ -400,7 +578,12 @@ def invoice_void_view(request: HttpRequest, pk: int) -> HttpResponse:
     check_perm(request, "finance:write")
     invoice = _get_invoice(request, pk, permission="finance:write")
     _service().void_invoice(invoice=invoice, actor=request.user)
-    fresh = _service().reload_invoice(pk=invoice.pk, user=request.user, roles=_roles(request))
+    fresh = _service().reload_invoice(
+        pk=invoice.pk,
+        user=request.user,
+        roles=_roles(request),
+        permission="finance:write",
+    )
     return success(invoice_to_dict(fresh or invoice))
 
 
@@ -570,6 +753,11 @@ def payment_methods_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([payment_method_to_dict(m) for m in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "finance:write")
+        assert_permission_organization_scope(
+            request,
+            permission="finance:write",
+            account_kinds={"staff"},
+        )
         pm = _service().create_payment_method(
             data=_payment_method_data(request, require_required=True, generate_slug=True)
         )
@@ -588,6 +776,11 @@ def payment_method_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         return success(payment_method_to_dict(pm))
     if request.method in ("PUT", "PATCH"):
         check_perm(request, "finance:write")
+        assert_permission_organization_scope(
+            request,
+            permission="finance:write",
+            account_kinds={"staff"},
+        )
         pm = _service().payment_method(pk)
         if pm is None:
             raise NotFoundException(code="not_found")
@@ -596,6 +789,11 @@ def payment_method_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         return success(payment_method_to_dict(pm))
     if request.method == "DELETE":
         check_perm(request, "finance:write")
+        assert_permission_organization_scope(
+            request,
+            permission="finance:write",
+            account_kinds={"staff"},
+        )
         pm = _service().payment_method(pk)
         if pm is None:
             raise NotFoundException(code="not_found")
@@ -612,16 +810,24 @@ def payment_method_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
 def expenses_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, "finance:read")
+        expenses = scope_to_permission_memberships(
+            request,
+            _service().expenses(),
+            permission="finance:read",
+            branch_field="branch_id",
+            account_kinds={"staff"},
+        )
+        expenses = _apply_register_filters(
+            request,
+            expenses,
+            branch_field="branch_id",
+            date_field="created_at",
+            datetime_field=True,
+        )
         qs = apply_filters(
             request,
-            scope_to_permission_memberships(
-                request,
-                _service().expenses(),
-                permission="finance:read",
-                branch_field="branch_id",
-                account_kinds={"staff"},
-            ),
-            filter_fields=("status", "branch", "category"),
+            expenses,
+            filter_fields=("status", "category"),
             ordering_fields=("created_at", "amount_uzs"),
             default_ordering="-created_at",
         )
@@ -716,14 +922,17 @@ def expense_pay_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 def _get_refund(request: HttpRequest, pk: int, *, permission: str):
     refund = _service().refund(pk)
-    if refund is None:
+    if (
+        refund is None
+        or refund.invoice.attribution_status not in ATTRIBUTED_SCOPE_STATUSES
+        or refund.invoice.branch_at_issue_id is None
+    ):
         raise NotFoundException(code="not_found")
-    student = refund.invoice.student
     assert_permission_membership_scope(
         request,
         permission=permission,
-        branch_id=student.branch_id,
-        department_id=_student_department_id(student),
+        branch_id=refund.invoice.branch_at_issue_id,
+        department_id=refund.invoice.department_at_issue_id,
         account_kinds={"staff"},
     )
     return refund
@@ -737,11 +946,18 @@ def refunds_collection_view(request: HttpRequest) -> HttpResponse:
     check_perm(request, "finance:read")
     qs = scope_to_permission_memberships(
         request,
-        _service().refunds(),
+        _service().refunds().filter(invoice__attribution_status__in=ATTRIBUTED_SCOPE_STATUSES),
         permission="finance:read",
-        branch_field="invoice__student__branch_id",
-        department_field="invoice__student__current_cohort__department_id",
+        branch_field="invoice__branch_at_issue_id",
+        department_field="invoice__department_at_issue_id",
         account_kinds={"staff"},
+    )
+    qs = _apply_register_filters(
+        request,
+        qs,
+        branch_field="invoice__branch_at_issue_id",
+        date_field="created_at",
+        datetime_field=True,
     )
     qs = apply_filters(
         request,
@@ -787,16 +1003,11 @@ def refund_approve_view(request: HttpRequest, pk: int) -> HttpResponse:
 def cashier_shifts_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, "finance:read")
-        shifts = scope_to_permission_memberships(
+        shifts = _scope_cashier_shifts(
             request,
             _service().cashier_shifts(),
             permission="finance:read",
-            branch_field="branch_id",
-            account_kinds={"staff"},
         )
-        roles = _roles(request)
-        if Role.CASHIER in roles and not ({Role.DIRECTOR, Role.ACCOUNTANT} & roles):
-            shifts = shifts.filter(cashier=request.user)
         qs = apply_filters(
             request,
             shifts,
@@ -842,23 +1053,17 @@ def cashier_shift_open_view(request: HttpRequest) -> HttpResponse:
 
 
 def _get_shift(request: HttpRequest, pk: int, *, permission: str):
-    s = _service().cashier_shift(pk)
+    s = (
+        _scope_cashier_shifts(
+            request,
+            _service().cashier_shifts(),
+            permission=permission,
+        )
+        .filter(pk=pk)
+        .first()
+    )
     if s is None:
         raise NotFoundException(code="not_found")
-    assert_permission_membership_scope(
-        request,
-        permission=permission,
-        branch_id=s.branch_id,
-        enforce_department=False,
-        account_kinds={"staff"},
-    )
-    roles = _roles(request)
-    if (
-        Role.CASHIER in roles
-        and not ({Role.DIRECTOR, Role.ACCOUNTANT} & roles)
-        and s.cashier_id != request.user.pk
-    ):
-        raise PermissionException("You can only access your own shifts.", code="out_of_scope")
     return s
 
 
@@ -913,9 +1118,17 @@ def _require_int_param(request: HttpRequest, name: str) -> int:
 
 
 def _can_view_balance(*, user, student_id: int, roles: set[str]) -> bool:
-    if Role.PARENT in roles and _service().parent_can_see_student(user=user, student_id=student_id):
+    if has_natural_finance_scope(
+        roles,
+        account_kind="parent",
+        legacy_role=Role.PARENT,
+    ) and _service().parent_can_see_student(user=user, student_id=student_id):
         return True
-    if Role.STUDENT in roles:
+    if has_natural_finance_scope(
+        roles,
+        account_kind="student",
+        legacy_role=Role.STUDENT,
+    ):
         from apps.students.models import StudentProfile
 
         return StudentProfile.objects.filter(pk=student_id, user=user).exists()
@@ -938,11 +1151,43 @@ def outstanding_balance_view(request: HttpRequest) -> HttpResponse:
     ):
         raise PermissionException("Insufficient finance access.", code="forbidden")
     student_id = _require_int_param(request, "student")
+    from apps.students.models import StudentProfile
+
+    student = StudentProfile.objects.select_related("current_cohort").filter(pk=student_id).first()
+    if student is None:
+        raise NotFoundException(code="not_found")
     is_staff = user.is_superuser or has_permission_code(roles, "finance:read")
-    if not is_staff:
-        if Role.PARENT in roles or Role.STUDENT in roles:
+    if is_staff:
+        if not is_permission_unscoped(
+            request,
+            permission="finance:read",
+            account_kinds={"staff"},
+        ):
+            current_scope_visible = request_permission_membership_allows(
+                request,
+                permission="finance:read",
+                branch_id=student.branch_id,
+                department_id=_student_department_id(student),
+                account_kinds={"staff"},
+            )
+            historical_scope_visible = (
+                _service().invoices(user=user, roles=roles).filter(student_id=student_id).exists()
+            )
+            if not current_scope_visible and not historical_scope_visible:
+                raise NotFoundException(code="not_found")
+    else:
+        has_natural_scope = has_natural_finance_scope(
+            roles,
+            account_kind="parent",
+            legacy_role=Role.PARENT,
+        ) or has_natural_finance_scope(
+            roles,
+            account_kind="student",
+            legacy_role=Role.STUDENT,
+        )
+        if has_natural_scope:
             if not _can_view_balance(user=user, student_id=student_id, roles=roles):
-                raise PermissionException("You can only view your own children's balances.", code="forbidden")
+                raise NotFoundException(code="not_found")
         else:
             raise PermissionException("Insufficient finance access.", code="forbidden")
     balance, invoices = _service().outstanding(student_id=student_id, user=user, roles=roles)
@@ -960,20 +1205,19 @@ def statement_request_view(request: HttpRequest, student_id: int) -> HttpRespons
     check_perm(request, "finance:read")
     from apps.students.models import StudentProfile
 
-    student_scope = (
-        StudentProfile.objects.filter(pk=student_id)
-        .values_list("branch_id", "current_cohort__department_id")
-        .first()
-    )
-    if student_scope is None:
+    if not StudentProfile.objects.filter(pk=student_id).exists():
         raise NotFoundException("Student not found.", code="student_not_found")
-    assert_permission_membership_scope(
-        request,
-        permission="finance:read",
-        branch_id=student_scope[0],
-        department_id=student_scope[1],
-        account_kinds={"staff"},
-    )
+    # A transfer must not let the destination branch download invoices issued
+    # by the prior branch. Prove at least one historical invoice is currently
+    # visible, then recompute the same live membership scope inside the task so
+    # a revocation between enqueue and execution also fails closed.
+    if (
+        not _service()
+        .invoices(user=request.user, roles=_roles(request))
+        .filter(student_id=student_id)
+        .exists()
+    ):
+        raise NotFoundException(code="not_found")
     from core.ratelimit import check_rate
     from core.utils import current_schema
 
@@ -985,7 +1229,12 @@ def statement_request_view(request: HttpRequest, student_id: int) -> HttpRespons
     locale = _choice(read_json(request).get("locale", "en"), "locale", _LOCALES)
     from celery_tasks.finance_tasks import generate_statement_pdf
 
-    result = generate_statement_pdf.delay(int(student_id), locale=locale, _schema_name=current_schema())
+    result = generate_statement_pdf.delay(
+        int(student_id),
+        locale=locale,
+        requested_by_id=request.user.pk,
+        _schema_name=current_schema(),
+    )
     return success({"task_id": result.id}, status=202)
 
 
@@ -997,9 +1246,26 @@ def statement_result_view(request: HttpRequest, task_id: str) -> HttpResponse:
     check_perm(request, "finance:read")
     from core.utils import current_schema
 
-    key = cache.get(f"finance:statement:{current_schema()}:{task_id}")
-    if key is None:
+    if _TASK_ID_RE.fullmatch(task_id) is None:
+        raise NotFoundException(code="not_found")
+    result = cache.get(f"finance:statement:{current_schema()}:{task_id}")
+    if result is None:
         return success({"status": "pending", "url": None})
+    if not isinstance(result, dict) or result.get("requested_by_id") != request.user.pk:
+        raise NotFoundException(code="not_found")
+    key = _trusted_statement_key(result, schema=current_schema())
+    invoice_ids = _trusted_statement_invoice_ids(result)
+    if key is None or invoice_ids is None:
+        raise NotFoundException(code="not_found")
+    visible_invoice_ids = tuple(
+        _service()
+        .invoices(user=request.user, roles=_roles(request))
+        .filter(student_id=result["student_id"], pk__in=invoice_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    if visible_invoice_ids != invoice_ids:
+        raise NotFoundException(code="not_found")
     from infrastructure.storage.s3_client import presign_download
 
     return success({"status": "done", "url": presign_download(key, expires_in=600)})

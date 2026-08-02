@@ -264,22 +264,23 @@ def test_new_device_signal_dispatches_once_without_persisting_device_id(tenant_a
         assert "private-device-id" not in notification.dedupe_key
 
 
-def test_user_login_produces_only_first_login_for_each_device(tenant_a, client_for, user_in):
+def test_role_login_produces_only_first_login_for_each_device(tenant_a, client_for, user_in):
     password = "Quasar-Lantern-42"
     user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
-        user.set_password(password)
-        user.save(update_fields=["password"])
+        teacher = user.teacher_profile
+        teacher.set_password(password)
+        teacher.save(update_fields=["password"])
 
     client = client_for(tenant_a)
     payload = {
-        "username": user.username,
+        "username": teacher.username,
         "password": password,
         "device_id": "phone-1",
         "platform": "android",
     }
-    assert client.post("/api/v1/auth/login/", payload, format="json").status_code == 200
-    assert client.post("/api/v1/auth/login/", payload, format="json").status_code == 200
+    assert client.post("/api/v1/auth/role-login/", payload, format="json").status_code == 200
+    assert client.post("/api/v1/auth/role-login/", payload, format="json").status_code == 200
 
     with schema_context(tenant_a.schema_name):
         assert (

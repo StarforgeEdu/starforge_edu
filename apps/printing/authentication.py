@@ -14,6 +14,8 @@ authenticates inside its own tenant.
 
 from __future__ import annotations
 
+import re
+
 from django.contrib.auth.models import AnonymousUser
 from django.utils.translation import gettext_lazy as _
 from rest_framework.authentication import BaseAuthentication
@@ -23,6 +25,26 @@ from core.exceptions import AuthenticationException
 from core.utils import stable_hash
 
 AGENT_AUTH_KEYWORD = "Agent"
+_RAW_AGENT_TOKEN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_branch_agent_authorization(value: object) -> bool:
+    """Return whether a header has the exact non-secret BranchAgent wire shape.
+
+    This intentionally performs no database lookup and grants no authority. The
+    pre-tenant IP limiter uses it only to avoid classifying a syntactically valid
+    device credential as anonymous; authentication and the stable per-agent limit
+    still run after tenant resolution.
+    """
+
+    if not isinstance(value, str):
+        return False
+    parts = value.split()
+    return (
+        len(parts) == 2
+        and parts[0] == AGENT_AUTH_KEYWORD
+        and _RAW_AGENT_TOKEN.fullmatch(parts[1]) is not None
+    )
 
 
 class BranchAgentAuthentication(BaseAuthentication):
@@ -41,14 +63,14 @@ class BranchAgentAuthentication(BaseAuthentication):
             # JWT) — defer. Guarding `not parts` avoids an IndexError → 500 on a
             # whitespace-only Authorization header.
             return None
-        if len(parts) != 2:
+        if not is_branch_agent_authorization(header):
             raise AuthenticationException(_("Invalid agent token."), code="agent_token_invalid")
 
         from apps.printing.models import BranchAgent
 
         token_hash = stable_hash(parts[1])
         agent = (
-            BranchAgent.objects.select_related("branch")
+            BranchAgent.objects.only("id", "branch_id")
             .filter(token_hash=token_hash, revoked_at__isnull=True)
             .first()
         )

@@ -6,8 +6,9 @@ A `suspended` subscription must paywall the tenant's domain API with 402
 different tenant is unaffected.
 
 AUTH PIVOT (DAY-3.md is stale): the reachable auth endpoint is
-`POST /api/v1/auth/login/` (and `/api/v1/auth/password/reset/request/`) — there
-is NO `/auth/otp/*`. The middleware allowlists the whole `/api/v1/auth/` prefix.
+`POST /api/v1/auth/role-login/` (and `/api/v1/auth/password/reset/request/`) —
+generic bridge-user login is public-schema-only and there is NO `/auth/otp/*`.
+The middleware allowlists the whole `/api/v1/auth/` prefix.
 
 Subscription/Plan are PUBLIC-schema rows: create them WITHOUT a schema_context
 (the autouse `_reset_schema_to_public` fixture leaves us on public). The status
@@ -63,12 +64,12 @@ def test_trialing_tenant_not_paywalled(tenant_a, user_in, as_user):
 # Allowlist stays reachable even when suspended
 # --------------------------------------------------------------------------- #
 def test_suspended_tenant_login_reachable(tenant_a, client_for):
-    """AUTH PIVOT: /api/v1/auth/login/ is allowlisted. A login attempt must NOT
+    """AUTH PIVOT: /api/v1/auth/role-login/ is allowlisted. A login attempt must NOT
     402 — it reaches the view (401 invalid_credentials for bad creds is fine;
     the point is it is NOT 402)."""
     _set_status(tenant_a, "suspended")
     resp = client_for(tenant_a).post(
-        "/api/v1/auth/login/",
+        "/api/v1/auth/role-login/",
         {"username": "nobody", "password": "wrong"},
         format="json",
     )

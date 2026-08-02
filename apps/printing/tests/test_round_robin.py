@@ -68,6 +68,34 @@ def test_inactive_printer_is_skipped(tenant_a):
     assert all(printer_id == active.id for printer_id in assigned)  # only the active one
 
 
+def test_claim_does_not_assign_declared_incompatible_printer(tenant_a):
+    from apps.printing.tests.factories import PrinterFactory, PrintJobFactory
+
+    branch, agent = _branch_with_agent(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        PrinterFactory(
+            branch=branch,
+            name="Mono simplex",
+            capabilities={"color": False, "duplex": False},
+        )
+        compatible = PrinterFactory(
+            branch=branch,
+            name="Color duplex",
+            capabilities={"color": True, "duplex": True},
+        )
+        PrintJobFactory(
+            branch=branch,
+            color=True,
+            duplex=True,
+            next_attempt_at=timezone.now(),
+        )
+
+        claimed = services.claim_job(agent=agent)
+
+        assert claimed is not None
+        assert claimed.printer_id == compatible.pk
+
+
 def test_failed_retry_clears_printer_to_rebalance(tenant_a):
     from apps.printing.models import PrintJob
     from apps.printing.tests.factories import PrinterFactory
@@ -80,7 +108,11 @@ def test_failed_retry_clears_printer_to_rebalance(tenant_a):
         assert job.printer_id is not None  # assigned on first claim
         # the agent reports a (printer-specific) failure -> requeued for a fresh attempt
         job = services.update_job_status(
-            agent=agent, job_id=job.pk, status=PrintJob.Status.FAILED, error="paper jam"
+            agent=agent,
+            job_id=job.pk,
+            lease_id=job.lease_id,
+            status=PrintJob.Status.FAILED,
+            error="paper jam",
         )
         assert job.status == PrintJob.Status.QUEUED
         assert job.printer_id is None  # NOT pinned to the failed printer; next claim rebalances

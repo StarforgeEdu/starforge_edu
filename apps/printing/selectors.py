@@ -1,25 +1,29 @@
 """Printing read-side selectors (D4-LD).
 
-All non-trivial reads live here with eager loading. Staff visibility is the
-whole tenant (jobs/printers/agents are operational data, not per-user PII);
-branch object-scoping for non-director staff is enforced by the viewset's
-``object_scope``.
+Presenters intentionally use foreign-key ids and never dereference related identity,
+storage, or device rows. Avoid eager joins here: they add work to every paginated
+register query and load sensitive objects that the response contract does not use.
+Exact branch visibility is applied by the view before pagination.
 """
 
 from __future__ import annotations
 
 from django.db.models import QuerySet
 
-from apps.printing.models import BranchAgent, Printer, PrintJob
+from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
 
 
 def print_jobs() -> QuerySet[PrintJob]:
-    return PrintJob.objects.select_related("branch", "printer", "agent", "requested_by")
+    return PrintJob.objects.all()
+
+
+def print_job_reconciliations(*, job_id: int) -> QuerySet[PrintJobReconciliation]:
+    return PrintJobReconciliation.objects.filter(job_id=job_id)
 
 
 def printers() -> QuerySet[Printer]:
-    return Printer.objects.select_related("branch")
+    return Printer.objects.all()
 
 
 def agents() -> QuerySet[BranchAgent]:
-    return BranchAgent.objects.select_related("branch", "created_by")
+    return BranchAgent.objects.all()

@@ -84,7 +84,7 @@ def test_every_issued_key_starts_with_schema_name(tenant_a, monkeypatch):
         result = services.request_upload(
             filename="notes.pdf", content_type="application/pdf", size_bytes=2048, folder=folder
         )
-        assert result["key"].startswith(f"{tenant_a.schema_name}/tmp/")
+        assert result["key"].startswith(f"{tenant_a.schema_name}/tmp/")  # nosec B108
         assert result["file"].status == LessonFile.Status.PENDING
 
 
@@ -106,7 +106,7 @@ def _pending_file(folder, *, content_type="application/pdf", size=1000) -> Any:
     return LessonFile.objects.create(
         folder=folder,
         title="doc",
-        s3_key=f"tenant_a/tmp/abc/doc.{content_type.split('/')[-1]}",
+        s3_key=f"tenant_a/tmp/{'a' * 32}/doc.{content_type.split('/')[-1]}",
         content_type=content_type,
         size_bytes=size,
         status=LessonFile.Status.PENDING,
@@ -124,6 +124,7 @@ def _stub_validate_s3(monkeypatch, *, sniff, copies, content_length=1000, delete
 
     monkeypatch.setattr(services, "head_object", lambda key: {"ContentLength": content_length})
     monkeypatch.setattr(services, "get_object_range", lambda key, **kw: b"binarymagic")
+    monkeypatch.setattr(services, "download_bytes", lambda key, **kw: _png_bytes())
     monkeypatch.setattr(services, "_sniff_mime", lambda buf: sniff)
     monkeypatch.setattr(services, "copy_object", _copy)
     monkeypatch.setattr(services, "delete_object", _delete)
@@ -192,7 +193,7 @@ def test_sniff_must_match_exact_mime_not_just_family(tenant_a, monkeypatch):
         file = LessonFile.objects.create(
             folder=folder,
             title="img",
-            s3_key="tenant_a/tmp/abc/photo.jpeg",
+            s3_key=f"tenant_a/tmp/{'b' * 32}/photo.jpeg",
             content_type="image/jpeg",
             size_bytes=1000,
             status=LessonFile.Status.PENDING,
@@ -213,7 +214,7 @@ def test_sniff_exact_match_passes(tenant_a, monkeypatch):
         file = LessonFile.objects.create(
             folder=folder,
             title="img",
-            s3_key="tenant_a/tmp/abc/photo.png",
+            s3_key=f"tenant_a/tmp/{'c' * 32}/photo.png",
             content_type="image/png",
             size_bytes=1000,
             status=LessonFile.Status.PENDING,
@@ -234,15 +235,13 @@ def test_thumbnail_idempotent(tenant_a, monkeypatch):
         uploads.append((key, data))
         return key
 
-    monkeypatch.setattr(services, "download_bytes", lambda key: _png_bytes())
+    monkeypatch.setattr(services, "download_bytes", lambda key, **kw: _png_bytes())
     monkeypatch.setattr(services, "upload_bytes", _capture)
     with schema_context(tenant_a.schema_name):
-        file: Any = LessonFileFactory(
-            content_type="image/png", status=LessonFile.Status.CLEAN, s3_key="tenant_a/content/9/i.png"
-        )
+        file: Any = LessonFileFactory(content_type="image/png", status=LessonFile.Status.CLEAN)
         key = services.generate_thumbnail(file.id)
         file.refresh_from_db()
-        assert key == f"{tenant_a.schema_name}/content/{file.id}/thumb.jpg"
+        assert key == f"{tenant_a.schema_name}/content/{file.id}/_derived/thumbnail.jpg"
         assert file.thumbnail_key == key
         assert uploads[0][1].startswith(b"\xff\xd8")  # JPEG magic
         services.generate_thumbnail(file.id)  # already has thumb → short-circuit
@@ -342,8 +341,8 @@ def test_visibility_positive_department_membership(tenant_a, user_in):
 def test_content_write_scoped_to_visible_library(tenant_a, user_in, as_user):
     """CONTENT-1: content WRITES are visibility-scoped like reads. A content:write holder
     (teacher scoped to dept A) cannot create a course in a DEPARTMENT-restricted library of
-    dept B they cannot see (403 library_out_of_scope), closing the read/write asymmetry; a
-    TENANT-visible library works (201)."""
+    dept B they cannot see (403 library_out_of_scope), closing the read/write asymmetry; their
+    own department library works (201). Tenant-wide mutation remains owner-only."""
     from apps.academics.tests.factories import SubjectFactory
     from apps.users.models import RoleMembership
 
@@ -354,7 +353,7 @@ def test_content_write_scoped_to_visible_library(tenant_a, user_in, as_user):
         other_dept: Any = DepartmentFactory(branch=branch)
         RoleMembership.objects.create(user=teacher, branch=branch, department=my_dept, role="teacher")
         hidden = ContentLibraryFactory(visibility="department", department=other_dept)
-        visible = ContentLibraryFactory(visibility="tenant")
+        visible = ContentLibraryFactory(visibility="department", department=my_dept)
         subject_id = SubjectFactory().id
         hidden_id, visible_id = hidden.id, visible.id
 
@@ -555,14 +554,17 @@ def test_upload_url_rejects_out_of_scope_folder(tenant_a, as_role, monkeypatch):
 
 
 def test_upload_url_accepts_in_scope_folder(tenant_a, as_role, monkeypatch):
-    """A content:write holder CAN attach into a tenant-visibility library they
-    can see (positive path for the scoped lesson/folder queryset)."""
+    """A content:write holder can attach inside their branch-scoped library."""
     from core.permissions import Role
 
     _stub_s3(monkeypatch)
-    client, _ = as_role(Role.TEACHER)
+    client, teacher = as_role(Role.TEACHER)
     with schema_context(tenant_a.schema_name):
-        visible_folder: Any = FolderFactory(library=ContentLibraryFactory(visibility="tenant"))
+        branch = teacher.role_memberships.get().branch
+        department = DepartmentFactory(branch=branch)
+        visible_folder: Any = FolderFactory(
+            library=ContentLibraryFactory(visibility="department", department=department)
+        )
         visible_id = visible_folder.id
 
     resp = client.post(
@@ -626,9 +628,13 @@ def test_upload_url_normal_filename_accepted_key_under_schema(tenant_a, as_role,
     from core.permissions import Role
 
     _stub_s3(monkeypatch)
-    client, _ = as_role(Role.TEACHER)
+    client, teacher = as_role(Role.TEACHER)
     with schema_context(tenant_a.schema_name):
-        visible_folder: Any = FolderFactory(library=ContentLibraryFactory(visibility="tenant"))
+        branch = teacher.role_memberships.get().branch
+        department = DepartmentFactory(branch=branch)
+        visible_folder: Any = FolderFactory(
+            library=ContentLibraryFactory(visibility="department", department=department)
+        )
         visible_id = visible_folder.id
 
     resp = client.post(
@@ -643,7 +649,7 @@ def test_upload_url_normal_filename_accepted_key_under_schema(tenant_a, as_role,
     )
     assert resp.status_code == 200
     body = resp.json()["data"]
-    assert body["key"].startswith(f"{tenant_a.schema_name}/tmp/")
+    assert body["key"].startswith(f"{tenant_a.schema_name}/tmp/")  # nosec B108
     assert body["key"].endswith("/lecture-notes_v2.pdf")
 
 
@@ -661,7 +667,7 @@ def test_request_upload_service_sanitizes_traversal_basename(tenant_a, monkeypat
             folder=folder,
         )
         key = result["key"]
-        assert key.startswith(f"{tenant_a.schema_name}/tmp/")
+        assert key.startswith(f"{tenant_a.schema_name}/tmp/")  # nosec B108
         assert ".." not in key
         assert key.endswith("/evil.pdf")
 
@@ -803,11 +809,9 @@ def test_cascade_delete_queues_s3_cleanup_after_commit(
 
     with schema_context(tenant_a.schema_name):
         folder: Any = FolderFactory()
-        file: Any = LessonFileFactory(
-            folder=folder,
-            s3_key=f"{tenant_a.schema_name}/content/1/document.pdf",
-            thumbnail_key=f"{tenant_a.schema_name}/content/1/thumb.jpg",
-        )
+        file: Any = LessonFileFactory(folder=folder)
+        file.thumbnail_key = f"{tenant_a.schema_name}/content/{file.id}/_derived/thumbnail.jpg"
+        file.save(update_fields=["thumbnail_key"])
         with django_capture_on_commit_callbacks(execute=True):
             folder.delete()
 
@@ -830,15 +834,16 @@ def test_serializer_hides_thumbnail_key_and_signs_url(tenant_a, user_in, as_user
         with_thumb: Any = LessonFileFactory(
             status=LessonFile.Status.CLEAN,
             content_type="image/png",
-            thumbnail_key="tenant_a/content/7/thumb.jpg",
         )
+        with_thumb.thumbnail_key = f"tenant_a/content/{with_thumb.id}/thumb.jpg"
+        with_thumb.save(update_fields=["thumbnail_key"])
         no_thumb: Any = LessonFileFactory(status=LessonFile.Status.CLEAN)
         with_id, no_id = with_thumb.id, no_thumb.id
 
     client = as_user(tenant_a, director)
     detail = client.get(f"/api/v1/content/files/{with_id}/").json()["data"]
     assert "thumbnail_key" not in detail  # raw key never exposed
-    assert detail["thumbnail_url"] == "https://signed/tenant_a/content/7/thumb.jpg"
+    assert detail["thumbnail_url"] == f"https://signed/tenant_a/content/{with_thumb.id}/thumb.jpg"
 
     no_detail = client.get(f"/api/v1/content/files/{no_id}/").json()["data"]
     assert no_detail["thumbnail_url"] is None  # no thumbnail → null, not signed

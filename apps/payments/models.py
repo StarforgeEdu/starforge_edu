@@ -10,15 +10,24 @@ dedupe spines (D3-B-6). Cross-lane FK to ``finance.CashierShift`` is a STRING re
 from __future__ import annotations
 
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from core.fields import EncryptedCharField
+from core.historical_scope import (
+    ATTRIBUTED_SCOPE_STATUSES,
+    ScopeAttributionStatus,
+    guard_immutable_scope_snapshot,
+)
 
 
 class Provider(models.TextChoices):
     CLICK = "click", _("Click")
     PAYME = "payme", _("Payme")
     UZUM = "uzum", _("Uzum")
+
+
+_EXTERNAL_PAYMENT_METHODS = ("click", "payme", "uzum")
 
 
 class ProviderConfig(models.Model):
@@ -87,6 +96,26 @@ class Payment(models.Model):
     cashier_shift = models.ForeignKey(
         "finance.CashierShift", on_delete=models.SET_NULL, null=True, blank=True, related_name="payments"
     )
+    branch_at_payment = models.ForeignKey(
+        "org.Branch",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    department_at_payment = models.ForeignKey(
+        "org.Department",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    attribution_status = models.CharField(
+        max_length=12,
+        choices=ScopeAttributionStatus.choices,
+        default=ScopeAttributionStatus.UNRESOLVED,
+        db_index=True,
+    )
     payer = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="payments"
     )
@@ -105,10 +134,60 @@ class Payment(models.Model):
             # filter. Payment is one row per transaction (high volume) — index the sort.
             models.Index(fields=("-created_at", "id"), name="payment_created_idx"),
             models.Index(fields=("account_ref",), name="payment_account_ref_idx"),
+            models.Index(fields=("branch_at_payment", "paid_at"), name="payment_branch_paid_idx"),
+            models.Index(
+                fields=("branch_at_payment", "created_at"),
+                name="payment_branch_created_idx",
+            ),
+            models.Index(
+                fields=("department_at_payment", "paid_at"),
+                name="payment_dept_paid_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(currency="UZS"),
+                name="payment_currency_uzs",
+            ),
+            models.UniqueConstraint(
+                fields=("provider", "provider_txn_id"),
+                condition=(models.Q(provider__in=_EXTERNAL_PAYMENT_METHODS) & ~models.Q(provider_txn_id="")),
+                name="payment_provider_txn_unique",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+                        branch_at_payment__isnull=False,
+                    )
+                    | models.Q(
+                        attribution_status__in=(
+                            ScopeAttributionStatus.UNRESOLVED,
+                            ScopeAttributionStatus.CONFLICTING,
+                            ScopeAttributionStatus.QUARANTINED,
+                        ),
+                        branch_at_payment__isnull=True,
+                        department_at_payment__isnull=True,
+                    )
+                ),
+                name="payment_scope_attribution_valid",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.provider}:{self.amount_uzs} [{self.status}]"
+
+    def save(self, *args, **kwargs) -> None:
+        guard_immutable_scope_snapshot(
+            self,
+            field_attnames=(
+                "branch_at_payment_id",
+                "department_at_payment_id",
+                "attribution_status",
+            ),
+            update_fields=kwargs.get("update_fields"),
+        )
+        super().save(*args, **kwargs)
 
     # --- Payme transaction-shape adapter (used by the Payme JSON-RPC store) ---
     @property
@@ -125,12 +204,10 @@ class Payment(models.Model):
 
 
 class PaymentAttempt(models.Model):
-    """One provider round-trip (request + response). Append-only history."""
+    """One privacy-minimized provider round-trip outcome."""
 
     payment = models.ForeignKey(Payment, on_delete=models.CASCADE, related_name="attempts")
     attempt_no = models.PositiveSmallIntegerField()
-    request_payload = models.JSONField(default=dict, blank=True)
-    response_payload = models.JSONField(default=dict, blank=True)
     error_code = models.CharField(max_length=32, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -157,8 +234,8 @@ class WebhookEvent(models.Model):
     signature_valid = models.BooleanField(default=False)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.RECEIVED, db_index=True)
     payload = models.JSONField(default=dict, blank=True)
-    remote_ip = models.GenericIPAddressField(null=True, blank=True)
     processed_at = models.DateTimeField(null=True, blank=True)
+    last_attempted_at = models.DateTimeField(default=timezone.now)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -187,6 +264,10 @@ class FiscalReceipt(models.Model):
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
     fiscal_sign = models.CharField(max_length=128, blank=True)
     qr_url = models.URLField(blank=True)
+    provider_payload = models.JSONField(default=dict, blank=True)
+    pdf_key = models.CharField(max_length=512, blank=True)
+    # Deprecated mixed-trust storage. Kept for a safe rolling migration only;
+    # application code never reads download keys or provider data from it.
     payload = models.JSONField(default=dict, blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
     submitted_at = models.DateTimeField(null=True, blank=True)

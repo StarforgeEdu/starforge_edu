@@ -7,15 +7,12 @@ from typing import Any
 from apps.parents.models import Guardian, ParentProfile, PickupAuthorization
 
 
-def parent_to_dict(parent: ParentProfile) -> dict[str, Any]:
-    """Personal identity is now OWNED by the parent model (role-native auth), surfaced at
-    the top level; ``user`` is retained for the login/username reference + back-compat."""
+def parent_to_dict(parent: ParentProfile, *, notes: bool = False) -> dict[str, Any]:
+    """Role-native parent identity without bridge IDs or session/password state."""
     return {
         "id": parent.id,
         "username": parent.username,
         "is_active": parent.is_active,
-        "must_change_password": parent.must_change_password,
-        "last_login_at": parent.last_login_at.isoformat() if parent.last_login_at else None,
         # Identity owned by the parent model.
         "first_name": parent.first_name,
         "last_name": parent.last_name,
@@ -26,12 +23,24 @@ def parent_to_dict(parent: ParentProfile) -> dict[str, Any]:
         "birthdate": parent.birthdate.isoformat() if parent.birthdate else None,
         "gender": parent.gender,
         "workplace": parent.workplace,
-        "notes": parent.notes,
+        "notes": parent.notes if notes else None,
         "created_at": parent.created_at.isoformat(),
     }
 
 
-def guardian_to_dict(g: Guardian) -> dict[str, Any]:
+def parent_list_to_dict(parent: ParentProfile) -> dict[str, Any]:
+    """PII-minimized directory projection.
+
+    Safeguarding notes, password-change state, and sign-in activity belong only
+    in an explicitly authorized detail/account workflow, not every list row.
+    """
+    payload = parent_to_dict(parent)
+    for field in ("notes",):
+        payload.pop(field, None)
+    return payload
+
+
+def guardian_to_dict(g: Guardian, *, custody_notes: str | None = None) -> dict[str, Any]:
     # Denormalized names resolved from the repo's select_related("parent__user",
     # "student__user") — a family link answers "which parent / which child" without
     # a second call, no extra query per row.
@@ -43,7 +52,9 @@ def guardian_to_dict(g: Guardian) -> dict[str, Any]:
         "student_name": g.student.get_full_name() if g.student_id else None,
         "relationship": g.relationship,
         "is_primary": g.is_primary,
-        "custody_notes": g.custody_notes,
+        # Custody notes can contain legal/safeguarding information. Merely
+        # being allowed to browse family links must not reveal them.
+        "custody_notes": custody_notes,
     }
 
 
@@ -60,4 +71,5 @@ def pickup_to_dict(p: PickupAuthorization) -> dict[str, Any]:
         "relationship": p.relationship,
         "is_active": p.is_active,
         "created_at": p.created_at.isoformat(),
+        "deactivated_at": p.deactivated_at.isoformat() if p.deactivated_at else None,
     }

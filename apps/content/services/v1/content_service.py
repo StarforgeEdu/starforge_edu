@@ -30,6 +30,7 @@ from apps.content.interfaces.services import (
 )
 from apps.content.models import ContentLibrary, LessonFile, LibraryMaterial
 from core.exceptions import PermissionException, ValidationException
+from core.scoping import permission_membership_scopes
 
 
 def _reject(field: str, message: str) -> ValidationException:
@@ -49,8 +50,62 @@ def _assert_library_writable(library_id, *, actor, roles) -> None:
     call (no HTTP actor) and skips the check; mirrors LibraryMaterialService.is_writable_library."""
     if actor is None or library_id is None:
         return
-    if not selectors.scoped_libraries(user=actor, roles=roles).filter(pk=library_id).exists():
+    if (
+        not selectors.scoped_libraries(
+            user=actor,
+            roles=roles,
+            permission="content:write",
+        )
+        .filter(pk=library_id)
+        .exists()
+    ):
         raise PermissionException(_("You don't have access to that library."), code="library_out_of_scope")
+
+
+def _assert_library_target_writable(data: dict[str, Any], *, actor, roles) -> None:
+    """Authorize creation or re-scoping of a top-level library container."""
+
+    if actor is None or actor.is_superuser:
+        return
+    if selectors.has_global_content_scope(roles, permission="content:write"):
+        return
+
+    visibility = data.get("visibility", ContentLibrary.Visibility.TENANT)
+    scopes = permission_membership_scopes(
+        roles=roles,
+        permission="content:write",
+        account_kinds={"staff", "teacher"},
+    )
+    branch_id: int | None = None
+    department_id: int | None = None
+    if visibility == ContentLibrary.Visibility.DEPARTMENT and data.get("department_id"):
+        from apps.org.models import Department
+
+        department_target = (
+            Department.objects.filter(pk=data["department_id"]).values("branch_id", "id").first()
+        )
+        if department_target:
+            branch_id, department_id = department_target["branch_id"], department_target["id"]
+    elif visibility == ContentLibrary.Visibility.COHORT and data.get("cohort_id"):
+        from apps.cohorts.models import Cohort
+
+        cohort_target = (
+            Cohort.objects.filter(pk=data["cohort_id"]).values("branch_id", "department_id").first()
+        )
+        if cohort_target:
+            branch_id, department_id = cohort_target["branch_id"], cohort_target["department_id"]
+    else:
+        raise PermissionException(_("You don't have access to that library."), code="library_out_of_scope")
+
+    for scope in scopes:
+        if scope.is_organization_wide:
+            return
+        if scope.branch_id != branch_id:
+            continue
+        if scope.department_id is not None and scope.department_id != department_id:
+            continue
+        return
+    raise PermissionException(_("You don't have access to that library."), code="library_out_of_scope")
 
 
 def _course_library_id(course_id) -> int | None:
@@ -69,11 +124,11 @@ class ContentLibraryService(IContentLibraryService):
     def __init__(self, repository: IContentLibraryRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None):
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def _resolve(self, data: dict[str, Any]) -> dict[str, Any]:
         from apps.cohorts.models import Cohort
@@ -91,13 +146,20 @@ class ContentLibraryService(IContentLibraryService):
         return out
 
     def create(self, *, data: dict[str, Any], actor: Any = None, roles: set[str] | None = None):
-        # A library is the top-level container (no parent library to scope against); creating
-        # one is a plain content:write authoring action. actor/roles accepted for a uniform
-        # CRUD signature but not needed here.
-        return self.repository.add(data=self._resolve(data))
+        resolved = self._resolve(data)
+        _assert_library_target_writable(resolved, actor=actor, roles=roles)
+        return self.repository.add(data=resolved)
 
     def update(self, obj, *, changes: dict[str, Any], actor: Any = None, roles: set[str] | None = None):
-        return self.repository.apply_changes(obj, changes=self._resolve(changes))
+        resolved = self._resolve(changes)
+        if {"visibility", "department_id", "cohort_id"} & resolved.keys():
+            target = {
+                "visibility": resolved.get("visibility", obj.visibility),
+                "department_id": resolved.get("department_id", obj.department_id),
+                "cohort_id": resolved.get("cohort_id", obj.cohort_id),
+            }
+            _assert_library_target_writable(target, actor=actor, roles=roles)
+        return self.repository.apply_changes(obj, changes=resolved)
 
     def delete(self, obj) -> None:
         self.repository.remove(obj)
@@ -107,11 +169,11 @@ class CourseService(ICourseService):
     def __init__(self, repository: ICourseRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None):
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def _resolve(self, data: dict[str, Any]) -> dict[str, Any]:
         from apps.academics.models import Subject
@@ -144,11 +206,11 @@ class ModuleService(IModuleService):
     def __init__(self, repository: IModuleRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None):
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def _resolve(self, data: dict[str, Any]) -> dict[str, Any]:
         from apps.content.models import Course
@@ -187,11 +249,11 @@ class ContentLessonService(IContentLessonService):
     def __init__(self, repository: IContentLessonRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None):
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def _resolve(self, data: dict[str, Any]) -> dict[str, Any]:
         from apps.content.models import Module
@@ -221,11 +283,11 @@ class FolderService(IFolderService):
     def __init__(self, repository: IFolderRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None):
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def _resolve(self, data: dict[str, Any]) -> dict[str, Any]:
         from apps.content.models import Folder
@@ -270,17 +332,21 @@ class LessonFileService(ILessonFileService):
     def __init__(self, repository: ILessonFileRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[LessonFile]:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet[LessonFile]:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> LessonFile | None:
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str) -> LessonFile | None:
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def request_upload(self, *, data: dict[str, Any], user) -> dict:
         return domain.request_upload(user=user, **data)
 
-    def confirm(self, *, file: LessonFile) -> LessonFile:
-        return domain.confirm_upload(file=file)
+    def confirm(self, *, file: LessonFile, requested_by=None, requested_principal=None) -> LessonFile:
+        return domain.confirm_upload(
+            file=file,
+            requested_by=requested_by,
+            requested_principal=requested_principal,
+        )
 
     def download_url(self, *, file: LessonFile, user, actor_is_staff: bool) -> dict:
         return domain.download_url(file=file, user=user, actor_is_staff=actor_is_staff)
@@ -304,16 +370,20 @@ class LibraryMaterialService(ILibraryMaterialService):
     def __init__(self, repository: ILibraryMaterialRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None, manages: bool) -> QuerySet[LibraryMaterial]:
-        return self.repository.scoped(user=user, roles=roles, manages=manages)
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet[LibraryMaterial]:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
     def get_scoped(
-        self, *, pk: int, user: Any, roles: set[str] | None, manages: bool
+        self, *, pk: int, user: Any, roles: set[str] | None, permission: str
     ) -> LibraryMaterial | None:
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles, manages=manages)
+        return self.repository.get_scoped(pk=pk, user=user, roles=roles, permission=permission)
 
     def is_writable_library(self, *, library_id: int, user, roles: set[str] | None) -> bool:
-        return selectors.scoped_libraries(user=user, roles=roles).filter(pk=library_id).exists()
+        return (
+            selectors.scoped_libraries(user=user, roles=roles, permission="content:write")
+            .filter(pk=library_id)
+            .exists()
+        )
 
     def create(self, *, library_id: int, title: str, topic: str, created_by) -> LibraryMaterial:
         library = ContentLibrary.objects.get(pk=library_id)
@@ -322,8 +392,12 @@ class LibraryMaterialService(ILibraryMaterialService):
     def update(self, *, material: LibraryMaterial, fields: dict[str, Any]) -> LibraryMaterial:
         return domain.update_material(material_id=material.pk, fields=fields)
 
-    def generate(self, *, material: LibraryMaterial, requested_by):
-        return domain.request_material_generation(material=material, requested_by=requested_by)
+    def generate(self, *, material: LibraryMaterial, requested_by, requested_principal):
+        return domain.request_material_generation(
+            material=material,
+            requested_by=requested_by,
+            requested_principal=requested_principal,
+        )
 
     def publish(self, *, material: LibraryMaterial) -> LibraryMaterial:
         return domain.publish_material(material=material)

@@ -31,7 +31,8 @@ from core.exceptions import NotFoundException, PermissionException, ValidationEx
 from core.http import bool_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
 from core.responses import created, error, no_content, paginated, success
-from core.scoping import is_unscoped, permission_membership_branch_ids
+from core.role_principals import request_role_principal
+from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 
 _RESOURCE = "campaign"
 
@@ -52,7 +53,7 @@ def _scope(request: HttpRequest, permission: str) -> tuple[bool, set[int]]:
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     from core.permissions import get_user_roles
 
-    return is_unscoped(req), permission_membership_branch_ids(
+    return is_permission_unscoped(req, permission=permission), permission_membership_branch_ids(
         roles=get_user_roles(req), permission=permission
     )
 
@@ -198,7 +199,7 @@ def dnc_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if read:
         return success(do_not_contact_to_dict(entry))
     if request.method == "DELETE":
-        if not is_unscoped(request):
+        if not is_permission_unscoped(request, permission=f"{_RESOURCE}:write"):
             raise PermissionException(
                 "Only a director can remove a do-not-contact entry.",
                 code="forbidden",
@@ -267,7 +268,15 @@ def template_generate_view(request: HttpRequest, pk: int) -> HttpResponse:
     template = _template_service().get(pk)
     if template is None:
         raise NotFoundException(code="not_found")
-    ai_request = _template_service().generate(template, requested_by=request.user)
+    ai_request = _template_service().generate(
+        template,
+        requested_by=request.user,
+        requested_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff", "teacher"},
+            error_code="ai_principal_unavailable",
+        ),
+    )
     # 202 Accepted — the body is drafted async; poll /ai/requests/{id}/.
     return success({"request_id": ai_request.pk, "status": ai_request.status}, status=202)
 

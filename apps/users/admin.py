@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 from django import forms
 from django.contrib import admin
@@ -78,19 +78,19 @@ class RoleMembershipAdminForm(forms.ModelForm):
     )
     teacher_account = forms.ModelChoiceField(
         label="Teacher account",
-        queryset=TeacherProfile.objects.all(),
+        queryset=TeacherProfile.objects.defer("salary_type", "rate"),
         required=False,
         help_text="Choose exactly one account across these four fields.",
     )
     student_account = forms.ModelChoiceField(
         label="Student account",
-        queryset=StudentProfile.objects.all(),
+        queryset=StudentProfile.objects.defer("medical_notes", "emergency_contacts"),
         required=False,
         help_text="Choose exactly one account across these four fields.",
     )
     parent_account = forms.ModelChoiceField(
         label="Parent account",
-        queryset=ParentProfile.objects.all(),
+        queryset=ParentProfile.objects.defer("notes"),
         required=False,
         help_text="Choose exactly one account across these four fields.",
     )
@@ -102,14 +102,21 @@ class RoleMembershipAdminForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.instance.pk and self.instance.user_id:
-            user = self.instance.user
-            for field, relation in (
-                ("staff_account", "staff_profile"),
-                ("teacher_account", "teacher_profile"),
-                ("student_account", "student_profile"),
-                ("parent_account", "parent_profile"),
+            # Resolve through each form field's least-privilege queryset. Using
+            # reverse OneToOne descriptors here would load every model column,
+            # including deferred safeguarding or compensation fields, merely to
+            # render a membership form.
+            for field in (
+                "staff_account",
+                "teacher_account",
+                "student_account",
+                "parent_account",
             ):
-                account = getattr(user, relation, None)
+                account_field = cast(forms.ModelChoiceField, self.fields[field])
+                queryset = account_field.queryset
+                if queryset is None:  # pragma: no cover - all four fields declare one
+                    continue
+                account = queryset.filter(user_id=self.instance.user_id).first()
                 if account is not None:
                     self.initial[field] = account
                     break
@@ -180,11 +187,22 @@ class RoleMembershipAdmin(admin.ModelAdmin):
 
     @admin.display(description="Account", ordering="user__username")
     def role_account(self, obj: RoleMembership) -> str:
-        for relation in ("staff_profile", "teacher_profile", "student_profile", "parent_profile"):
-            account = getattr(obj.user, relation, None)
-            if account is not None:
-                return str(account)
-        return "Legacy account"
+        # The authorization bridge's username is synchronized from the role
+        # account. Avoid reverse-profile loads (and sensitive column decryption)
+        # on every row in this security-critical directory.
+        return obj.user.username or "Legacy account"
+
+    def get_queryset(self, request):
+        return (
+            super()
+            .get_queryset(request)
+            .select_related(
+                "user",
+                "account_type",
+                "branch",
+                "department",
+            )
+        )
 
     def save_model(self, request, obj, form, change) -> None:
         if not change and obj.granted_by_id is None:

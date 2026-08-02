@@ -14,14 +14,19 @@ from datetime import date
 from django.db.models import QuerySet
 
 from apps.ai.models import AIRequest, TenantAIBudget
+from core.role_principals import RolePrincipal
 
 
 class IAIService(ABC):
     @abstractmethod
-    def list_requests(self) -> QuerySet[AIRequest]: ...
+    def list_requests(
+        self, *, roles, principal: RolePrincipal, is_superuser: bool = False
+    ) -> QuerySet[AIRequest]: ...
 
     @abstractmethod
-    def get_request(self, *, pk: int) -> AIRequest | None: ...
+    def get_request(
+        self, *, pk: int, roles, principal: RolePrincipal, is_superuser: bool = False
+    ) -> AIRequest | None: ...
 
     @abstractmethod
     def get_budget(self) -> TenantAIBudget: ...
@@ -33,7 +38,14 @@ class IAIService(ABC):
 
     @abstractmethod
     def request_exam_generation(
-        self, *, requested_by, subject_id: int, exam_type: str, question_count: int, difficulty: str
+        self,
+        *,
+        requested_by,
+        requested_principal: RolePrincipal,
+        subject_id: int,
+        exam_type: str,
+        question_count: int,
+        difficulty: str,
     ) -> AIRequest: ...
 
     @abstractmethod

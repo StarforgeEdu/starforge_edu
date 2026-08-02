@@ -59,7 +59,8 @@ def _three_weighted_exams(*, subject, cohort, term, student, scores, weights, pu
             weight=Decimal(weight),
             is_published=pub,
         )
-        ExamResult.objects.create(exam=exam, student=student, score=Decimal(score))
+        with services.assessment_integrity_write():
+            ExamResult.objects.create(exam=exam, student=student, score=Decimal(score))
         exams.append(exam)
     return exams
 
@@ -181,7 +182,10 @@ def test_record_results_rejects_student_outside_exam_cohort(tenant_a):
         assert ExamResult.objects.filter(exam=exam).count() == 0
 
 
-def test_grade_changed_emitted_once_on_overwrite(tenant_a, django_capture_on_commit_callbacks):
+def test_draft_grade_overwrite_does_not_emit_published_signal(
+    tenant_a,
+    django_capture_on_commit_callbacks,
+):
     received: list[dict] = []
 
     def _recv(sender, **kwargs):
@@ -205,9 +209,9 @@ def test_grade_changed_emitted_once_on_overwrite(tenant_a, django_capture_on_com
                 services.record_results(
                     exam=exam, rows=[{"student": student, "score": Decimal("88")}], actor=None
                 )
-            assert len(received) == 1  # overwrite emits exactly once
-            assert received[0]["old_score"] == Decimal("70")
-            assert received[0]["new_score"] == Decimal("88")
+            # A draft overwrite is not a publication event. Notifications are
+            # emitted only after an explicit readiness-confirmed publish.
+            assert received == []
     finally:
         grade_changed.disconnect(_recv)
 
@@ -239,7 +243,7 @@ def test_grade_changed_not_emitted_on_identical_reentry(tenant_a, django_capture
                 result = services.record_results(
                     exam=exam, rows=[{"student": student, "score": Decimal("70")}], actor=None
                 )
-            assert result["updated"] == 1  # update_or_create still touched the row
+            assert result["updated"] == 0  # exact retries do not touch evidence
             assert received == []  # ...but no grade_changed because score is unchanged
     finally:
         grade_changed.disconnect(_recv)
@@ -280,11 +284,12 @@ def test_record_results_bulk_query_budget(
             ExamResultFactory(exam=exam, student=student, score=Decimal("50"))
 
         rows = [{"student": student, "score": Decimal("75"), "note": "bulk"} for student in students]
-        # SAVEPOINT + locked exam/cohort + membership ids + locked existing rows
-        # + one bulk INSERT + one bulk UPDATE + RELEASE SAVEPOINT.
+        # Constant-query even for a mixed batch: lifecycle capability setup and
+        # restoration, the two bulk writes, audit scheduling, and the published-
+        # evidence aggregate refresh must not grow with the number of rows.
         with (
             django_capture_on_commit_callbacks(execute=True),
-            django_assert_max_num_queries(8),
+            django_assert_max_num_queries(17),
         ):
             result = services.record_results(exam=exam, rows=rows)
 
@@ -398,6 +403,27 @@ def test_transcript_task_lifecycle_idempotent(tenant_a, monkeypatch):
         # Re-run is idempotent: done short-circuits, no second upload.
         services.generate_transcript(transcript.id)
         assert len(uploads) == 1
+
+
+def test_transcript_failures_store_and_present_only_a_safe_code(tenant_a):
+    from apps.academics.presenters import transcript_to_dict
+
+    secret = "storage://operator:super-secret@internal/private/student.pdf"
+    with schema_context(tenant_a.schema_name):
+        transcript = Transcript.objects.create(student=StudentProfileFactory())
+        services.mark_transcript_failed(transcript.pk, RuntimeError(secret))
+        transcript.refresh_from_db()
+
+        assert transcript.error == "transcript_generation_failed"
+        payload = transcript_to_dict(transcript)
+        assert payload["error"] == "transcript_generation_failed"
+        assert secret not in str(payload)
+
+        # Rows written by older releases can contain raw exception text; presenters
+        # must redact those too while a data migration is pending.
+        transcript.error = secret
+        transcript.save(update_fields=["error"])
+        assert transcript_to_dict(transcript)["error"] == "transcript_generation_failed"
 
 
 def test_transcript_post_returns_202_pending(tenant_a, user_in, as_user):
@@ -574,11 +600,15 @@ def test_weasyprint_renders_real_pdf(tenant_a):
 
 
 def test_publication_gating_parent_student_teacher(tenant_a, user_in, as_user):
-    teacher_user = user_in(tenant_a, roles=["teacher"])
-    student_user = user_in(tenant_a, roles=["student"])
-    parent_user = user_in(tenant_a, roles=["parent"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+    # Canonical permission memberships are branch-scoped. Keep each role
+    # principal's assignment aligned with the records constructed below instead
+    # of relying on the fixture's unrelated default branch.
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    student_user = user_in(tenant_a, roles=["student"], branch=branch)
+    parent_user = user_in(tenant_a, roles=["parent"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         cohort = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         subject = SubjectFactory()
@@ -637,11 +667,12 @@ def test_exam_results_write_path_teacher_cohort_scoped(tenant_a, user_in, as_use
     """A teacher of cohort A cannot reach cohort B's exam: GET/POST on the
     results / import-csv / publish actions 404 (via get_object()), while the
     owning-cohort teacher and a director succeed."""
-    owner_teacher_user = user_in(tenant_a, roles=["teacher"])
-    other_teacher_user = user_in(tenant_a, roles=["teacher"])
-    director = user_in(tenant_a, roles=["director"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+    owner_teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    other_teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    director = user_in(tenant_a, roles=["director"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         owner_profile = TeacherProfileFactory(user=owner_teacher_user, branch=branch)
         other_profile = TeacherProfileFactory(user=other_teacher_user, branch=branch)
         owned_cohort = CohortFactory(branch=branch, name="Owned", primary_teacher=owner_profile)
@@ -679,7 +710,14 @@ def test_exam_results_write_path_teacher_cohort_scoped(tenant_a, user_in, as_use
     # --- director (staff): tenant-wide, publish succeeds ---
     director_client = as_user(tenant_a, director)
     assert director_client.get(f"{base}/results/").status_code == 200
-    assert director_client.post(f"{base}/publish/").status_code == 200
+    assert (
+        director_client.post(
+            f"{base}/publish/",
+            {"expected_version": 1, "confirmed": True},
+            format="json",
+        ).status_code
+        == 200
+    )
     # Empty body is a 400 contract error (parity with the old DRF ParseError); an
     # explicit empty JSON array [] is a valid no-op (200).
     assert (
@@ -715,9 +753,10 @@ def test_json_results_array_is_capped(tenant_a, user_in, as_user, monkeypatch):
 
 def test_exam_list_teacher_cohort_scoped(tenant_a, user_in, as_user):
     """List is scoped too: a teacher sees only exams of cohorts they teach."""
-    teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         mine = CohortFactory(branch=branch, name="Mine", primary_teacher=profile)
         theirs = CohortFactory(branch=branch, name="Theirs")
@@ -776,10 +815,11 @@ def test_honor_roll_endpoint_staff_only(tenant_a, user_in, as_user):
 def test_honor_roll_and_warnings_teacher_cohort_scoped(tenant_a, user_in, as_user):
     """Honor-roll / warnings mirror grade scoping for TEACHER: a teacher sees only
     students in cohorts they teach; a director stays tenant-wide."""
-    teacher_user = user_in(tenant_a, roles=["teacher"])
-    director = user_in(tenant_a, roles=["director"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    director = user_in(tenant_a, roles=["director"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         my_cohort = CohortFactory(branch=branch, name="Mine", primary_teacher=profile)
         other_cohort = CohortFactory(branch=branch, name="Other")
@@ -844,9 +884,10 @@ def test_teacher_cannot_create_exam_in_non_taught_cohort(tenant_a, user_in, as_u
     academics:write may NOT POST an exam into a cohort they don't teach. The
     out-of-scope cohort PK is filtered from the serializer queryset → 400; the
     teacher's own cohort succeeds (201)."""
-    teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         own_cohort: Any = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         foreign_cohort: Any = CohortFactory(branch=branch)
@@ -970,9 +1011,10 @@ def test_teacher_cannot_recompute_grades_for_non_taught_cohort(tenant_a, user_in
     academics:write may NOT recompute/publish grades for a cohort they don't teach —
     otherwise they could force-publish another cohort's (or another branch's) grades.
     Their own cohort is allowed."""
-    teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         own_cohort: Any = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         foreign_cohort: Any = CohortFactory(branch=branch)

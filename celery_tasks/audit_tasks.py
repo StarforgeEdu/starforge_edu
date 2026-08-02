@@ -72,7 +72,7 @@ def cleanup_old_audit_logs_for_schema() -> int:
     # The database trigger rejects arbitrary UPDATE/DELETE. Only this explicit,
     # transaction-local maintenance capability may perform statutory retention.
     with transaction.atomic(), connection.cursor() as cursor:
-        cursor.execute("SET LOCAL starforge.audit_maintenance = 'on'")
+        cursor.execute("SET LOCAL starforge.audit_maintenance = 'retention-delete'")
         long_deleted, _ = AuditLog.objects.filter(
             resource_type__in=RETENTION_LONG_TYPES, created_at__lt=long_cutoff
         ).delete()

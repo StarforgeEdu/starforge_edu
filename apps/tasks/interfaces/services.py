@@ -9,21 +9,38 @@ from django.db.models import QuerySet
 
 from apps.tasks.dto.task_dto import AssignTaskDTO, CreateTaskDTO, RoleGradeDTO
 from apps.tasks.models import RoleGrade, Task
+from core.permissions import MembershipGrantScope
+from core.role_principals import RolePrincipal
 
 
 class ITaskService(ABC):
     @abstractmethod
     def scoped_list(
-        self, *, user, is_unscoped: bool, has_write: bool, branch_ids: set[int], dept_ids: set[int]
+        self,
+        *,
+        is_unscoped: bool,
+        include_assignee: bool,
+        principal_kind: str,
+        principal_id: int,
+        branch_ids: set[int],
+        dept_ids: set[int],
     ) -> QuerySet[Task]: ...
 
     @abstractmethod
     def get_visible(
-        self, *, user, is_unscoped: bool, has_write: bool, branch_ids: set[int], dept_ids: set[int], pk: int
+        self,
+        *,
+        is_unscoped: bool,
+        include_assignee: bool,
+        principal_kind: str,
+        principal_id: int,
+        branch_ids: set[int],
+        dept_ids: set[int],
+        pk: int,
     ) -> Task | None: ...
 
     @abstractmethod
-    def mine(self, user) -> QuerySet[Task]: ...
+    def mine(self, *, principal_kind: str, principal_id: int) -> QuerySet[Task]: ...
 
     @abstractmethod
     def create(
@@ -31,10 +48,11 @@ class ITaskService(ABC):
         data: CreateTaskDTO,
         *,
         creator,
-        creator_roles: set[str],
+        creator_principal: RolePrincipal,
         is_superuser: bool,
         is_unscoped: bool,
-        branch_ids: set[int],
+        write_grants: tuple[MembershipGrantScope, ...],
+        assign_any_grants: tuple[MembershipGrantScope, ...],
     ) -> Task: ...
 
     @abstractmethod
@@ -44,13 +62,24 @@ class ITaskService(ABC):
         data: AssignTaskDTO,
         *,
         actor,
-        actor_roles: set[str],
         is_unscoped: bool,
-        branch_ids: set[int],
+        write_grants: tuple[MembershipGrantScope, ...],
+        assign_any_grants: tuple[MembershipGrantScope, ...],
     ) -> Task: ...
 
     @abstractmethod
-    def transition(self, task: Task, *, to_status: str, actor, can_transition_any: bool = False) -> Task: ...
+    def transition(
+        self,
+        task: Task,
+        *,
+        to_status: str,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        is_superuser: bool,
+        transition_grants: tuple[MembershipGrantScope, ...],
+        assign_any_grants: tuple[MembershipGrantScope, ...],
+    ) -> Task: ...
 
     @abstractmethod
     def auto_assign(
@@ -59,10 +88,10 @@ class ITaskService(ABC):
         task_ids: list[int],
         department_id: int,
         actor,
-        actor_roles: set[str],
         mode: str,
         is_unscoped: bool,
-        branch_ids: set[int],
+        write_grants: tuple[MembershipGrantScope, ...],
+        assign_any_grants: tuple[MembershipGrantScope, ...],
     ) -> dict[str, Any]: ...
 
 

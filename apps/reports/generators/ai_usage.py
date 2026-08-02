@@ -1,8 +1,8 @@
 """AI-usage generator (D4-LB-3): AI tokens consumed in a month.
 
-Consumes Lane A's published interface ``apps.ai.selectors.tokens_consumed(start,
-end) -> int`` (cross-app, imported LAZILY). Until Lane A merges the selector,
-this tolerates its absence and reports 0 (the WORKLOG D4-LA-9 contract).
+Consumes the published interface ``apps.ai.selectors.tokens_consumed(start,
+end) -> int`` (cross-app, imported lazily). Source failures abort generation;
+they are never rendered as a misleading zero-usage report.
 
 Param: ``month`` = "YYYY-MM" (defaults to the current month).
 """
@@ -10,15 +10,12 @@ Param: ``month`` = "YYYY-MM" (defaults to the current month).
 from __future__ import annotations
 
 import calendar
-import logging
 from datetime import date
 from typing import Any
 
 from django.utils import timezone
 
-from apps.reports.generators.base import ReportGenerator
-
-logger = logging.getLogger("starforge.reports")
+from apps.reports.generators.base import ReportGenerator, assert_report_generation_authorized
 
 
 def _month_bounds(month: str | None) -> tuple[date, date]:
@@ -36,16 +33,10 @@ def _month_bounds(month: str | None) -> tuple[date, date]:
 
 
 def _tokens_consumed(start: date, end: date) -> int:
-    """Call Lane A's selector lazily; tolerate its absence (0) until A merges."""
-    try:
-        from apps.ai.selectors import tokens_consumed
-    except Exception:
-        return 0
-    try:
-        return int(tokens_consumed(start, end))
-    except Exception:  # pragma: no cover - defensive while Lane A stabilizes
-        logger.exception("tokens_consumed failed in ai_usage report")
-        return 0
+    """Call the authoritative selector; failures must not masquerade as zero."""
+    from apps.ai.selectors import tokens_consumed
+
+    return int(tokens_consumed(start, end))
 
 
 class AiUsageGenerator(ReportGenerator):
@@ -54,6 +45,7 @@ class AiUsageGenerator(ReportGenerator):
     template_base = "ai_usage"
 
     def collect(self, params: dict[str, Any], *, user, roles: set[str]) -> dict[str, Any]:
+        assert_report_generation_authorized(report_key=self.key, user=user, roles=roles)
         start, end = _month_bounds(params.get("month"))
         total = _tokens_consumed(start, end)
         rows = [

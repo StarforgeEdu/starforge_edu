@@ -28,9 +28,12 @@ in plaintext (it lives in ``ProviderConfig.payme_key`` via EncryptedCharField).
 from __future__ import annotations
 
 import base64
+import binascii
 import hmac
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
+from urllib.parse import quote
 
 from django.conf import settings
 
@@ -44,12 +47,16 @@ ERR_ACCOUNT_ALREADY_PAID = -31099  # another open/performed txn for this account
 ERR_INSUFFICIENT_PRIVILEGE = -32504
 ERR_METHOD_NOT_FOUND = -32601
 ERR_PARSE = -32700
+ERR_INTERNAL = -32400
 
 # --- Payme transaction states ----------------------------------------------
 STATE_CREATED = 1
 STATE_PERFORMED = 2
 STATE_CANCELLED = -1  # cancelled while in CREATED
 STATE_CANCELLED_AFTER_PERFORM = -2  # cancelled after PERFORMED (refund)
+_SAFE_CHECKOUT_VALUE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+_MAX_PAYME_ID_LENGTH = 64
+_MAX_STATEMENT_WINDOW_MS = 31 * 24 * 60 * 60 * 1000
 
 
 class PaymeError(Exception):
@@ -84,6 +91,15 @@ class PaymeStore(Protocol):
     def create_transaction(
         self, *, payme_id: str, time_ms: int, amount_tiyin: int, account: dict, invoice: Any
     ) -> Any: ...
+    def validate_existing_create(
+        self,
+        txn: Any,
+        *,
+        time_ms: int,
+        amount_tiyin: int,
+        account: dict[str, Any],
+        invoice: Any,
+    ) -> None: ...
     def perform_transaction(self, txn: Any) -> Any: ...
     def cancel_transaction(self, txn: Any, *, reason: int) -> Any: ...
     def statement(self, *, frm: int, to: int) -> list[dict[str, Any]]: ...
@@ -95,11 +111,14 @@ class PaymeClient(ABC):
     # ----- auth ------------------------------------------------------------
     def verify_auth(self, *, auth_header: str | None, key: str) -> bool:
         """Validate the ``Authorization: Basic base64(Paycom:<key>)`` header."""
-        if not auth_header or not auth_header.startswith("Basic "):
+        if not auth_header or len(auth_header) > 8192:
             return False
         try:
-            raw = base64.b64decode(auth_header.split(" ", 1)[1]).decode()
-        except (ValueError, UnicodeDecodeError):
+            scheme, encoded = auth_header.split(" ", 1)
+            if scheme.lower() != "basic" or not encoded or any(char.isspace() for char in encoded):
+                return False
+            raw = base64.b64decode(encoded, validate=True).decode("utf-8", errors="strict")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
             return False
         login, _, token = raw.partition(":")
         # Constant-time compare on the secret to avoid leaking the key byte-by-byte
@@ -126,19 +145,35 @@ class RealPaymeClient(PaymeClient):
     def handle(
         self, *, body: dict[str, Any], auth_header: str | None, key: str, store: PaymeStore
     ) -> dict[str, Any]:
-        rpc_id = body.get("id")
+        raw_rpc_id = body.get("id")
+        rpc_id = (
+            raw_rpc_id
+            if isinstance(raw_rpc_id, int)
+            and not isinstance(raw_rpc_id, bool)
+            and -(2**63) <= raw_rpc_id <= 2**63 - 1
+            else None
+        )
         if not self.verify_auth(auth_header=auth_header, key=key):
             return PaymeError(
                 ERR_INSUFFICIENT_PRIVILEGE,
                 _msg("Insufficient privilege to perform this method."),
             ).as_rpc(rpc_id)
 
-        method = str(body.get("method") or "")
-        # Attacker-controlled body: a non-dict `params` ([...], "x", 5) would make the
-        # handlers' params.get(...) / params[...] raise below. Coerce so a malformed
-        # request becomes a JSON-RPC error, never a 500 (Payme's always-200 contract).
+        # Never execute a money transition for a malformed JSON-RPC envelope.
+        # Silently replacing an attacker-controlled id with null after processing
+        # would leave the provider unable to correlate the side effect or retry.
+        rpc_version = body.get("jsonrpc")
+        # Payme's Merchant API names the wire format RPC and requires
+        # method/params/id, but its official examples omit a jsonrpc member. If a
+        # version is supplied, accept only 2.0; omission remains provider-compatible.
+        if rpc_id is None or (rpc_version is not None and rpc_version != "2.0"):
+            return PaymeError(ERR_PARSE, _msg("Invalid JSON-RPC request.")).as_rpc(None)
+
+        method = body.get("method")
         raw_params = body.get("params")
-        params = raw_params if isinstance(raw_params, dict) else {}
+        if not isinstance(method, str) or len(method) > 64 or not isinstance(raw_params, dict):
+            return PaymeError(ERR_PARSE, _msg("Invalid JSON-RPC request.")).as_rpc(rpc_id)
+        params = raw_params
         handler = {
             "CheckPerformTransaction": self._check_perform,
             "CreateTransaction": self._create,
@@ -168,19 +203,31 @@ class RealPaymeClient(PaymeClient):
         return {"allow": True}
 
     def _create(self, params: dict[str, Any], store: PaymeStore) -> dict[str, Any]:
-        payme_id = str(params["id"])
+        payme_id = self._transaction_id(params)
+        account = self._account(params)
+        invoice = store.find_account(account)
+        self._assert_amount(params, store, invoice)
+        time_ms = self._timestamp(params.get("time"))
         existing = store.get_transaction(payme_id)
         if existing is not None:
-            # Idempotent on Payme id — echo the existing transaction.
+            # Payme retries are idempotent only for the SAME immutable intent.
+            # Official conformance requires the merchant to repeat its basic
+            # checks; blindly echoing an id reused for a different account,
+            # amount, or creation time can acknowledge the wrong payment.
+            store.validate_existing_create(
+                existing,
+                time_ms=time_ms,
+                amount_tiyin=self._amount(params),
+                account=account,
+                invoice=invoice,
+            )
             return self._txn_create_result(existing)
 
-        invoice = store.find_account(params.get("account") or {})
-        self._assert_amount(params, store, invoice)
         txn = store.create_transaction(
             payme_id=payme_id,
-            time_ms=int(params.get("time", 0)),
-            amount_tiyin=int(params["amount"]),
-            account=params.get("account") or {},
+            time_ms=time_ms,
+            amount_tiyin=self._amount(params),
+            account=account,
             invoice=invoice,
         )
         return self._txn_create_result(txn)
@@ -210,7 +257,10 @@ class RealPaymeClient(PaymeClient):
                 "cancel_time": txn.cancel_time_ms,
                 "state": txn.provider_state,
             }
-        txn = store.cancel_transaction(txn, reason=int(params.get("reason", 0)))
+        reason = params.get("reason", 0)
+        if isinstance(reason, bool) or not isinstance(reason, int) or reason < 0 or reason > 255:
+            raise PaymeError(ERR_PARSE, _msg("Invalid parameters."))
+        txn = store.cancel_transaction(txn, reason=reason)
         return {
             "transaction": txn.provider_txn_id,
             "cancel_time": txn.cancel_time_ms,
@@ -229,19 +279,52 @@ class RealPaymeClient(PaymeClient):
         }
 
     def _statement(self, params: dict[str, Any], store: PaymeStore) -> dict[str, Any]:
-        return {"transactions": store.statement(frm=int(params.get("from", 0)), to=int(params.get("to", 0)))}
+        frm = self._timestamp(params.get("from"))
+        to = self._timestamp(params.get("to"))
+        if to < frm or to - frm > _MAX_STATEMENT_WINDOW_MS:
+            raise PaymeError(ERR_PARSE, _msg("Invalid statement period."))
+        return {"transactions": store.statement(frm=frm, to=to)}
 
     # ----- helpers ---------------------------------------------------------
     def _assert_amount(self, params: dict[str, Any], store: PaymeStore, invoice: Any) -> None:
         expected = store.expected_amount_tiyin(invoice)
-        if int(params.get("amount", -1)) != expected:
+        if self._amount(params) != expected:
             raise PaymeError(ERR_INVALID_AMOUNT, _msg("Incorrect amount."))
 
     def _require_txn(self, params: dict[str, Any], store: PaymeStore) -> Any:
-        txn = store.get_transaction(str(params.get("id")))
+        txn = store.get_transaction(self._transaction_id(params))
         if txn is None:
             raise PaymeError(ERR_TRANSACTION_NOT_FOUND, _msg("Transaction not found."))
         return txn
+
+    @staticmethod
+    def _transaction_id(params: dict[str, Any]) -> str:
+        value = params.get("id")
+        if not isinstance(value, str) or not value or len(value) > _MAX_PAYME_ID_LENGTH:
+            raise PaymeError(ERR_PARSE, _msg("Invalid transaction identifier."))
+        if value.strip() != value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise PaymeError(ERR_PARSE, _msg("Invalid transaction identifier."))
+        return value
+
+    @staticmethod
+    def _amount(params: dict[str, Any]) -> int:
+        value = params.get("amount")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value >= 10**18:
+            raise PaymeError(ERR_PARSE, _msg("Invalid payment amount."))
+        return value
+
+    @staticmethod
+    def _timestamp(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 10**12 or value >= 10**14:
+            raise PaymeError(ERR_PARSE, _msg("Invalid timestamp."))
+        return value
+
+    @staticmethod
+    def _account(params: dict[str, Any]) -> dict[str, Any]:
+        value = params.get("account")
+        if not isinstance(value, dict) or not value:
+            raise PaymeError(ERR_ACCOUNT_NOT_FOUND, _msg("Account is required."), data="order_id")
+        return value
 
     @staticmethod
     def _txn_create_result(txn: Any) -> dict[str, Any]:
@@ -252,11 +335,29 @@ class RealPaymeClient(PaymeClient):
         }
 
     def build_checkout(self, *, amount_tiyin: int, account: dict[str, Any], config: Any) -> dict[str, Any]:
-        merchant = getattr(config, "payme_merchant_id", "")
-        acct = ";".join(f"ac.{k}={v}" for k, v in account.items())
+        from infrastructure.http_client import validate_https_endpoint
+
+        merchant = str(getattr(config, "payme_merchant_id", ""))
+        if _SAFE_CHECKOUT_VALUE.fullmatch(merchant) is None:
+            raise ValueError("Payme merchant configuration is invalid.")
+        normalized_account: dict[str, str] = {}
+        for key, value in account.items():
+            key_text = str(key)
+            value_text = str(value)
+            if (
+                _SAFE_CHECKOUT_VALUE.fullmatch(key_text) is None
+                or _SAFE_CHECKOUT_VALUE.fullmatch(value_text) is None
+            ):
+                raise ValueError("Payme checkout account is invalid.")
+            normalized_account[key_text] = value_text
+        acct = ";".join(f"ac.{key}={value}" for key, value in normalized_account.items())
         raw = f"m={merchant};{acct};a={amount_tiyin}"
         token = base64.b64encode(raw.encode()).decode()
-        return {"redirect_url": f"{settings.PAYME_CHECKOUT_URL}/{token}", "rpc_payload": None}
+        base = validate_https_endpoint(
+            settings.PAYME_CHECKOUT_URL,
+            allowed_hosts=getattr(settings, "PAYME_CHECKOUT_ALLOWED_HOSTS", ()),
+        ).rstrip("/")
+        return {"redirect_url": f"{base}/{quote(token, safe='=')}", "rpc_payload": None}
 
 
 class MockPaymeClient(RealPaymeClient):

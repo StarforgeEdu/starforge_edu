@@ -264,15 +264,14 @@ def test_bulk_reschedule_one_week_moves_sibling_slots_together(tenant_a):
         assert after == [starts_at + timedelta(days=7) for starts_at in before]
 
 
-def test_bulk_reschedule_emits_one_rescheduled_per_moved_lesson(tenant_a, django_capture_on_commit_callbacks):
-    """Regression: bulk_reschedule must emit lesson_rescheduled (on_commit) once
-    per shifted lesson, mirroring move_occurrence, so D3-C notifies students."""
-    received: list[int] = []
+def test_bulk_reschedule_emits_one_aggregate_event(tenant_a, django_capture_on_commit_callbacks):
+    """A rule-wide move emits one batch event, not lessons x receiver work inline."""
+    received: list[dict] = []
 
-    def _recv(sender, lesson_id, **kw):
-        received.append(lesson_id)
+    def _recv(sender, **kwargs):
+        received.append(kwargs)
 
-    services.lesson_rescheduled.connect(_recv)
+    services.lessons_bulk_rescheduled.connect(_recv)
     try:
         with schema_context(tenant_a.schema_name):
             ctx = _setup()
@@ -282,21 +281,24 @@ def test_bulk_reschedule_emits_one_rescheduled_per_moved_lesson(tenant_a, django
             with django_capture_on_commit_callbacks(execute=True):
                 moved = services.bulk_reschedule(rule, shift_minutes=30)
             assert moved == 8
-        assert sorted(received) == expected_ids
+        assert len(received) == 1
+        assert received[0]["cohort_id"] == rule.cohort_id
+        assert sorted(move["lesson_id"] for move in received[0]["moves"]) == expected_ids
     finally:
-        services.lesson_rescheduled.disconnect(_recv)
+        services.lessons_bulk_rescheduled.disconnect(_recv)
 
 
-def test_bulk_reschedule_passes_actor_and_old_start(tenant_a, user_in, django_capture_on_commit_callbacks):
-    """The emitted kwargs must match move_occurrence: lesson_id, old_start
-    (isoformat of the pre-shift start), actor_id, schema_name."""
+def test_bulk_reschedule_batch_preserves_actor_and_move_snapshots(
+    tenant_a, user_in, django_capture_on_commit_callbacks
+):
+    """The aggregate event retains actor, tenant, and every dedupe snapshot."""
     actor = user_in(tenant_a, roles=["director"])
     captured: list[dict] = []
 
     def _recv(sender, **kw):
         captured.append(kw)
 
-    services.lesson_rescheduled.connect(_recv)
+    services.lessons_bulk_rescheduled.connect(_recv)
     try:
         with schema_context(tenant_a.schema_name):
             ctx = _setup()
@@ -304,13 +306,19 @@ def test_bulk_reschedule_passes_actor_and_old_start(tenant_a, user_in, django_ca
             old_starts = {lf.id: lf.starts_at for lf in rule.lessons.all()}
             with django_capture_on_commit_callbacks(execute=True):
                 services.bulk_reschedule(rule, shift_minutes=30, actor=actor)
-        assert captured  # at least one emit
-        for kw in captured:
-            assert kw["actor_id"] == actor.pk
-            assert kw["schema_name"] == tenant_a.schema_name
-            assert kw["old_start"] == old_starts[kw["lesson_id"]].isoformat()
+        assert len(captured) == 1
+        batch = captured[0]
+        assert batch["actor_id"] == actor.pk
+        assert batch["schema_name"] == tenant_a.schema_name
+        assert batch["cohort_id"] == rule.cohort_id
+        assert len(batch["moves"]) == len(old_starts)
+        for move in batch["moves"]:
+            assert move["old_start"] == old_starts[move["lesson_id"]].isoformat()
+            assert move["moved_at"]
+            assert len(move["move_id"]) == 32
+        assert len({move["move_id"] for move in batch["moves"]}) == len(old_starts)
     finally:
-        services.lesson_rescheduled.disconnect(_recv)
+        services.lessons_bulk_rescheduled.disconnect(_recv)
 
 
 def test_deactivating_rule_clears_future_lessons_and_stops_regeneration(tenant_a):
@@ -395,6 +403,8 @@ def test_teacher_ical_feed_excludes_other_teachers_lesson(tenant_a, user_in):
     teacher_b_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        teacher_a_user.role_memberships.filter(role="teacher").update(branch=branch)
+        teacher_b_user.role_memberships.filter(role="teacher").update(branch=branch)
         prof_a = TeacherProfileFactory(user=teacher_a_user, branch=branch)
         prof_b = TeacherProfileFactory(user=teacher_b_user, branch=branch)
         term = TermFactory()
@@ -417,6 +427,7 @@ def test_ical_feed_excludes_lessons_older_than_the_window(tenant_a, user_in):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        teacher_user.role_memberships.filter(role="teacher").update(branch=branch)
         prof = TeacherProfileFactory(user=teacher_user, branch=branch)
         term = TermFactory()
         ctx = {"term": term, "cohort": CohortFactory(branch=branch), "teacher": prof, "room": None}
@@ -652,8 +663,8 @@ def test_hod_schedule_scope_honors_department_and_branch_memberships(tenant_a, u
         },
         format="json",
     )
-    assert cross_department_create.status_code == 403
-    assert cross_department_create.json()["code"] == "out_of_scope"
+    assert cross_department_create.status_code == 404
+    assert cross_department_create.json()["code"] == "not_found"
 
 
 # --- one-off op guards ---
@@ -839,8 +850,8 @@ def test_rules_create_cross_branch_blocked(tenant_a, user_in, as_user):
         },
         format="json",
     )
-    assert resp.status_code == 403, resp.content
-    assert resp.json()["code"] == "out_of_scope"
+    assert resp.status_code == 404, resp.content
+    assert resp.json()["code"] == "not_found"
 
 
 def test_lesson_cancel_move_cross_branch_blocked(tenant_a, user_in, as_user):

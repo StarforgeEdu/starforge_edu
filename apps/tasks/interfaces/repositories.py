@@ -16,16 +16,31 @@ from core.interfaces import IBaseRepository
 
 class ITaskRepository(IBaseRepository[Task]):
     def scoped(
-        self, *, user, is_unscoped: bool, has_write: bool, branch_ids: set[int], dept_ids: set[int]
+        self,
+        *,
+        is_unscoped: bool,
+        include_assignee: bool,
+        principal_kind: str,
+        principal_id: int,
+        branch_ids: set[int],
+        dept_ids: set[int],
     ) -> QuerySet[Task]:
         raise NotImplementedError
 
     def get_scoped(
-        self, *, user, is_unscoped: bool, has_write: bool, branch_ids: set[int], dept_ids: set[int], pk: int
+        self,
+        *,
+        is_unscoped: bool,
+        include_assignee: bool,
+        principal_kind: str,
+        principal_id: int,
+        branch_ids: set[int],
+        dept_ids: set[int],
+        pk: int,
     ) -> Task | None:
         raise NotImplementedError
 
-    def assigned_to(self, user) -> QuerySet[Task]:
+    def assigned_to(self, *, principal_kind: str, principal_id: int) -> QuerySet[Task]:
         """The caller's own assigned tasks (the `mine` list)."""
         raise NotImplementedError
 

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from abc import abstractmethod
 
+from django.db.models import QuerySet
+
 from apps.users.models import Session, User
 from core.interfaces import IBaseRepository
 
@@ -36,4 +38,29 @@ class ISessionRepository(IBaseRepository[Session]):
     ) -> Session: ...
 
     @abstractmethod
+    def revoke(self, session_id: int) -> int:
+        """Revoke one active session. Returns the number of rows changed."""
+
+    @abstractmethod
     def revoke_all_for_user(self, user_id: int) -> int: ...
+
+    @abstractmethod
+    def active_for_principal(
+        self,
+        *,
+        user: User,
+        principal_kind: str,
+        principal_id: int | None,
+    ) -> QuerySet[Session]:
+        """Return only live sessions for one exact role-native principal."""
+
+    @abstractmethod
+    def revoke_for_principal(
+        self,
+        *,
+        user: User,
+        principal_kind: str,
+        principal_id: int | None,
+        session_id: int,
+    ) -> int:
+        """Revoke one visible live session, returning the changed row count."""

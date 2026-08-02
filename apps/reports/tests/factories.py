@@ -18,7 +18,7 @@ class ReportRunFactory(factory.django.DjangoModelFactory[ReportRun]):
     report = factory.LazyFunction(lambda: Report.objects.get(key="enrollment"))
     format = "pdf"
     status = ReportRun.Status.QUEUED
-    params: dict = {}
+    params = factory.LazyFunction(dict)
 
 
 class ReportScheduleFactory(factory.django.DjangoModelFactory[ReportSchedule]):

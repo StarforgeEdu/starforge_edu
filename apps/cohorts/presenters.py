@@ -82,7 +82,7 @@ def cohort_to_dict(cohort: Cohort) -> dict[str, Any]:
 
 def membership_to_dict(m: CohortMembership) -> dict[str, Any]:
     # `student`/`cohort` are non-null FKs — surface their readable labels alongside the
-    # ids. The members-list queryset select_relateds student__user + cohort (no N+1).
+    # ids. The members-list queryset joins the student profile + cohort (no N+1).
     return {
         "id": m.id,
         "cohort": m.cohort_id,

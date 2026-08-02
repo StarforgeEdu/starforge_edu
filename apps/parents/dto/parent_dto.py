@@ -17,6 +17,8 @@ class ParentCreateDTO:
     gender: str = ""
     workplace: str = ""
     notes: str = ""
+    branch_id: int | None = None
+    department_id: int | None = None
 
 
 @dataclass(frozen=True)

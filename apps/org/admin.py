@@ -1,4 +1,4 @@
-from typing import ClassVar
+from typing import ClassVar, cast
 
 from django import forms
 from django.contrib import admin
@@ -31,8 +31,7 @@ class StaffProfileAdminForm(RoleAccountAdminForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        account_type_field = self.fields["account_type"]
-        assert isinstance(account_type_field, forms.ModelChoiceField)
+        account_type_field = cast(forms.ModelChoiceField, self.fields["account_type"])
         account_type_field.queryset = AccountType.objects.filter(
             account_kind=AccountType.AccountKind.STAFF,
             is_active=True,
@@ -101,6 +100,9 @@ class BranchAdmin(admin.ModelAdmin):
     search_fields = ("name", "slug", "address")
     inlines = (BranchWorkingHoursInline,)
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 class DepartmentAdminForm(forms.ModelForm):
     teacher_head = forms.ModelChoiceField(
@@ -156,12 +158,18 @@ class DepartmentAdmin(admin.ModelAdmin):
         teacher = getattr(obj.head, "teacher_profile", None) if obj.head else None
         return str(teacher) if teacher is not None else "-"
 
+    def has_delete_permission(self, request, obj=None):
+        return False
+
 
 @admin.register(Room)
 class RoomAdmin(admin.ModelAdmin):
     list_display = ("name", "branch", "capacity", "is_active")
     list_filter = ("is_active", "branch")
     search_fields = ("name",)
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(BranchHoliday)
@@ -176,7 +184,15 @@ class BranchHolidayAdmin(admin.ModelAdmin):
 class BranchTransferAdmin(admin.ModelAdmin):
     """Read-only audit surface — transfers are written by services only."""
 
-    list_display = ("user", "from_branch", "to_branch", "reason", "actor", "created_at")
+    list_display = (
+        "student_public_id",
+        "student_name",
+        "from_branch",
+        "to_branch",
+        "reason",
+        "actor_name",
+        "created_at",
+    )
     list_filter = ("from_branch", "to_branch")
 
     def has_add_permission(self, request):
@@ -193,11 +209,18 @@ class BranchTransferAdmin(admin.ModelAdmin):
 class CenterSettingsAdmin(admin.ModelAdmin):
     """The per-tenant singleton (pk=1) — operator repair surface (TD-10)."""
 
-    list_display = ("__str__", "grading_scheme", "currency_primary", "student_id_pattern", "updated_at")
+    list_display = (
+        "__str__",
+        "organization_timezone",
+        "grading_scheme",
+        "currency_primary",
+        "student_id_pattern",
+        "updated_at",
+    )
 
     def has_add_permission(self, request):
-        # Singleton: created lazily by CenterSettings.load(), never via admin.
-        return not CenterSettings.objects.exists()
+        # Provisioning/migrations own the singleton; admin may repair it only in place.
+        return False
 
     def has_delete_permission(self, request, obj=None):
         return False

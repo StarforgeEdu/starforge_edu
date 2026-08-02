@@ -21,7 +21,14 @@ from core.exceptions import NotFoundException, UnprocessableEntity
 
 
 def request_loan(
-    *, requested_by, amount_uzs: Decimal, title: str, description: str = "", branch=None, borrower=None
+    *,
+    requested_by,
+    amount_uzs: Decimal,
+    title: str,
+    description: str = "",
+    branch=None,
+    borrower=None,
+    allowed_branch_ids: set[int] | None = None,
 ):
     """Raise a loan request on the A-1 engine. The borrower defaults to the
     requester (staff borrowing for themselves); a manager may name another staff
@@ -35,6 +42,7 @@ def request_loan(
         description=description,
         branch=branch,
         payload={"borrower_id": borrower_id},
+        allowed_branch_ids=allowed_branch_ids,
     )
 
 

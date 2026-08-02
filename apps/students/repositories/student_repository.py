@@ -34,7 +34,8 @@ class EnrollmentReasonRepository(BaseRepository[EnrollmentReason], IEnrollmentRe
         return reason
 
     def remove(self, reason: EnrollmentReason) -> None:
-        reason.delete()
+        reason.is_active = False
+        reason.save(update_fields=["is_active", "updated_at"])
 
     def slug_taken(self, *, slug: str, exclude_pk: int | None = None) -> bool:
         qs = EnrollmentReason.objects.filter(slug=slug)
@@ -50,7 +51,10 @@ class StudentRepository(BaseRepository[StudentProfile], IStudentRepository):
     model = StudentProfile
 
     def get_queryset(self) -> QuerySet[StudentProfile]:
-        return StudentProfile.objects.select_related("user", "branch", "current_cohort")
+        return StudentProfile.objects.select_related("user", "branch", "current_cohort").defer(
+            "medical_notes",
+            "emergency_contacts",
+        )
 
     def scoped(self, *, user, roles) -> QuerySet[StudentProfile]:
         from apps.students.selectors import scoped_students  # role-based, select_related baked in

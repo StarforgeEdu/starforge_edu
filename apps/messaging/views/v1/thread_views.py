@@ -20,18 +20,34 @@ from django.views.decorators.csrf import csrf_exempt
 
 from apps.messaging.dto.thread_dto import CreateThreadDTO
 from apps.messaging.interfaces.services import IThreadService
-from apps.messaging.presenters import contact_to_dict, message_to_dict, thread_to_dict
+from apps.messaging.openapi_contracts import (
+    THREAD_EVENTS_GET_CONTRACT,
+    THREAD_EVENTS_HEAD_CONTRACT,
+    THREAD_READ_POST_CONTRACT,
+)
+from apps.messaging.presenters import (
+    contact_to_dict,
+    message_to_dict,
+    thread_event_page_to_dict,
+    thread_read_state_to_dict,
+    thread_to_dict,
+)
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
 from core.http import int_field, read_json, str_field
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.responses import created, error, paginated, success
+from core.role_principals import RolePrincipal, request_role_principal
 
 _RESOURCE = "messaging"
 _MAX_PARTICIPANTS = 100
 _MAX_ATTACHMENTS = 10
 _MAX_MESSAGE_WINDOW = timedelta(hours=26)
+_EVENT_PAGE_DEFAULT = 50
+_EVENT_PAGE_MAX = 100
+_MAX_DATABASE_ID = 9_223_372_036_854_775_807
 
 
 def _service() -> IThreadService:
@@ -43,13 +59,37 @@ def _viewer_id(request: HttpRequest) -> int:
     return user.pk
 
 
+def _viewer_principal(request: HttpRequest) -> RolePrincipal:
+    cached = getattr(request, "_messaging_role_principal", None)
+    if isinstance(cached, RolePrincipal):
+        return cached
+    principal = request_role_principal(
+        request,
+        error_code="messaging_principal_unavailable",
+    )
+    request._messaging_role_principal = principal  # type: ignore[attr-defined]
+    return principal
+
+
 def _unread_map(request: HttpRequest, threads: list) -> dict[int, int]:
     """One bounded query for {thread_id: unread_count} across the given threads."""
-    return _service().unread_counts(thread_ids=[t.id for t in threads], viewer_id=_viewer_id(request))
+    principal = _viewer_principal(request)
+    return _service().unread_counts(
+        thread_ids=[t.id for t in threads],
+        viewer_id=_viewer_id(request),
+        viewer_principal_kind=principal.kind,
+        viewer_principal_id=principal.principal_id,
+    )
 
 
 def _get_thread(request: HttpRequest, pk: int):
-    thread = _service().get_thread(user=request.user, pk=pk)
+    principal = _viewer_principal(request)
+    thread = _service().get_thread(
+        user=request.user,
+        principal_kind=principal.kind,
+        principal_id=principal.principal_id,
+        pk=pk,
+    )
     if thread is None:
         raise NotFoundException(code="not_found")  # non-participant -> 404, strict isolation
     return thread
@@ -105,6 +145,43 @@ def _message_window(request: HttpRequest):
     return lower, upper
 
 
+def _query_int(
+    request: HttpRequest,
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    values = request.GET.getlist(name)
+    if not values:
+        return default
+    raw = values[0]
+    if len(values) != 1 or not raw or raw != raw.strip() or not raw.isascii() or not raw.isdecimal():
+        raise ValidationException(
+            f"{name} must be an integer.",
+            code="validation_error",
+            fields={name: ["Provide one decimal integer."]},
+        )
+    # Avoid both Python's deliberately bounded huge-integer conversion and a
+    # PostgreSQL bigint overflow reaching the ORM as a 500 response.
+    if len(raw) > 19:
+        raise ValidationException(
+            f"{name} is outside the supported range.",
+            code="validation_error",
+            fields={name: ["The value is too large."]},
+        )
+    value = int(raw)
+    if value < minimum or (maximum is not None and value > maximum):
+        upper = f" and at most {maximum}" if maximum is not None else ""
+        raise ValidationException(
+            f"{name} is outside the supported range.",
+            code="validation_error",
+            fields={name: [f"Must be at least {minimum}{upper}."]},
+        )
+    return value
+
+
 @csrf_exempt
 @require_auth
 def contacts_collection_view(request: HttpRequest) -> HttpResponse:
@@ -112,13 +189,15 @@ def contacts_collection_view(request: HttpRequest) -> HttpResponse:
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
     category = request.GET.get("category", "").strip().lower()
-    if category not in ("", "staff", "student"):
+    if category not in ("", "staff", "student", "parent"):
         raise ValidationException(
-            "category must be staff or student.",
+            "category must be staff, student, or parent.",
             code="validation_error",
-            fields={"category": ["Choose staff or student."]},
+            fields={"category": ["Choose staff, student, or parent."]},
         )
-    qs = _service().contacts(user=request.user, category=category)
+    # Keep the role-native principal on the request attached all the way through
+    # directory scoping. A bridge User may back more than one account kind.
+    qs = _service().contacts(authorization_context=request, category=category)
     qs = apply_filters(
         request,
         qs,
@@ -133,6 +212,9 @@ def contacts_collection_view(request: HttpRequest) -> HttpResponse:
             "student_profile__first_name",
             "student_profile__middle_name",
             "student_profile__last_name",
+            "parent_profile__first_name",
+            "parent_profile__middle_name",
+            "parent_profile__last_name",
         ),
     )
     items, total, page, size = paginate(request, qs)
@@ -150,7 +232,12 @@ def contacts_collection_view(request: HttpRequest) -> HttpResponse:
 def threads_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:read")
-        qs = _service().scoped_threads(user=request.user)
+        principal = _viewer_principal(request)
+        qs = _service().scoped_threads(
+            user=request.user,
+            principal_kind=principal.kind,
+            principal_id=principal.principal_id,
+        )
         # Meta.ordering is compound ("-last_message_at","-created_at") -> omit
         # default_ordering so apply_filters preserves it (only ?ordering re-orders).
         qs = apply_filters(request, qs, ordering_fields=("last_message_at", "created_at"))
@@ -161,6 +248,8 @@ def threads_collection_view(request: HttpRequest) -> HttpResponse:
                 t,
                 unread_count=unread.get(t.id, 0),
                 viewer_id=_viewer_id(request),
+                viewer_principal_kind=principal.kind,
+                viewer_principal_id=principal.principal_id,
             )
             for t in items
         ]
@@ -178,12 +267,15 @@ def thread_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
     thread = _get_thread(request, pk)
+    principal = _viewer_principal(request)
     unread = _unread_map(request, [thread])
     return success(
         thread_to_dict(
             thread,
             unread_count=unread.get(thread.id, 0),
             viewer_id=_viewer_id(request),
+            viewer_principal_kind=principal.kind,
+            viewer_principal_id=principal.principal_id,
         )
     )
 
@@ -199,6 +291,15 @@ def thread_messages_view(request: HttpRequest, pk: int) -> HttpResponse:
         check_perm(request, f"{_RESOURCE}:write")  # posting additionally needs write
         return _send_message(request, thread)
     qs = _service().messages_of(thread=thread)
+    after_id = _query_int(
+        request,
+        "after_id",
+        default=0,
+        minimum=0,
+        maximum=_MAX_DATABASE_ID,
+    )
+    if after_id:
+        qs = qs.filter(pk__gt=after_id)
     window = _message_window(request)
     if window is not None:
         lower, upper = window
@@ -209,13 +310,79 @@ def thread_messages_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 @csrf_exempt
 @require_auth
+@openapi_contract(
+    path="/api/v1/messaging/threads/{pk}/events/",
+    operations=(THREAD_EVENTS_GET_CONTRACT, THREAD_EVENTS_HEAD_CONTRACT),
+)
+def thread_events_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Durable cursor recovery for the pointer-only thread WebSocket stream."""
+
+    if request.method not in ("GET", "HEAD"):
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, f"{_RESOURCE}:read")
+    unknown = sorted(set(request.GET) - {"after", "limit"})
+    if unknown:
+        raise ValidationException(
+            "Unknown event query parameter.",
+            code="validation_error",
+            fields={name: ["This query parameter is not supported."] for name in unknown},
+        )
+    thread = _get_thread(request, pk)
+    after = _query_int(
+        request,
+        "after",
+        default=0,
+        minimum=0,
+        maximum=_MAX_DATABASE_ID,
+    )
+    limit = _query_int(
+        request,
+        "limit",
+        default=_EVENT_PAGE_DEFAULT,
+        minimum=1,
+        maximum=_EVENT_PAGE_MAX,
+    )
+    page = _service().event_page(thread=thread, after=after, limit=limit)
+    payload = thread_event_page_to_dict(page, thread_id=thread.pk)
+    payload["generated_at"] = timezone.now().isoformat()
+    return success(payload)
+
+
+@csrf_exempt
+@require_auth
+@openapi_contract(
+    path="/api/v1/messaging/threads/{pk}/read/",
+    operations=(THREAD_READ_POST_CONTRACT,),
+)
 def thread_read_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
     thread = _get_thread(request, pk)
-    _service().mark_read(thread=thread, user=request.user)
-    return success({"status": "ok"})
+    principal = _viewer_principal(request)
+    body = read_json(request)
+    unknown = sorted(set(body) - {"through_message_id"})
+    if unknown:
+        raise ValidationException(
+            "Unknown read-state field.",
+            code="validation_error",
+            fields={name: ["This field is not supported."] for name in unknown},
+        )
+    through_message_id = int_field(
+        body,
+        "through_message_id",
+        required=False,
+        min_value=1,
+        max_value=_MAX_DATABASE_ID,
+    )
+    state = _service().mark_read(
+        thread=thread,
+        user=request.user,
+        principal_kind=principal.kind,
+        principal_id=principal.principal_id,
+        through_message_id=through_message_id,
+    )
+    return success(thread_read_state_to_dict(state, thread_id=thread.pk))
 
 
 @csrf_exempt
@@ -233,9 +400,12 @@ def thread_preferences_view(request: HttpRequest, pk: int) -> HttpResponse:
             fields={"notifications_muted": ["Provide true or false."]},
         )
     muted = body["notifications_muted"]
+    principal = _viewer_principal(request)
     _service().set_notifications_muted(
         thread=thread,
         user=request.user,
+        principal_kind=principal.kind,
+        principal_id=principal.principal_id,
         muted=muted,
     )
     return success({"notifications_muted": muted})
@@ -248,8 +418,8 @@ def attachment_upload_url_view(request: HttpRequest) -> HttpResponse:
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
     body = read_json(request)
-    filename = str_field(body, "filename", max_length=255).strip()
-    if not filename:
+    filename = str_field(body, "filename", max_length=255)
+    if not filename.strip():
         raise ValidationException(
             "filename is required.", code="validation_error", fields={"filename": ["Required."]}
         )
@@ -278,8 +448,8 @@ def thread_attachment_download_view(request: HttpRequest, pk: int) -> HttpRespon
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
     thread = _get_thread(request, pk)
-    key = request.GET.get("key", "").strip()
-    if not key or len(key) > 512 or "\x00" in key:
+    key = request.GET.get("key", "")
+    if not key or key != key.strip() or len(key) > 512 or "\x00" in key:
         raise ValidationException(
             "key is required.", code="validation_error", fields={"key": ["Provide a valid attachment key."]}
         )
@@ -295,9 +465,18 @@ def _create_thread(request: HttpRequest) -> HttpResponse:
         first_body=str_field(body, "first_body").strip(),
         attachments=_attachments(body),
     )
-    thread = _service().create(dto, creator=request.user)
+    thread = _service().create(dto, authorization_context=request)
+    principal = _viewer_principal(request)
     # A freshly created thread's only message is the creator's own opener -> unread 0.
-    return created(thread_to_dict(thread, unread_count=0, viewer_id=_viewer_id(request)))
+    return created(
+        thread_to_dict(
+            thread,
+            unread_count=0,
+            viewer_id=_viewer_id(request),
+            viewer_principal_kind=principal.kind,
+            viewer_principal_id=principal.principal_id,
+        )
+    )
 
 
 def _send_message(request: HttpRequest, thread) -> HttpResponse:
@@ -310,7 +489,15 @@ def _send_message(request: HttpRequest, thread) -> HttpResponse:
             code="validation_error",
             fields={"body": ["Provide text or at least one attachment."]},
         )
-    message = _service().post(thread=thread, sender=request.user, body=text, attachments=attachments)
+    principal = _viewer_principal(request)
+    message = _service().post(
+        thread=thread,
+        sender=request.user,
+        sender_principal_kind=principal.kind,
+        sender_principal_id=principal.principal_id,
+        body=text,
+        attachments=attachments,
+    )
     return created(message_to_dict(message))
 
 
@@ -372,13 +559,13 @@ def _attachments(body: dict[str, Any]) -> list[str]:
             code="validation_error",
             fields={"attachments": [f"At most {_MAX_ATTACHMENTS} attachments are allowed."]},
         )
-    if any(not isinstance(key, str) or not key.strip() or len(key) > 512 for key in raw):
+    if any(not isinstance(key, str) or not key or key != key.strip() or len(key) > 512 for key in raw):
         raise ValidationException(
             "Invalid attachment key.",
             code="validation_error",
             fields={"attachments": ["Each key must be non-empty text of at most 512 characters."]},
         )
-    keys = [key.strip() for key in raw]
+    keys = list(raw)
     if len(keys) != len(set(keys)):
         raise ValidationException(
             "Duplicate attachment key.",

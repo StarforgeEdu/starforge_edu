@@ -35,7 +35,14 @@ def _mock_complete(monkeypatch, text):
     from celery_tasks import ai_tasks
 
     monkeypatch.setattr(
-        ai_tasks, "complete", lambda **kw: {"text": text, "usage": {"input_tokens": 5, "output_tokens": 50}}
+        ai_tasks,
+        "complete",
+        lambda **kw: {
+            "text": text,
+            "raw_id": "msg_material_generation",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 50},
+        },
     )
 
 
@@ -47,15 +54,32 @@ def _library(tenant, **over):
 
 
 def _setup(tenant, user_in, as_user):
+    from apps.cohorts.tests.factories import CohortFactory, CohortMembershipFactory
     from apps.org.tests.factories import BranchFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
 
     with schema_context(tenant.schema_name):
         branch = BranchFactory.create()
     teacher_u = user_in(tenant, roles=[Role.TEACHER], branch=branch)  # content:read/write/publish
     student_u = user_in(tenant, roles=[Role.STUDENT], branch=branch)  # content:read only
+    with schema_context(tenant.schema_name):
+        teacher = TeacherProfileFactory(user=teacher_u, branch=branch)
+        cohort = CohortFactory(branch=branch, primary_teacher=teacher)
+        student = StudentProfileFactory(
+            user=student_u,
+            branch=branch,
+            current_cohort=cohort,
+        )
+        CohortMembershipFactory(cohort=cohort, student=student)
+        library = _library(
+            tenant,
+            visibility="cohort",
+            cohort=cohort,
+        )
     return {
         "branch": branch,
-        "library": _library(tenant),
+        "library": library,
         "teacher_u": teacher_u,
         "manager": as_user(tenant, teacher_u),
         "learner": as_user(tenant, student_u),

@@ -15,23 +15,57 @@ from apps.approvals.interfaces.repositories import (
 )
 from apps.approvals.interfaces.services import IApprovalService, ILedgerService
 from apps.approvals.models import ApprovalRequest, LedgerEntry
-from core.exceptions import ValidationException
+from core.exceptions import NotFoundException, ValidationException
 
 
 class ApprovalService(IApprovalService):
     def __init__(self, repository: IApprovalRequestRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[ApprovalRequest]:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> QuerySet[ApprovalRequest]:
+        return self.repository.scoped(
+            user=user,
+            roles=roles,
+            permission=permission,
+            include_requested_by=include_requested_by,
+        )
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> ApprovalRequest | None:
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> ApprovalRequest | None:
+        return self.repository.get_scoped(
+            pk=pk,
+            user=user,
+            roles=roles,
+            permission=permission,
+            include_requested_by=include_requested_by,
+        )
 
-    def create(self, *, data: dict[str, Any], requested_by) -> ApprovalRequest:
+    def create(
+        self,
+        *,
+        data: dict[str, Any],
+        requested_by,
+        allowed_branch_ids: set[int] | None,
+    ) -> ApprovalRequest:
         branch = None
         branch_id = data.get("branch")
         if branch_id is not None:
+            if allowed_branch_ids is not None and branch_id not in allowed_branch_ids:
+                raise NotFoundException(code="not_found")
             from apps.org.models import Branch
 
             branch = Branch.objects.filter(pk=branch_id, archived_at__isnull=True).first()
@@ -49,6 +83,7 @@ class ApprovalService(IApprovalService):
             amount_uzs=data.get("amount_uzs"),
             branch=branch,
             payload=data.get("payload", {}),
+            allowed_branch_ids=allowed_branch_ids,
         )
 
     def approve(self, *, request_id: int, actor, note: str) -> ApprovalRequest:

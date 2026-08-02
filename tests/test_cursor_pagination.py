@@ -35,10 +35,10 @@ def _cursor_of(link: str) -> str:
 
 def _seed(n: int) -> None:
     # The production table is append-only. This test alone needs deterministic
-    # historical timestamps, so use the same transaction-local maintenance gate as
-    # the audited retention task and close it immediately after fixture setup.
+    # historical timestamps, so use the test-database-only transaction-local
+    # fixture gate and close it immediately after setup.
     with connection.cursor() as cursor:
-        cursor.execute("SET LOCAL starforge.audit_maintenance = 'on'")
+        cursor.execute("SET LOCAL starforge.audit_test = 'on'")
     try:
         AuditLog.objects.all().delete()
         base = timezone.now() - timedelta(hours=1)
@@ -47,7 +47,7 @@ def _seed(n: int) -> None:
             AuditLog.objects.filter(pk=row.pk).update(created_at=base + timedelta(seconds=i))
     finally:
         with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL starforge.audit_maintenance = 'off'")
+            cursor.execute("SET LOCAL starforge.audit_test = 'off'")
 
 
 def test_forward_pages_stay_disjoint_under_head_inserts(tenant_a):
@@ -87,7 +87,7 @@ def test_backward_link_returns_the_prior_page(tenant_a):
         assert [r.id for r in rows_back] == [r.id for r in rows1]
 
 
-def test_page_size_param_is_honoured_and_capped(tenant_a):
+def test_page_size_param_is_honoured(tenant_a):
     rf = RequestFactory()
     with schema_context(tenant_a.schema_name):
         _seed(30)

@@ -34,9 +34,6 @@ class IPaymentService(ABC):
     def list_payments(self) -> QuerySet[Payment]: ...
 
     @abstractmethod
-    def get(self, *, pk: int) -> Payment | None: ...
-
-    @abstractmethod
     def checkout(self, *, invoice_id: int, provider: str, idempotency_key: str, payer) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -53,4 +50,9 @@ class IPaymentService(ABC):
     ) -> tuple[Payment, Any]: ...
 
     @abstractmethod
-    def reconciliation(self, *, on: date, branch_ids: set[int] | None = None) -> dict[str, Any]: ...
+    def reconciliation(
+        self,
+        *,
+        on: date,
+        scope_pairs: set[tuple[int, int | None]] | None = None,
+    ) -> dict[str, Any]: ...

@@ -11,10 +11,25 @@ from core.interfaces import IBaseRepository
 
 
 class IApprovalRequestRepository(IBaseRepository[ApprovalRequest]):
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[ApprovalRequest]:
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> QuerySet[ApprovalRequest]:
         raise NotImplementedError
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> ApprovalRequest | None:
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> ApprovalRequest | None:
         raise NotImplementedError
 
 

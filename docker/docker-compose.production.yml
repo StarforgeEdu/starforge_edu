@@ -4,7 +4,7 @@ x-app: &app
   image: ${APP_IMAGE:?APP_IMAGE must be an immutable Starforge image tag}
   restart: unless-stopped
   env_file:
-    - ${STARFORGE_APP_ENV_FILE:-/root/starforge-deploy/app.env}
+    - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/app.env
   secrets:
     - source: firebase_credentials
       target: firebase.json
@@ -24,14 +24,17 @@ x-app: &app
     - no-new-privileges:true
   pids_limit: 160
   init: true
-  stop_grace_period: 45s
+  # Must exceed Gunicorn's validated request + graceful shutdown envelope.
+  # The release controller uses the same 120-second bound for discovered
+  # producer/worker/orphan containers.
+  stop_grace_period: 120s
 
 services:
   postgres:
     image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must use an immutable tag or digest}
     restart: unless-stopped
     env_file:
-      - ${STARFORGE_DB_ENV_FILE:-/root/starforge-deploy/postgres.env}
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/postgres.env
     volumes:
       - sf_pg:/var/lib/postgresql/data
     networks:
@@ -50,7 +53,11 @@ services:
   redis:
     image: ${REDIS_IMAGE:?REDIS_IMAGE must use an immutable tag or digest}
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    # Leave headroom below the container limit for Redis metadata, client buffers,
+    # AOF rewrite, and allocator fragmentation.  The broker must fail writes rather
+    # than evict queued financial/notification work.
+    command:
+      ["redis-server", "--appendonly", "yes", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction"]
     volumes:
       - sf_redis:/data
     networks:
@@ -69,7 +76,7 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     env_file:
-      - ${STARFORGE_MINIO_ENV_FILE:-/root/starforge-deploy/minio.env}
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/minio.env
     volumes:
       - sf_minio:/data
     networks:
@@ -142,13 +149,34 @@ services:
     <<: *app
     command: ["worker"]
     environment:
-      CELERY_QUEUES: default,notifications,reports,ai,maintenance
+      CELERY_QUEUES: default,notifications,maintenance
       CELERY_WORKER_CONCURRENCY: "1"
     networks:
       - internal
       - egress
     mem_limit: 384m
     cpus: 0.55
+    healthcheck:
+      test:
+        ["CMD-SHELL", "celery -A config inspect ping --destination \"celery@$$HOSTNAME\" --timeout=5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Isolate long PDF/AI work so a single slow provider or renderer cannot starve
+  # interactive notifications and normal background jobs.
+  worker-long:
+    <<: *app
+    command: ["worker"]
+    environment:
+      CELERY_QUEUES: reports,ai
+      CELERY_WORKER_CONCURRENCY: "1"
+    networks:
+      - internal
+      - egress
+    mem_limit: 384m
+    cpus: 0.45
     healthcheck:
       test:
         ["CMD-SHELL", "celery -A config inspect ping --destination \"celery@$$HOSTNAME\" --timeout=5 | grep -q pong"]
@@ -178,14 +206,56 @@ services:
   migrate:
     <<: *app
     command: ["migrate"]
+    secrets:
+      - source: firebase_credentials
+        target: firebase.json
+      - source: migration_cutover_evidence
+        target: migration-cutover.evidence
+    environment:
+      # Only scripts/deploy_production.sh should set this after stopping every
+      # old application process and completing a verified quiesced backup.
+      STARFORGE_MAINTENANCE_CUTOVER: ${STARFORGE_MAINTENANCE_CUTOVER:-}
+      STARFORGE_RELEASE_REVISION: ${STARFORGE_RELEASE_REVISION:-}
+      STARFORGE_CANDIDATE_IMAGE_ID: ${STARFORGE_CANDIDATE_IMAGE_ID:-}
+      STARFORGE_RELEASE_HELPERS_SHA256: ${STARFORGE_RELEASE_HELPERS_SHA256:-}
+      STARFORGE_EMPTY_DATABASE_BOOTSTRAP: ${STARFORGE_EMPTY_DATABASE_BOOTSTRAP:-}
     restart: "no"
     profiles: [tools]
     mem_limit: 384m
     cpus: 0.60
 
+  cutover-check:
+    <<: *app
+    command:
+      ["python", "manage.py", "check_safeguarding_encryption_cutover", "--token"]
+    restart: "no"
+    profiles: [tools]
+    mem_limit: 128m
+    cpus: 0.15
+
+  release-preflight:
+    <<: *app
+    command:
+      ["python", "manage.py", "check_release_migration_preflight", "--fail-on-blocked", "--no-color"]
+    restart: "no"
+    profiles: [tools]
+    mem_limit: 256m
+    cpus: 0.30
+
   collectstatic:
     <<: *app
     command: ["python", "manage.py", "collectstatic", "--noinput"]
+    # The CSP-trusted static bucket is writable only from this one-shot tool.
+    # Long-running services inherit app.env alone and use a URL-only backend.
+    env_file:
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/app.env
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/static-storage.env
+    environment:
+      STATIC_STORAGE_WRITE_ENABLED: "True"
+      # Remove media authority inherited from app.env in the final container
+      # environment. Production settings also reject this mixed-credential mode.
+      AWS_S3_ACCESS_KEY_ID: ""
+      AWS_S3_SECRET_ACCESS_KEY: ""
     restart: "no"
     profiles: [tools]
     mem_limit: 256m
@@ -204,7 +274,9 @@ secrets:
   # explicitly disabled does not need fake credentials. When push is enabled,
   # point this at the real service-account JSON; production settings validate it.
   firebase_credentials:
-    file: ${STARFORGE_FIREBASE_CREDENTIALS_FILE:-/root/starforge-deploy/firebase.disabled.json}
+    file: ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/firebase.json
+  migration_cutover_evidence:
+    file: ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/migration-cutover.evidence
 
 volumes:
   sf_pg: {}

@@ -26,8 +26,3 @@ app.autodiscover_tasks(["celery_tasks"])
 from celery_tasks.observability import connect_celery_observability  # noqa: E402
 
 connect_celery_observability(app)
-
-
-@app.task(bind=True)
-def debug_task(self):  # pragma: no cover
-    print(f"Request: {self.request!r}")

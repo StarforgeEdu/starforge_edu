@@ -12,23 +12,29 @@ from datetime import date
 from typing import Any
 
 from django.http import HttpRequest, HttpResponse
+from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.teachers.dto.teacher_dto import TeacherCreateDTO
+from apps.teachers.filters import apply_teacher_directory_filters
 from apps.teachers.interfaces.teacher_service import ITeacherService
 from apps.teachers.models import TeacherProfile
+from apps.teachers.openapi_contracts import PAYOUT_POLICY_CONTRACTS, PREPARE_SALARY_CONTRACT
 from apps.teachers.presenters import teacher_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
 from core.http import bool_field, decimal_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
-from core.permissions import get_user_roles
+from core.openapi_contracts import openapi_contract
+from core.permissions import _request_overrides, get_user_roles, has_permission_code
 from core.responses import created, error, no_content, paginated, success, validation_error
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_scope_q,
+    request_permission_membership_allows,
+    scope_to_permission_memberships,
 )
 
 _RESOURCE = "teachers"
@@ -36,10 +42,95 @@ _FILTERS = ("branch", "department", "is_substitute")
 _SEARCH = ("first_name", "last_name", "phone")
 _ORDERING = ("created_at", "hire_date")
 _SCALARS = ("hire_date", "subjects", "qualifications", "salary_type", "rate", "is_substitute")
+_COMPENSATION_FIELDS = frozenset({"salary_type", "rate"})
+_CREATE_FIELDS = frozenset(
+    {
+        "account_type",
+        "birthdate",
+        "branch",
+        "department",
+        "email",
+        "first_name",
+        "gender",
+        "hire_date",
+        "is_substitute",
+        "last_name",
+        "middle_name",
+        "phone",
+        "qualifications",
+        "rate",
+        "salary_type",
+        "subjects",
+        "username",
+    }
+)
+_UPDATE_FIELDS = frozenset(
+    {
+        "birthdate",
+        "branch",
+        "department",
+        "email",
+        "first_name",
+        "gender",
+        "hire_date",
+        "is_active",
+        "is_substitute",
+        "last_name",
+        "middle_name",
+        "phone",
+        "qualifications",
+        "rate",
+        "salary_type",
+        "subjects",
+    }
+)
 
 
 def _service() -> ITeacherService:
     return container.resolve(ITeacherService)  # type: ignore[type-abstract]
+
+
+def _has_compensation_permission(
+    request: HttpRequest,
+    permission: str = "compensation:read",
+) -> bool:
+    if getattr(request.user, "is_superuser", False):
+        return True
+    roles = get_user_roles(request)
+    overrides = _request_overrides(request) if roles.fallback_roles else {}
+    return has_permission_code(roles, permission, overrides)
+
+
+def _can_view_compensation(request: HttpRequest, teacher: TeacherProfile) -> bool:
+    """Require compensation authority over this teacher's exact scope.
+
+    A compensation grant in one branch must not reveal pay for teachers made visible by
+    a separate faculty grant in another branch.
+    """
+    return request_permission_membership_allows(
+        request,
+        permission="compensation:read",
+        branch_id=teacher.branch_id,
+        department_id=teacher.department_id,
+        account_kinds={"staff"},
+    )
+
+
+def _require_compensation_write(
+    request: HttpRequest,
+    *,
+    branch_id: int,
+    department_id: int | None,
+) -> None:
+    """Protect hidden compensation values from a blind directory write."""
+    check_perm(request, "compensation:write")
+    assert_permission_membership_scope(
+        request,
+        permission="compensation:write",
+        branch_id=branch_id,
+        department_id=department_id,
+        account_kinds={"staff"},
+    )
 
 
 @csrf_exempt
@@ -72,20 +163,64 @@ def teacher_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
     if request.method in ("GET", "HEAD"):
-        return success(teacher_to_dict(teacher))
+        return success(
+            teacher_to_dict(
+                teacher,
+                include_compensation=_can_view_compensation(request, teacher),
+            )
+        )
     if request.method in ("PUT", "PATCH"):
-        changes = _changes(read_json(request))
+        body = read_json(request)
+        _reject_unknown_fields(body, allowed=_UPDATE_FIELDS, operation="teacher update")
+        changes = _changes(body)
+        target_branch_id = changes.get("branch", teacher.branch_id)
+        target_department_id = changes.get("department", teacher.department_id)
         if "branch" in changes or "department" in changes:
             assert_permission_membership_scope(
                 request,
                 permission=f"{_RESOURCE}:write",
-                branch_id=changes.get("branch", teacher.branch_id),
-                department_id=changes.get("department", teacher.department_id),
+                branch_id=target_branch_id,
+                department_id=target_department_id,
                 account_kinds={"staff"},
             )
+            # Compensation history and the active payout policy follow the
+            # teacher.  Moving the profile without pay authority would let a
+            # faculty-only writer move hidden salary data into a branch where
+            # another membership can read it.  Require pay-write authority at
+            # both the old and new boundaries.
+            _require_compensation_write(
+                request,
+                branch_id=teacher.branch_id,
+                department_id=teacher.department_id,
+            )
+            _require_compensation_write(
+                request,
+                branch_id=target_branch_id,
+                department_id=target_department_id,
+            )
+        if _COMPENSATION_FIELDS.intersection(changes):
+            _require_compensation_write(
+                request,
+                branch_id=target_branch_id,
+                department_id=target_department_id,
+            )
         updated = _service().update(teacher, changes)
-        return success(teacher_to_dict(updated))
+        return success(
+            teacher_to_dict(
+                updated,
+                include_compensation=_can_view_compensation(request, updated),
+            )
+        )
     if request.method == "DELETE":
+        # Hard deletion also removes the payout policy and historical profile
+        # rate fields.  Treat it as a compensation mutation as well as a
+        # faculty mutation; a directory editor alone must not erase payroll
+        # evidence.
+        _require_compensation_write(
+            request,
+            branch_id=teacher.branch_id,
+            department_id=teacher.department_id,
+        )
         _service().delete(teacher)
         return no_content()
     return error("Method not allowed.", code="method_not_allowed", status=405)
@@ -137,26 +272,61 @@ def teacher_credentials_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
 
+@openapi_contract(
+    path="/api/v1/teachers/{pk}/payout-policy/",
+    operations=PAYOUT_POLICY_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def teacher_payout_policy_view(request: HttpRequest, pk: int) -> HttpResponse:
-    """F13-1: GET / set a teacher's dynamic pay rule (method + params). teachers:read to
-    view, teachers:write to configure — the manager sets HOW the teacher is paid."""
+    """Read or configure one teacher's dynamic pay rule.
+
+    Compensation is intentionally independent of the faculty-directory grant:
+    payroll operators need not receive the broader ``teachers:*`` capability,
+    and faculty editors cannot infer or overwrite pay through this route.
+    """
     from apps.teachers.models import PayoutPolicy
     from apps.teachers.presenters import payout_policy_to_dict
 
     read = request.method in ("GET", "HEAD")
-    check_perm(request, f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write")
-    teacher = _teacher_in_scope(request, pk, permission=f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write")
+    compensation_permission = "compensation:read" if read else "compensation:write"
+    check_perm(request, compensation_permission)
+    teacher = _teacher_in_scope(
+        request,
+        pk,
+        permission=compensation_permission,
+    )
     if read:
         policy = PayoutPolicy.objects.filter(teacher=teacher).first()
         if policy is None:
-            raise NotFoundException("This teacher has no payout policy yet.", code="no_payout_policy")
+            raise NotFoundException(_("This teacher has no payout policy yet."), code="no_payout_policy")
         return success(payout_policy_to_dict(policy))
     if request.method in ("PUT", "POST"):
         from apps.teachers.services import set_payout_policy
 
         body = read_json(request)
+        allowed_fields = {
+            "method",
+            "hourly_rate_uzs",
+            "flat_amount_uzs",
+            "tuition_percent",
+            "is_active",
+        }
+        unknown_fields = sorted(set(body) - allowed_fields)
+        if unknown_fields:
+            raise ValidationException(
+                _("Unsupported payout-policy field."),
+                code="validation_error",
+                fields={field: [_("This field is not supported.")] for field in unknown_fields},
+            )
+        for decimal_name in ("hourly_rate_uzs", "flat_amount_uzs", "tuition_percent"):
+            raw_decimal = body.get(decimal_name)
+            if raw_decimal is not None and not isinstance(raw_decimal, str):
+                raise ValidationException(
+                    _("Decimal values must be strings."),
+                    code="validation_error",
+                    fields={decimal_name: [_("Use a decimal string, never a JSON number.")]},
+                )
         policy = set_payout_policy(
             teacher=teacher,
             method=str_field(body, "method"),
@@ -169,23 +339,48 @@ def teacher_payout_policy_view(request: HttpRequest, pk: int) -> HttpResponse:
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
 
+@openapi_contract(
+    path="/api/v1/teachers/{pk}/prepare-salary/",
+    operations=(PREPARE_SALARY_CONTRACT,),
+)
 @csrf_exempt
 @require_auth
 def teacher_prepare_salary_view(request: HttpRequest, pk: int) -> HttpResponse:
     """F13-1: compute the teacher's payout for a period from their policy and raise it as an
-    A-1 salary-prep request (a manager then approves + a cashier disburses). teachers:write."""
+    A-1 salary-prep request. Preparing pay is a separate capability from
+    editing either the teacher profile or ordinary finance records."""
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
-    check_perm(request, f"{_RESOURCE}:write")
-    teacher = _teacher_in_scope(request, pk, permission=f"{_RESOURCE}:write")
+    check_perm(request, "compensation:run")
+    teacher = _teacher_in_scope(request, pk, permission="compensation:run")
     body = read_json(request)
+    unknown_fields = sorted(set(body) - {"period_start", "period_end"})
+    if unknown_fields:
+        raise ValidationException(
+            _("Unsupported salary preparation field."),
+            code="validation_error",
+            fields={field: [_("This field is not supported.")] for field in unknown_fields},
+        )
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key is None:
+        raise ValidationException(
+            _("Idempotency-Key is required."),
+            code="validation_error",
+            fields={"Idempotency-Key": [_("This header is required.")]},
+        )
     start = _date(body, "period_start")
     end = _date(body, "period_end")
     if start is None or end is None:
         return validation_error({"period_start": ["period_start and period_end are required."]})
     from apps.teachers.services import prepare_salary
 
-    req = prepare_salary(teacher=teacher, period_start=start, period_end=end, requested_by=request.user)
+    req = prepare_salary(
+        teacher=teacher,
+        period_start=start,
+        period_end=end,
+        requested_by=request.user,
+        idempotency_key=idempotency_key,
+    )
     return created(
         {
             "request_id": req.pk,
@@ -200,7 +395,11 @@ def teacher_prepare_salary_view(request: HttpRequest, pk: int) -> HttpResponse:
 # --- helpers ---------------------------------------------------------------
 def _list(request: HttpRequest) -> HttpResponse:
     qs = _service().list()
-    if not is_unscoped(request):
+    if not is_permission_unscoped(
+        request,
+        permission=f"{_RESOURCE}:read",
+        account_kinds={"staff"},
+    ):
         qs = qs.filter(
             permission_membership_scope_q(
                 roles=get_user_roles(request),
@@ -218,12 +417,39 @@ def _list(request: HttpRequest) -> HttpResponse:
         ordering_fields=_ORDERING,
         default_ordering="-created_at",
     )
+    has_compensation_permission = _has_compensation_permission(request)
+    if request.GET.get("salary_type") not in (None, "") and has_compensation_permission:
+        qs = scope_to_permission_memberships(
+            request,
+            qs,
+            permission="compensation:read",
+            branch_field="branch_id",
+            department_field="department_id",
+            account_kinds={"staff"},
+        )
+    qs = apply_teacher_directory_filters(
+        request,
+        qs,
+        can_view_compensation=has_compensation_permission,
+    )
     items, total, page, size = paginate(request, qs)
-    return paginated([teacher_to_dict(t) for t in items], total=total, page=page, page_size=size)
+    return paginated(
+        [
+            teacher_to_dict(
+                teacher,
+                include_compensation=_can_view_compensation(request, teacher),
+            )
+            for teacher in items
+        ],
+        total=total,
+        page=page,
+        page_size=size,
+    )
 
 
 def _create(request: HttpRequest) -> HttpResponse:
     body = read_json(request)
+    _reject_unknown_fields(body, allowed=_CREATE_FIELDS, operation="teacher creation")
     phone = str_field(body, "phone")
     email = str_field(body, "email")
     if not phone and not email:
@@ -237,6 +463,12 @@ def _create(request: HttpRequest) -> HttpResponse:
         department_id=department_id,
         account_kinds={"staff"},
     )
+    if _COMPENSATION_FIELDS.intersection(body):
+        _require_compensation_write(
+            request,
+            branch_id=branch_id,  # type: ignore[arg-type]
+            department_id=department_id,
+        )
     dto = TeacherCreateDTO(
         branch_id=branch_id,  # type: ignore[arg-type]
         account_type_id=int_field(body, "account_type"),
@@ -256,7 +488,13 @@ def _create(request: HttpRequest) -> HttpResponse:
         rate=decimal_field(body, "rate", max_digits=12),
         is_substitute=bool_field(body, "is_substitute"),
     )
-    return created(teacher_to_dict(_service().create(dto)))
+    teacher = _service().create(dto)
+    return created(
+        teacher_to_dict(
+            teacher,
+            include_compensation=_can_view_compensation(request, teacher),
+        )
+    )
 
 
 def _changes(body: dict[str, Any]) -> dict[str, Any]:
@@ -288,6 +526,22 @@ def _changes(body: dict[str, Any]) -> dict[str, Any]:
     if "is_substitute" in body:
         changes["is_substitute"] = bool_field(body, "is_substitute")
     return changes
+
+
+def _reject_unknown_fields(
+    body: dict[str, Any],
+    *,
+    allowed: frozenset[str],
+    operation: str,
+) -> None:
+    unknown_fields = sorted(set(body) - allowed)
+    if not unknown_fields:
+        return
+    raise ValidationException(
+        _("Unsupported field in %(operation)s.") % {"operation": operation},
+        code="validation_error",
+        fields={field: [_("This field is not supported.")] for field in unknown_fields},
+    )
 
 
 def _date(body: dict[str, Any], name: str) -> date | None:

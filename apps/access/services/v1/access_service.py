@@ -53,6 +53,7 @@ class AccessService(IAccessService):
     def update_override(
         self, override: RolePermissionOverride, changes: dict[str, Any]
     ) -> RolePermissionOverride:
+        override = RolePermissionOverride.objects.select_for_update().get(pk=override.pk)
         previous_role = override.role
         if "role" in changes:
             override.role = validate_role(changes["role"])
@@ -70,6 +71,7 @@ class AccessService(IAccessService):
 
     @transaction.atomic
     def delete_override(self, override: RolePermissionOverride) -> None:
+        override = RolePermissionOverride.objects.select_for_update().get(pk=override.pk)
         role = override.role
         override.delete()
         sync_system_account_type(role)

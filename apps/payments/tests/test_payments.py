@@ -52,6 +52,7 @@ def test_fiscalize_payment_idempotent_and_deterministic(invoice_a):
             amount_uzs=Decimal(AMOUNT_UZS),
             account_ref=inv.number,
             metadata={"invoice_id": inv.id, "student_id": inv.student_id},
+            invoice=inv,
         )
         # Drive it completed WITHOUT auto-allocation noise; fiscalize directly.
         Payment.objects.filter(pk=payment.pk).update(status=Payment.Status.COMPLETED)
@@ -81,6 +82,7 @@ def test_fiscalize_rejects_non_completed_payment(invoice_a):
             provider="payme",
             amount_uzs=Decimal(AMOUNT_UZS),
             account_ref=inv.number,
+            invoice=inv,
         )
         with pytest.raises(UnprocessableEntity):
             services.fiscalize_payment_body(payment.pk)
@@ -154,6 +156,7 @@ def test_mark_payment_completed_twice_emits_one_signal(invoice_a, django_capture
                 amount_uzs=Decimal(AMOUNT_UZS),
                 account_ref=inv.number,
                 metadata={"invoice_id": inv.id, "student_id": inv.student_id},
+                invoice=inv,
             )
             with django_capture_on_commit_callbacks(execute=True):
                 services.mark_payment_completed(payment_id=payment.pk, provider_txn_id="t1")
@@ -180,6 +183,7 @@ def test_refund_on_non_completed_payment_rejected(invoice_a):
             amount_uzs=Decimal(AMOUNT_UZS),
             account_ref=inv.number,
             metadata={"invoice_id": inv.id, "student_id": inv.student_id},
+            invoice=inv,
         )
         with pytest.raises(UnprocessableEntity):
             services.refund_payment(payment_id=payment.pk, reason="oops")
@@ -299,6 +303,7 @@ def test_reconciliation_totals_and_mismatch(invoice_a):
             provider="cash",
             amount_uzs=Decimal("50000.00"),
             account_ref="INV-NONE",
+            invoice=inv,
         )
         Payment.objects.filter(pk=unallocated.pk).update(
             status=Payment.Status.COMPLETED, paid_at=timezone.now()
@@ -358,56 +363,169 @@ def test_uzum_complete_rejects_amount_mismatch(invoice_a):
         assert not Payment.objects.filter(provider_txn_id="uzum-wrong-amt").exists()
 
 
+@pytest.mark.parametrize("provider", ["click", "uzum"])
+def test_provider_completion_rejects_oversized_transaction_identifier(invoice_a, provider):
+    tenant_a, invoice = invoice_a
+    from apps.payments import services
+    from core.exceptions import ValidationException
+
+    payload = {
+        "amount": AMOUNT_UZS,
+        "click_trans_id" if provider == "click" else "transaction_id": "x" * 65,
+    }
+    operation = services.process_click_complete if provider == "click" else services.process_uzum_payment
+    with schema_context(tenant_a.schema_name), pytest.raises(ValidationException) as exc:
+        operation(payload=payload, invoice=invoice)
+    assert exc.value.code == "transaction_id_invalid"
+
+
 # --------------------------------------------------------------------------- #
 # Regression (HIGH, this-session bug hunt): the checkout merchant reference is
 # echoed back on the completion callback, where the webhook resolves the invoice
 # by Invoice.number. It MUST be invoice.number — sending the Payment PK made
-# every real Click/Uzum callback resolve to number="<pk>" (no such invoice) so
+# every real Click callback resolve to number="<pk>" (no such invoice) so
 # the payment was ACKed to the provider yet the invoice was never credited.
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(("provider", "ref_key"), [("click", "merchant_trans_id"), ("uzum", "order_id")])
-def test_checkout_merchant_ref_is_invoice_number_not_pk(invoice_a, provider, ref_key):
+def test_click_checkout_merchant_ref_is_invoice_number_not_pk(invoice_a):
     tenant_a, inv = invoice_a
     from apps.payments import services
 
     with schema_context(tenant_a.schema_name):
-        payload = services.create_checkout(
-            invoice_id=inv.id, provider=provider, idempotency_key=f"co-{provider}-1"
-        )
+        payload = services.create_checkout(invoice_id=inv.id, provider="click", idempotency_key="co-click-1")
         # The provider echoes this reference back on the Complete callback, where
         # the webhook does Invoice.objects.filter(number=<ref>). It must be the
         # invoice number so that lookup resolves — not the (unrelated) Payment PK.
-        assert payload[ref_key] == inv.number
-        assert payload[ref_key] != str(payload["payment_id"])
+        assert payload["merchant_trans_id"] == inv.number
+        assert payload["merchant_trans_id"] != str(payload["payment_id"])
+
+
+def test_legacy_uzum_checkout_is_not_offered_as_a_real_payment_contract(invoice_a):
+    tenant_a, inv = invoice_a
+    from apps.payments import services
+    from core.exceptions import ValidationException
+
+    with schema_context(tenant_a.schema_name), pytest.raises(ValidationException):
+        services.create_checkout(
+            invoice_id=inv.id,
+            provider="uzum",
+            idempotency_key="must-not-create-legacy-uzum-checkout",
+        )
 
 
 # --------------------------------------------------------------------------- #
-# Regression (HIGH, this-session bug hunt): the checkout rounds the invoice total
-# to whole soum (Click/Uzum are charged in soum), but the amount check compared
-# the callback exactly against a fractional total_uzs — so a fractional invoice
-# (e.g. from a percentage discount) was PERMANENTLY unpayable online.
+# Click amount reconciliation. Click has no tiyin field, so a new fractional
+# checkout must fail closed. A completion already in flight from an older release
+# still records/fiscalizes the signed whole-soum charge rather than the fractional
+# invoice balance.
 # --------------------------------------------------------------------------- #
-def test_click_complete_credits_fractional_invoice_at_rounded_soum(tenant_a):
+def test_click_checkout_rejects_fractional_balance_before_creating_intent(tenant_a):
     from apps.payments import services
     from apps.payments.models import Payment
+    from core.exceptions import UnprocessableEntity, ValidationException
 
     helpers.seed_provider_configs(tenant_a)
     inv = helpers.seed_open_invoice(tenant_a, number="INV-2026-000777", amount_uzs="149999.99")
     with schema_context(tenant_a.schema_name):
-        # Checkout charges the whole-soum rounded figure (149999.99 -> 150000).
-        payload = services.create_checkout(invoice_id=inv.id, provider="click", idempotency_key="co-frac-1")
-        assert "amount=150000" in payload["redirect_url"]
-        # The provider reports the amount it charged; the webhook must accept it.
+        with pytest.raises(UnprocessableEntity) as exc:
+            services.create_checkout(
+                invoice_id=inv.id,
+                provider="click",
+                idempotency_key="co-frac-1",
+            )
+
+        assert exc.value.code == "click_amount_precision_unsupported"
+        assert not Payment.objects.filter(idempotency_key="co-frac-1").exists()
+        with pytest.raises(ValidationException) as prepare_exc:
+            services.validate_provider_callback_amount(
+                payload={"amount": "150000"},
+                invoice=inv,
+            )
+        assert getattr(prepare_exc.value, "code", None) == "click_amount_precision_unsupported"
+
+
+def test_legacy_fractional_click_intent_records_and_fiscalizes_actual_charge(tenant_a, monkeypatch):
+    from apps.finance.models import PaymentAllocation
+    from apps.payments import services
+    from apps.payments.models import Payment
+
+    helpers.seed_provider_configs(tenant_a)
+    inv = helpers.seed_open_invoice(tenant_a, number="INV-2026-000779", amount_uzs="149999.99")
+    fiscal_call: dict = {}
+
+    class CapturingFiscalClient:
+        def fiscalize(self, **kwargs):
+            fiscal_call.update(kwargs)
+            return {"fiscal_sign": "whole-soum-sign", "qr_url": "", "raw": {}}
+
+    monkeypatch.setattr(
+        "infrastructure.fiscal.get_fiscal_client",
+        lambda: CapturingFiscalClient(),
+    )
+    with schema_context(tenant_a.schema_name):
+        pending, created = services.get_or_create_payment(
+            idempotency_key="legacy-click-fractional-up",
+            provider=Payment.Method.CLICK,
+            amount_uzs=Decimal("149999.99"),
+            account_ref=inv.number,
+            metadata={"invoice_id": inv.pk, "student_id": inv.student_id},
+            invoice=inv,
+        )
+        assert created is True
+
         payment = services.process_click_complete(
             payload={
-                "click_trans_id": "click-frac",
+                "click_trans_id": "click-frac-legacy",
                 "merchant_trans_id": inv.number,
                 "amount": "150000",
             },
             invoice=inv,
         )
         payment.refresh_from_db()
+        assert payment.pk == pending.pk
         assert payment.status == Payment.Status.COMPLETED
+        assert payment.amount_uzs == Decimal("150000.00")
+        assert payment.metadata["click_invoice_amount_uzs"] == "149999.99"
+        assert payment.allocation_status == Payment.Allocation.MANUAL_REVIEW
+        assert not PaymentAllocation.objects.filter(payment_id=payment.pk).exists()
+
+        services.fiscalize_payment_body(payment.pk)
+
+        assert fiscal_call["amount_uzs"] == "150000.00"
+        assert fiscal_call["items"] == [{"name": inv.number, "amount": "150000.00", "qty": 1}]
+
+
+def test_legacy_click_round_down_keeps_fractional_remainder_visible(tenant_a):
+    from apps.finance.models import PaymentAllocation
+    from apps.payments import services
+    from apps.payments.models import Payment
+
+    helpers.seed_provider_configs(tenant_a)
+    inv = helpers.seed_open_invoice(tenant_a, number="INV-2026-000780", amount_uzs="149999.49")
+    with schema_context(tenant_a.schema_name):
+        pending, _created = services.get_or_create_payment(
+            idempotency_key="legacy-click-fractional-down",
+            provider=Payment.Method.CLICK,
+            amount_uzs=Decimal("149999.49"),
+            account_ref=inv.number,
+            metadata={"invoice_id": inv.pk, "student_id": inv.student_id},
+            invoice=inv,
+        )
+
+        payment = services.process_click_complete(
+            payload={
+                "click_trans_id": "click-frac-down-legacy",
+                "merchant_trans_id": inv.number,
+                "amount": "149999",
+            },
+            invoice=inv,
+        )
+
+        payment.refresh_from_db()
+        assert payment.pk == pending.pk
+        assert payment.amount_uzs == Decimal("149999.00")
+        assert payment.allocation_status == Payment.Allocation.ALLOCATED
+        assert PaymentAllocation.objects.get(payment_id=payment.pk).amount_uzs == Decimal("149999.00")
+        assert services._invoice_outstanding_uzs(inv) == Decimal("0.49")
 
 
 def test_click_complete_still_rejects_underpay_on_fractional_invoice(tenant_a):
@@ -471,6 +589,7 @@ def test_auto_allocate_failure_completes_payment_manual_review(invoice_a, django
                 amount_uzs=Decimal(AMOUNT_UZS),
                 account_ref=inv.number,
                 metadata={"invoice_id": inv.id, "student_id": inv.student_id},
+                invoice=inv,
             )
             with django_capture_on_commit_callbacks(execute=True):
                 services.mark_payment_completed(payment_id=second.pk, provider_txn_id="dup-1")
@@ -591,7 +710,12 @@ def test_allocate_manual_applies_every_line(tenant_a):
     from apps.payments.models import Payment
 
     inv_a = helpers.seed_open_invoice(tenant_a, number="INV-2026-000010", amount_uzs="100000.00")
-    inv_b = helpers.seed_open_invoice(tenant_a, number="INV-2026-000011", amount_uzs="60000.00")
+    inv_b = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-2026-000011",
+        amount_uzs="60000.00",
+        branch=inv_a.branch_at_issue,
+    )
     with schema_context(tenant_a.schema_name):
         payment, _ = services.get_or_create_payment(
             idempotency_key="alloc-multi-1",
@@ -599,6 +723,7 @@ def test_allocate_manual_applies_every_line(tenant_a):
             amount_uzs=Decimal("160000.00"),
             account_ref=inv_a.number,
             metadata={},
+            invoice=inv_a,
         )
         Payment.objects.filter(pk=payment.pk).update(status=Payment.Status.COMPLETED)
 
@@ -619,9 +744,21 @@ def test_allocate_manual_applies_every_line(tenant_a):
         assert inv_a.status == Invoice.Status.PAID
         assert inv_b.status == Invoice.Status.PAID
 
+        from core.exceptions import ConflictException
 
-def test_allocate_manual_rejects_over_payment_amount(tenant_a):
-    """The total of the lines may not exceed the real money received."""
+        with pytest.raises(ConflictException) as mismatch:
+            services.allocate_manual(
+                payment_id=payment.pk,
+                allocations=[
+                    {"invoice": inv_a.pk, "amount": Decimal("90000.00")},
+                    {"invoice": inv_b.pk, "amount": Decimal("60000.00")},
+                ],
+            )
+        assert mismatch.value.code == "allocation_intent_mismatch"
+
+
+def test_allocate_manual_requires_exact_payment_amount(tenant_a):
+    """Manual allocation must neither exceed nor strand received money."""
     from apps.payments import services
     from apps.payments.models import Payment
     from core.exceptions import StarforgeError
@@ -634,6 +771,7 @@ def test_allocate_manual_rejects_over_payment_amount(tenant_a):
             amount_uzs=Decimal("50000.00"),
             account_ref=inv.number,
             metadata={},
+            invoice=inv,
         )
         Payment.objects.filter(pk=payment.pk).update(status=Payment.Status.COMPLETED)
         with pytest.raises(StarforgeError):
@@ -641,6 +779,12 @@ def test_allocate_manual_rejects_over_payment_amount(tenant_a):
                 payment_id=payment.pk,
                 allocations=[{"invoice": inv.pk, "amount": Decimal("90000.00")}],
             )
+        with pytest.raises(StarforgeError) as partial:
+            services.allocate_manual(
+                payment_id=payment.pk,
+                allocations=[{"invoice": inv.pk, "amount": Decimal("40000.00")}],
+            )
+        assert partial.value.code == "allocation_total_mismatch"
 
 
 def test_payment_detail_eager_data_and_receipt_head_has_no_enqueue(
@@ -651,6 +795,7 @@ def test_payment_detail_eager_data_and_receipt_head_has_no_enqueue(
 ):
     from apps.payments import services
     from apps.payments.models import FiscalReceipt, Payment, PaymentAttempt
+    from core.historical_scope import ScopeAttributionStatus
     from core.permissions import Role
 
     invoice = helpers.seed_open_invoice(
@@ -665,8 +810,16 @@ def test_payment_detail_eager_data_and_receipt_head_has_no_enqueue(
             status=Payment.Status.COMPLETED,
             idempotency_key="payment-detail-eager-1",
             account_ref=invoice.number,
+            branch_at_payment_id=invoice.branch_at_issue_id,
+            department_at_payment_id=invoice.department_at_issue_id,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
+            metadata={"invoice_id": invoice.pk, "student_id": invoice.student_id},
         )
-        FiscalReceipt.objects.create(payment=payment)
+        FiscalReceipt.objects.create(
+            payment=payment,
+            status=FiscalReceipt.Status.CONFIRMED,
+            fiscal_sign="confirmed-sign",
+        )
         attempt = PaymentAttempt.objects.create(payment=payment, attempt_no=1, error_code="")
         branch = invoice.student.branch
 
@@ -681,12 +834,16 @@ def test_payment_detail_eager_data_and_receipt_head_has_no_enqueue(
 
     detail = client.get(f"/api/v1/payments/{payment.pk}/")
     assert detail.status_code == 200, detail.content
-    assert detail.json()["data"]["fiscal_receipt"]["status"] == FiscalReceipt.Status.PENDING
+    assert detail.json()["data"]["fiscal_receipt"]["status"] == FiscalReceipt.Status.CONFIRMED
     assert [row["id"] for row in detail.json()["data"]["attempts"]] == [attempt.pk]
 
     head = client.head(f"/api/v1/payments/{payment.pk}/receipt/")
-    assert head.status_code == 202
+    assert head.status_code == 200
     assert queued == []
     get = client.get(f"/api/v1/payments/{payment.pk}/receipt/")
-    assert get.status_code == 202
+    assert get.status_code == 200
+    assert get.json()["data"]["status"] == "not_generated"
+    assert queued == []
+    post = client.post(f"/api/v1/payments/{payment.pk}/receipt/", {}, format="json")
+    assert post.status_code == 202
     assert queued == [(payment.pk, tenant_a.schema_name)]

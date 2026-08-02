@@ -6,7 +6,7 @@ These tests exercise the handler bodies directly so the contract is proven
 without a running broker:
 
 * a forced task failure lands exactly one entry on the Redis DLQ list, carrying
-  the task name, exception, and tenant schema;
+  the task name, exception type, and tenant schema without the exception text;
 * ``task_prerun`` -> ``task_postrun`` logs a structured, tenant-tagged duration;
 * a DLQ Redis hiccup is swallowed (never compounds the original failure).
 """
@@ -59,7 +59,9 @@ def test_task_failure_pushes_one_dlq_entry(monkeypatch):
     record = json.loads(dlq[0])
     assert record["task"] == "celery_tasks.demo.boom"
     assert record["task_id"] == "abc-123"
-    assert "kaboom" in record["exc"]
+    assert record["exc_type"] == "ValueError"
+    assert "exc" not in record
+    assert "kaboom" not in dlq[0]
     assert "schema" in record  # tenant-tagged
     assert record["arg_types"] == ["int", "int"]
     assert record["kwarg_keys"] == ["x"]

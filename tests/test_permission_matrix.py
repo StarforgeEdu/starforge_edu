@@ -35,9 +35,9 @@ MATRIX_CASES = [
     (Role.IT, "get", "/api/v1/org/branches/", True),
     (Role.TEACHER, "get", "/api/v1/org/branches/", True),
     (Role.TEACHER, "post", "/api/v1/org/branches/", False),
-    # org settings singleton (org:read) — teacher GET 200 per D1-LB-3.
+    # Tenant-global policy is separate from the branch organization directory.
     (Role.DIRECTOR, "get", "/api/v1/org/settings/", True),
-    (Role.TEACHER, "get", "/api/v1/org/settings/", True),
+    (Role.TEACHER, "get", "/api/v1/org/settings/", False),
     # students (students:read) — parent/student self-service reads are scoped
     # by selectors (TD-5); the gate must let them through.
     (Role.DIRECTOR, "get", "/api/v1/students/", True),

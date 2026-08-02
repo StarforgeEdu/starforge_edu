@@ -6,9 +6,9 @@ sensitive-model list below. Models are resolved via `apps.get_model` inside
 try/except `LookupError`: sibling lanes build these apps the same day, so a
 not-yet-migrated / not-yet-defined model must not crash app loading.
 
-Audited models (TD-9):
-    users.User, users.RoleMembership, finance.Invoice, payments.Payment,
-    academics.Grade, academics.ExamResult, payments.ProviderConfig
+Audited models include identity/grants, organization policy and structure,
+finance/payment state, published academic results, provider configuration, and
+compensation approval history. ``AUDITED_MODELS`` below is authoritative.
 
 `before` snapshots are captured in `pre_save` keyed by `(label, pk)` in a
 thread-local map and consumed by the matching `post_save` so update rows carry a
@@ -29,6 +29,7 @@ from django.dispatch import receiver
 
 from apps.audit.context import current_actor, current_request
 from apps.audit.models import AuditLog
+from apps.audit.scopes import audit_scope_for_instance
 from apps.audit.services import audit_log, audit_log_on_commit, diff_snapshots, serialize_instance
 from apps.auth.signals import (
     login_failed,
@@ -37,6 +38,8 @@ from apps.auth.signals import (
     otp_requested,
     otp_verified,
 )
+from core.privacy import private_fingerprint
+from core.role_principals import RolePrincipal
 from core.utils import current_schema
 
 logger = logging.getLogger("starforge.audit")
@@ -45,13 +48,40 @@ logger = logging.getLogger("starforge.audit")
 AUDITED_MODELS: tuple[tuple[str, str], ...] = (
     ("users", "User"),
     ("users", "RoleMembership"),
+    # Organization-scope mutations define who can see every downstream row.
+    # Keep their soft-deactivation and configuration history immutable too.
+    ("org", "Branch"),
+    ("org", "Department"),
+    ("org", "Room"),
+    ("org", "BranchWorkingHours"),
+    ("org", "BranchHoliday"),
+    ("org", "CenterSettings"),
     ("finance", "Invoice"),
     ("payments", "Payment"),
     ("academics", "Grade"),
     ("academics", "ExamResult"),
     ("payments", "ProviderConfig"),
+    # Compensation and its maker-checker state require a durable history. The
+    # read repository applies a second, compensation-specific visibility gate.
+    ("teachers", "TeacherProfile"),
+    ("teachers", "PayoutPolicy"),
+    ("approvals", "ApprovalRequest"),
+    ("approvals", "LedgerEntry"),
     # A-2 changes live server-side authorization and require an append-only trail.
     ("access", "RolePermissionOverride"),
+    # Leadership workflow state is decision evidence, not disposable UI state.
+    # Keep the definition/status changes and the role-native attendee/assignee
+    # attribution immutable; response answer values themselves are deliberately
+    # excluded because they can contain free-form sensitive information.
+    # These two apps intentionally use nonstandard Django labels to avoid
+    # collisions with django.forms and Celery's generic tasks modules. Receiver
+    # resolution must use AppConfig.label, not the Python package name.
+    ("forms_app", "Form"),
+    ("forms_app", "FormField"),
+    ("meetings", "StaffMeeting"),
+    ("meetings", "MeetingAttendee"),
+    ("staff_tasks", "RoleGrade"),
+    ("staff_tasks", "Task"),
 )
 
 # Stable dispatch_uids so re-imports (and the test suite's repeated ready())
@@ -109,6 +139,7 @@ def _on_post_save(sender: Any, instance: Any, created: bool, **kwargs: Any) -> N
             before=None,
             after=after,
             request=current_request(),
+            scope=audit_scope_for_instance(instance, after=after),
         )
         return
     audit_log_on_commit(
@@ -119,6 +150,7 @@ def _on_post_save(sender: Any, instance: Any, created: bool, **kwargs: Any) -> N
         before=before,
         after=diff_snapshots(before, after) if before else after,
         request=current_request(),
+        scope=audit_scope_for_instance(instance, before=before, after=after),
     )
 
 
@@ -135,14 +167,16 @@ def _clear_before_store(sender: Any, **kwargs: Any) -> None:
 
 
 def _on_post_delete(sender: Any, instance: Any, **kwargs: Any) -> None:
+    before = serialize_instance(instance)
     audit_log_on_commit(
         actor=current_actor(),
         action=AuditLog.Action.DELETE,
         resource_type=_label_for(sender),
         resource_id=instance.pk,
-        before=serialize_instance(instance),
+        before=before,
         after=None,
         request=current_request(),
+        scope=audit_scope_for_instance(instance, before=before),
     )
 
 
@@ -153,6 +187,9 @@ def _on_post_delete(sender: Any, instance: Any, **kwargs: Any) -> None:
 # is written immediately (the signal itself already guards the success path).
 # Logout and refresh-reuse have NO signal — those audit_log() calls are added
 # directly in apps/auth/services.py by the orchestrator (see integration_needed).
+# Raw IP/User-Agent are intentionally retained here as incident-response evidence
+# under organization-only audit visibility and the normal retention policy. Login
+# names, phone numbers, and email addresses are never retained in plaintext.
 # --------------------------------------------------------------------------- #
 
 
@@ -167,13 +204,43 @@ def _resolve_actor(user_id: int | None) -> Any:
 
 
 @receiver(login_succeeded, dispatch_uid="audit.login_succeeded")
-def on_login_succeeded(sender, *, username="", user_id=None, ip="", user_agent="", **kwargs):
+def on_login_succeeded(
+    sender,
+    *,
+    username="",
+    user_id=None,
+    ip="",
+    user_agent="",
+    principal_kind="",
+    principal_id=None,
+    schema_name="",
+    **kwargs,
+):
+    actor = _resolve_actor(user_id)
+    actor_principal = None
+    if (
+        actor is not None
+        and principal_kind in {"student", "teacher", "parent", "staff"}
+        and isinstance(principal_id, int)
+        and not isinstance(principal_id, bool)
+        and principal_id > 0
+    ):
+        actor_principal = RolePrincipal(
+            kind=principal_kind,
+            principal_id=principal_id,
+            user_id=actor.pk,
+        )
+    elif actor is not None:
+        from django_tenants.utils import get_public_schema_name
+
+        if schema_name == get_public_schema_name():
+            actor_principal = RolePrincipal(kind="user", principal_id=actor.pk, user_id=actor.pk)
     audit_log(
-        actor=_resolve_actor(user_id),
+        actor=actor,
+        actor_principal=actor_principal,
         action=AuditLog.Action.LOGIN,
         resource_type="users.User",
         resource_id=user_id or "",
-        after={"username": username},
         ip=ip or None,
         user_agent=user_agent,
     )
@@ -185,7 +252,10 @@ def on_login_failed(sender, *, username="", ip="", user_agent="", reason="", **k
         actor=None,
         action=AuditLog.Action.LOGIN_FAILED,
         resource_type="users.User",
-        after={"username": username, "reason": reason},
+        after={
+            "identifier_ref": private_fingerprint(username, namespace="auth-identifier"),
+            "reason": reason,
+        },
         ip=ip or None,
         user_agent=user_agent,
     )
@@ -197,7 +267,10 @@ def on_otp_requested(sender, *, identifier="", purpose="", ip="", user_agent="",
         actor=None,
         action=AuditLog.Action.OTP_REQUEST,
         resource_type="auth.OTP",
-        after={"identifier": identifier, "purpose": purpose},
+        after={
+            "identifier_ref": private_fingerprint(identifier, namespace="auth-identifier"),
+            "purpose": purpose,
+        },
         ip=ip or None,
         user_agent=user_agent,
     )
@@ -209,7 +282,10 @@ def on_otp_verified(sender, *, identifier="", purpose="", ip="", user_agent="", 
         actor=None,
         action=AuditLog.Action.OTP_VERIFY,
         resource_type="auth.OTP",
-        after={"identifier": identifier, "purpose": purpose},
+        after={
+            "identifier_ref": private_fingerprint(identifier, namespace="auth-identifier"),
+            "purpose": purpose,
+        },
         ip=ip or None,
         user_agent=user_agent,
     )
@@ -221,7 +297,11 @@ def on_otp_failed(sender, *, identifier="", ip="", user_agent="", reason="", **k
         actor=None,
         action=AuditLog.Action.OTP_VERIFY,
         resource_type="auth.OTP",
-        after={"identifier": identifier, "reason": reason, "outcome": "failed"},
+        after={
+            "identifier_ref": private_fingerprint(identifier, namespace="auth-identifier"),
+            "reason": reason,
+            "outcome": "failed",
+        },
         ip=ip or None,
         user_agent=user_agent,
     )

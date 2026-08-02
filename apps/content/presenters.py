@@ -11,6 +11,8 @@ from apps.content.models import (
     LibraryMaterial,
     Module,
 )
+from apps.content.storage_keys import trusted_thumbnail_key
+from core.utils import current_schema
 
 
 def _iso(value) -> str | None:
@@ -88,10 +90,11 @@ def folder_to_dict(folder: Folder) -> dict:
 
 def lesson_file_to_dict(f: LessonFile) -> dict:
     thumbnail_url = None
-    if f.thumbnail_key:
+    storage_key = trusted_thumbnail_key(f, schema=current_schema())
+    if storage_key:
         from infrastructure.storage.s3_client import presign_download
 
-        thumbnail_url = presign_download(f.thumbnail_key, expires_in=300)
+        thumbnail_url = presign_download(storage_key, expires_in=300)
     return {
         "id": f.id,
         "lesson": f.lesson_id,

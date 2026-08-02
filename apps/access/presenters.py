@@ -38,18 +38,22 @@ def account_type_to_dict(account_type: AccountType) -> dict[str, Any]:
 
 
 def account_type_assignment_to_dict(membership: RoleMembership) -> dict[str, Any]:
-    from apps.access.services.account_types import principal_identity
+    from apps.access.services.account_types import assignment_principal_identity
 
-    principal_kind, principal_id = principal_identity(membership)
+    principal_kind, principal_id = assignment_principal_identity(membership)
     account_type = cast(AccountType, membership.account_type)
+    department = membership.department if membership.department_id else None
     return {
         "id": membership.pk,
         "account_type": membership.account_type_id,
         "account_type_name": account_type.name,
         "principal_kind": principal_kind,
         "principal_id": principal_id,
+        "principal_missing": principal_id is None,
         "branch": membership.branch_id,
+        "branch_name": membership.branch.name if membership.branch_id else None,
         "department": membership.department_id,
+        "department_name": department.name if department is not None else None,
         "granted_at": membership.granted_at.isoformat(),
         "granted_by": membership.granted_by_id,
     }

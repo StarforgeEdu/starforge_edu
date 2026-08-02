@@ -20,10 +20,33 @@ pytestmark = pytest.mark.django_db
 FILES = "/api/v1/content/files/"
 
 
-def _draft(tenant) -> LessonFile:
-    """A CLEAN-but-unapproved (tenant-visible) file awaiting publication."""
+def _draft(tenant):
+    """A CLEAN, unapproved file inside one explicit branch/cohort scope."""
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.content.tests.factories import ContentLibraryFactory, FolderFactory
+    from apps.org.tests.factories import BranchFactory
+
     with schema_context(tenant.schema_name):
-        return LessonFileFactory(is_approved_teacher=False, is_approved_manager=False)
+        branch = BranchFactory()
+        cohort = CohortFactory(branch=branch)
+        library = ContentLibraryFactory(visibility="cohort", cohort=cohort)
+        file = LessonFileFactory(
+            folder=FolderFactory(library=library),
+            is_approved_teacher=False,
+            is_approved_manager=False,
+        )
+        return file, branch, cohort
+
+
+def _learner_for(tenant, *, branch, cohort, user_in, as_user):
+    from apps.cohorts.tests.factories import CohortMembershipFactory
+    from apps.students.tests.factories import StudentProfileFactory
+
+    user = user_in(tenant, roles=[Role.STUDENT], branch=branch)
+    with schema_context(tenant.schema_name):
+        student = StudentProfileFactory(user=user, branch=branch, current_cohort=cohort)
+        CohortMembershipFactory(cohort=cohort, student=student)
+    return as_user(tenant, user)
 
 
 def test_real_upload_starts_unapproved_and_downloadable():
@@ -47,12 +70,18 @@ def test_learner_sees_only_dual_approved_files(tenant_a, user_in):
 
 
 def test_full_publication_flow(tenant_a, user_in, as_user):
-    f = _draft(tenant_a)
-    teacher_user = user_in(tenant_a, roles=[Role.TEACHER])
-    hod_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT])
+    f, branch, cohort = _draft(tenant_a)
+    teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    hod_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
     teacher = as_user(tenant_a, teacher_user)
     hod = as_user(tenant_a, hod_user)
-    student = as_user(tenant_a, user_in(tenant_a, roles=[Role.STUDENT]))
+    student = _learner_for(
+        tenant_a,
+        branch=branch,
+        cohort=cohort,
+        user_in=user_in,
+        as_user=as_user,
+    )
 
     # teacher signs the first leg
     r1 = teacher.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json")
@@ -75,7 +104,7 @@ def test_full_publication_flow(tenant_a, user_in, as_user):
 
 def test_manager_leg_requires_a_different_person(tenant_a, as_role):
     """Maker-checker: the same person cannot sign both legs."""
-    f = _draft(tenant_a)
+    f, _branch, _cohort = _draft(tenant_a)
     director, _ = as_role(Role.DIRECTOR)
     assert director.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json").status_code == 200
     # the director holds both perms but already signed the teacher leg
@@ -85,8 +114,11 @@ def test_manager_leg_requires_a_different_person(tenant_a, as_role):
 
 
 def test_manager_leg_requires_teacher_first(tenant_a, user_in, as_user):
-    f = _draft(tenant_a)
-    hod = as_user(tenant_a, user_in(tenant_a, roles=[Role.HEAD_OF_DEPT]))
+    f, branch, _cohort = _draft(tenant_a)
+    hod = as_user(
+        tenant_a,
+        user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch),
+    )
     r = hod.post(f"{FILES}{f.id}/approve-manager/", {}, format="json")
     assert r.status_code == 422
     assert r.json()["code"] == "teacher_approval_required"
@@ -95,9 +127,9 @@ def test_manager_leg_requires_teacher_first(tenant_a, user_in, as_user):
 def test_teacher_cannot_give_manager_approval(tenant_a, user_in, as_user):
     """A teacher holds content:* (so the perm gate passes) but is not a manager —
     the service role gate blocks the elevated second leg."""
-    f = _draft(tenant_a)
-    t1 = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER]))
-    t2 = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER]))
+    f, branch, _cohort = _draft(tenant_a)
+    t1 = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
+    t2 = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
     assert t1.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json").status_code == 200
     blocked = t2.post(f"{FILES}{f.id}/approve-manager/", {}, format="json")
     assert blocked.status_code == 403
@@ -187,8 +219,8 @@ def test_custom_reviewer_and_publisher_types_are_permission_scoped(
 
 
 def test_double_teacher_approval_conflicts(tenant_a, user_in, as_user):
-    f = _draft(tenant_a)
-    teacher = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER]))
+    f, branch, _cohort = _draft(tenant_a)
+    teacher = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
     assert teacher.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json").status_code == 200
     again = teacher.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json")
     assert again.status_code == 409
@@ -196,8 +228,8 @@ def test_double_teacher_approval_conflicts(tenant_a, user_in, as_user):
 
 
 def test_student_cannot_approve(tenant_a, user_in, as_user):
-    f = _draft(tenant_a)
-    student = as_user(tenant_a, user_in(tenant_a, roles=[Role.STUDENT]))
+    f, branch, _cohort = _draft(tenant_a)
+    student = as_user(tenant_a, user_in(tenant_a, roles=[Role.STUDENT], branch=branch))
     # students hold neither content:approve nor content:publish
     assert student.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json").status_code == 403
     assert student.post(f"{FILES}{f.id}/approve-manager/", {}, format="json").status_code == 403
@@ -207,11 +239,17 @@ def test_view_only_blocks_learner_download(tenant_a, user_in, as_user, monkeypat
     from apps.content import services
 
     monkeypatch.setattr(services, "presign_download", lambda key, **kw: f"https://get/{key}")
-    f = _draft(tenant_a)
-    t1 = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER]))
-    hod_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT])
+    f, branch, cohort = _draft(tenant_a)
+    t1 = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
+    hod_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
     hod = as_user(tenant_a, hod_user)
-    student = as_user(tenant_a, user_in(tenant_a, roles=[Role.STUDENT]))
+    student = _learner_for(
+        tenant_a,
+        branch=branch,
+        cohort=cohort,
+        user_in=user_in,
+        as_user=as_user,
+    )
 
     assert t1.post(f"{FILES}{f.id}/approve-teacher/", {}, format="json").status_code == 200
     # publish as view-only
@@ -250,25 +288,31 @@ def test_new_version_resets_publication(tenant_a, user_in, monkeypatch):
     assert new_file.is_approved_manager is False
 
 
-def test_manager_reaches_pending_but_not_published_outside_scope(tenant_a, user_in):
-    """Least privilege: a HOD reaches a file PENDING the manager sign-off even in
-    a library they can't see (to counter-sign it), but gets NO blanket read of
-    already-published content in libraries outside their scope."""
+def test_manager_reaches_pending_only_inside_exact_scope(tenant_a, user_in):
+    """A publish grant never lends the manager access outside its membership boundary."""
     from apps.content import selectors
     from apps.content.tests.factories import ContentLibraryFactory, FolderFactory
+    from apps.org.tests.factories import DepartmentFactory
 
     hod = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT])
     with schema_context(tenant_a.schema_name):
+        branch = hod.role_memberships.get().branch
+        department = DepartmentFactory(branch=branch)
+        in_scope = ContentLibraryFactory(visibility="department", department=department)
+        in_scope_pending = LessonFileFactory(
+            folder=FolderFactory(library=in_scope),
+            is_approved_teacher=True,
+            is_approved_manager=False,
+        )
         # a ROLE-visibility library only students can see -> outside the HOD's scope
         walled = ContentLibraryFactory(visibility="role", allowed_roles=["student"])
         folder = FolderFactory(library=walled)
         pending = LessonFileFactory(folder=folder, is_approved_teacher=True, is_approved_manager=False)
         published = LessonFileFactory(folder=folder)  # factory -> dual-approved
-        reachable = set(
-            selectors.scoped_files(user=hod, roles={Role.HEAD_OF_DEPT}).values_list("id", flat=True)
-        )
-    assert pending.id in reachable  # can counter-sign anything still pending
-    assert published.id not in reachable  # but not browse finished walled-off content
+        reachable = set(selectors.scoped_files(user=hod).values_list("id", flat=True))
+    assert in_scope_pending.id in reachable
+    assert pending.id not in reachable
+    assert published.id not in reachable
 
 
 @pytest.mark.django_db(transaction=True)

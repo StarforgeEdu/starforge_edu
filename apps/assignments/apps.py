@@ -8,6 +8,7 @@ class AssignmentsConfig(AppConfig):
     verbose_name = "Assignments (homework)"
 
     def ready(self) -> None:
+        from apps.assignments import receivers  # noqa: F401
         from apps.assignments.interfaces.repositories import (
             IAssignmentRepository,
             ISubmissionRepository,

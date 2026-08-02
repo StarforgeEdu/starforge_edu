@@ -66,6 +66,9 @@ def _make_payment_and_invoices(center, *, amount_uzs, issued_totals):
             number=f"INV-2026-{i:06d}",
             student=student,
             cohort=cohort,
+            branch_at_issue=branch,
+            department_at_issue=cohort.department,
+            attribution_status="captured",
             status="issued",
             issue_date=date(2026, 5, 1),
             due_date=base_due + timedelta(days=i),  # ascending => oldest-due first
@@ -80,6 +83,9 @@ def _make_payment_and_invoices(center, *, amount_uzs, issued_totals):
         status="completed",
         idempotency_key=f"alloc-test-{amount_uzs}",
         account_ref=(ids and f"INV-2026-{0:06d}") or "",
+        branch_at_payment=branch,
+        department_at_payment=cohort.department,
+        attribution_status="captured",
     )
     return payment, ids
 
@@ -156,6 +162,9 @@ def test_status_flips_issued_partially_paid_paid(tenant_a):
             status="completed",
             idempotency_key="alloc-topup",
             account_ref=second.number,
+            branch_at_payment_id=second.branch_at_issue_id,
+            department_at_payment_id=second.department_at_issue_id,
+            attribution_status="captured",
         )
         services.allocate_payment(
             payment_id=topup.id, amount_uzs=Decimal("50000.00"), invoice_ids=[second.id]

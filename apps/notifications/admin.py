@@ -26,13 +26,28 @@ class NotificationDeliveryInline(admin.TabularInline):
 
 @admin.register(Notification)
 class NotificationAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "event_type", "title", "read_at", "created_at")
-    list_filter = ("event_type", "read_at")
+    list_display = (
+        "id",
+        "user",
+        "recipient_principal_kind",
+        "recipient_principal_id",
+        "attribution_status",
+        "event_type",
+        "title",
+        "read_at",
+        "created_at",
+    )
+    list_filter = ("attribution_status", "recipient_principal_kind", "event_type", "read_at")
     search_fields = ("title", "dedupe_key")
     autocomplete_fields = ("user",)
     list_select_related = ("user",)
     date_hierarchy = "created_at"
     inlines = (NotificationDeliveryInline,)
+    readonly_fields = (
+        "recipient_principal_kind",
+        "recipient_principal_id",
+        "attribution_status",
+    )
 
 
 @admin.register(NotificationDelivery)
@@ -48,10 +63,23 @@ class NotificationDeliveryAdmin(ReadOnlyAdmin):
 
 @admin.register(NotificationPreference)
 class NotificationPreferenceAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "event_type", "channel", "enabled")
-    list_filter = ("event_type", "channel", "enabled")
+    list_display = (
+        "id",
+        "user",
+        "recipient_principal_kind",
+        "recipient_principal_id",
+        "event_type",
+        "channel",
+        "enabled",
+    )
+    list_filter = ("recipient_principal_kind", "attribution_status", "event_type", "channel", "enabled")
     autocomplete_fields = ("user",)
     list_select_related = ("user",)
+    readonly_fields = (
+        "recipient_principal_kind",
+        "recipient_principal_id",
+        "attribution_status",
+    )
 
 
 @admin.register(NotificationTemplate)

@@ -101,6 +101,19 @@ class ApprovalRequest(models.Model):
     ledger_entry = models.ForeignKey(
         LedgerEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="approval_requests"
     )
+    # Retry-sensitive domain entry points store only hashes: the raw client key
+    # is a capability-like value and does not belong in database dumps.  The
+    # operation fingerprint detects one key reused for a different request;
+    # domain_dedupe_key prevents multiple keys from creating the same logical
+    # money movement (currently salary teacher+period).
+    idempotency_key_hash = models.CharField(max_length=64, null=True, blank=True, editable=False)
+    operation_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        editable=False,
+        db_default="",
+    )
+    domain_dedupe_key = models.CharField(max_length=64, null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -118,6 +131,23 @@ class ApprovalRequest(models.Model):
             models.CheckConstraint(
                 condition=models.Q(amount_uzs__isnull=True) | models.Q(amount_uzs__gt=0),
                 name="approval_amount_positive_or_null",
+            ),
+            models.UniqueConstraint(
+                fields=("idempotency_key_hash",),
+                condition=models.Q(idempotency_key_hash__isnull=False),
+                name="approval_idempotency_key_unique",
+            ),
+            models.UniqueConstraint(
+                fields=("domain_dedupe_key",),
+                condition=models.Q(domain_dedupe_key__isnull=False),
+                name="approval_domain_dedupe_unique",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(idempotency_key_hash__isnull=True, domain_dedupe_key__isnull=True)
+                    | ~models.Q(operation_fingerprint="")
+                ),
+                name="approval_key_has_fingerprint",
             ),
         ]
 

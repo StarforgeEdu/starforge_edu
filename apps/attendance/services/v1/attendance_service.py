@@ -16,7 +16,7 @@ from apps.attendance.interfaces.services import IAttendanceService
 from apps.attendance.models import AttendanceRecord
 from apps.attendance.services import mark_attendance
 from apps.schedule.models import Lesson
-from core.exceptions import PermissionException, ValidationException
+from core.exceptions import PermissionException, UnprocessableEntity
 
 
 class AttendanceService(IAttendanceService):
@@ -40,10 +40,13 @@ class AttendanceService(IAttendanceService):
         found = self.repository.students_by_ids(ids=ids)
         missing = sorted({sid for sid in ids if sid not in found})
         if missing:
-            raise ValidationException(
-                _("One or more student ids do not exist."),
-                code="validation_error",
-                fields={"student": [f"Unknown student id(s): {missing}."]},
+            # Match the domain response for an existing student outside the
+            # lesson roster. Distinguishing "unknown" from "not in cohort"
+            # turns this write endpoint into a cross-scope student-id oracle.
+            raise UnprocessableEntity(
+                _("One or more students were not members of this lesson's cohort on the lesson date."),
+                code="student_not_in_cohort",
+                fields={"students": missing},
             )
         resolved = [
             {

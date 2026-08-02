@@ -16,16 +16,42 @@ from core.interfaces import IBaseRepository
 
 
 class IAssignmentRepository(IBaseRepository[Assignment]):
-    def scoped(self, *, user, roles: set[str]) -> QuerySet[Assignment]:
+    def scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Assignment]:
         raise NotImplementedError
 
-    def get_scoped(self, *, user, roles: set[str], pk: int) -> Assignment | None:
+    def get_scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        pk: int,
+        permission: str = "assignments:read",
+    ) -> Assignment | None:
         raise NotImplementedError
 
 
 class ISubmissionRepository(IBaseRepository[Submission]):
-    def scoped(self, *, user, roles: set[str]) -> QuerySet[Submission]:
+    def scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Submission]:
         raise NotImplementedError
 
-    def get_scoped(self, *, user, roles: set[str], pk: int) -> Submission | None:
+    def get_scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        pk: int,
+        permission: str = "assignments:read",
+    ) -> Submission | None:
         raise NotImplementedError

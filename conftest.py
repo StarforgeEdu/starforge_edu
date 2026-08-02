@@ -2,7 +2,7 @@
 
 import factory.random
 import pytest
-from django_tenants.utils import schema_context
+from django_tenants.utils import get_public_schema_name, schema_context
 from rest_framework.test import APIClient
 
 TENANTS = {"tenant_a": "a.localhost", "tenant_b": "b.localhost"}
@@ -13,19 +13,25 @@ def _ensure_tenants() -> None:
     from apps.tenancy.models import Center
     from apps.tenancy.services import provision_center
 
-    for slug, host in TENANTS.items():
-        if not Center.objects.filter(schema_name=slug).exists():
-            # Cheap if the schema already exists (django-tenants skips creation
-            # via check_if_exists) — only the rows are restored.
-            provision_center(name=slug.replace("_", " ").title(), slug=slug, primary_domain=host)
-        else:
-            # A `transaction=True` test flushes tenant tables. If the public Center
-            # row survives (so provision_center is skipped above) the tenant's
-            # CenterSettings singleton can still be gone — restore it so an
-            # order-dependent test that asserts a fully-provisioned tenant never sees
-            # a half-healed one (get_or_create pk=1; a no-op when already present).
-            with schema_context(slug):
-                CenterSettings.load()
+    # A previous transaction=True test or interrupted local run can leave the
+    # connection's search_path on a tenant schema. Center/Domain are control-plane
+    # rows and must always be inspected and provisioned from the public schema;
+    # otherwise --reuse-db becomes order-dependent and can try to create a duplicate
+    # schema after checking the wrong tenancy_center table.
+    with schema_context(get_public_schema_name()):
+        for slug, host in TENANTS.items():
+            if not Center.objects.filter(schema_name=slug).exists():
+                # Cheap if the schema already exists (django-tenants skips creation
+                # via check_if_exists) — only the rows are restored.
+                provision_center(name=slug.replace("_", " ").title(), slug=slug, primary_domain=host)
+            else:
+                # A `transaction=True` test flushes tenant tables. If the public Center
+                # row survives (so provision_center is skipped above) the tenant's
+                # CenterSettings singleton can still be gone — restore it so an
+                # order-dependent test that asserts a fully-provisioned tenant never sees
+                # a half-healed one (get_or_create pk=1; a no-op when already present).
+                with schema_context(slug):
+                    CenterSettings.load()
 
 
 @pytest.fixture(scope="session")

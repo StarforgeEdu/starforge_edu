@@ -9,11 +9,16 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any
+from urllib.parse import quote
 
 import boto3
 from botocore.client import Config
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+
+
+class StorageObjectTooLarge(ValueError):
+    """Raised before an object can be materialized beyond a caller's bound."""
 
 
 def _storage_options() -> dict[str, Any]:
@@ -52,14 +57,27 @@ def get_s3_presign_client():
     return _build_s3_client(public_endpoint)
 
 
-def presign_upload(key: str, *, expires_in: int = 600, content_type: str = "application/octet-stream") -> str:
+def presign_upload(
+    key: str,
+    *,
+    expires_in: int = 600,
+    content_type: str = "application/octet-stream",
+    size_bytes: int | None = None,
+) -> str:
+    params: dict[str, Any] = {
+        "Bucket": _storage_options()["bucket_name"],
+        "Key": key,
+        "ContentType": content_type,
+    }
+    if size_bytes is not None:
+        if size_bytes < 0:
+            raise ValueError("size_bytes must be non-negative")
+        # ContentLength becomes part of the SigV4 signed request. The browser's
+        # PUT must therefore carry the exact declared length.
+        params["ContentLength"] = size_bytes
     return get_s3_presign_client().generate_presigned_url(
         "put_object",
-        Params={
-            "Bucket": _storage_options()["bucket_name"],
-            "Key": key,
-            "ContentType": content_type,
-        },
+        Params=params,
         ExpiresIn=expires_in,
     )
 
@@ -91,13 +109,31 @@ def presign_post_upload(
     )
 
 
-def presign_download(key: str, *, expires_in: int = 600) -> str:
+def presign_download(
+    key: str,
+    *,
+    expires_in: int = 600,
+    download_filename: str | None = None,
+    response_content_type: str | None = None,
+) -> str:
+    params: dict[str, Any] = {
+        "Bucket": _storage_options()["bucket_name"],
+        "Key": key,
+    }
+    if download_filename is not None:
+        # RFC 5987 encoding avoids interpolating user-controlled quotes or
+        # control characters into Content-Disposition. Domain key parsers still
+        # validate the filename before this helper is called.
+        encoded_name = quote(download_filename, safe="")
+        params["ResponseContentDisposition"] = f"attachment; filename*=UTF-8''{encoded_name}"
+    if response_content_type is not None:
+        normalized_type = response_content_type.partition(";")[0].strip().lower()
+        if not normalized_type or "/" not in normalized_type or len(normalized_type) > 127:
+            raise ValueError("Invalid response content type")
+        params["ResponseContentType"] = normalized_type
     return get_s3_presign_client().generate_presigned_url(
         "get_object",
-        Params={
-            "Bucket": _storage_options()["bucket_name"],
-            "Key": key,
-        },
+        Params=params,
         ExpiresIn=expires_in,
     )
 
@@ -120,17 +156,56 @@ def head_object(key: str) -> dict[str, Any]:
 
 
 def get_object_range(key: str, *, start: int = 0, end: int = 8191) -> bytes:
-    """Fetch a byte range (inclusive) — used to sniff the first KBs for libmagic."""
+    """Fetch one bounded byte range (inclusive).
+
+    Object storage is an external trust boundary.  Do not assume a compatible
+    service, proxy, or test double honoured the ``Range`` header: cap the body
+    read at the requested span and reject an oversized response before callers
+    hand it to a parser such as libmagic.
+    """
+    if isinstance(start, bool) or isinstance(end, bool) or start < 0 or end < start:
+        raise ValueError("Invalid object byte range")
+    length = end - start + 1
+    if length > 64 * 1024:
+        raise ValueError("Object byte range exceeds the 64 KiB safety limit")
     resp = get_s3_client().get_object(
         Bucket=_storage_options()["bucket_name"], Key=key, Range=f"bytes={start}-{end}"
     )
-    return resp["Body"].read()
+    body = resp["Body"]
+    try:
+        data = body.read(length + 1)
+    finally:
+        body.close()
+    if len(data) > length:
+        raise StorageObjectTooLarge("Storage ignored the requested byte range")
+    return data
 
 
-def download_bytes(key: str) -> bytes:
-    """Fetch a whole object's bytes (e.g. an image to thumbnail). Tasks only."""
+def download_bytes(key: str, *, max_bytes: int | None = None) -> bytes:
+    """Fetch an object into memory with an optional authoritative upper bound.
+
+    Background renderers must pass ``max_bytes``.  A storage object can change
+    after a metadata check, so the response length and the actual streamed body
+    are both bounded here at the allocation boundary.
+    """
     resp = get_s3_client().get_object(Bucket=_storage_options()["bucket_name"], Key=key)
-    return resp["Body"].read()
+    body = resp["Body"]
+    if max_bytes is None:
+        return body.read()
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    try:
+        content_length = int(resp.get("ContentLength", -1))
+    except (TypeError, ValueError):
+        content_length = -1
+    if content_length > max_bytes:
+        body.close()
+        raise StorageObjectTooLarge("Storage object exceeds the permitted size")
+    data = body.read(max_bytes + 1)
+    body.close()
+    if len(data) > max_bytes:
+        raise StorageObjectTooLarge("Storage object exceeds the permitted size")
+    return data
 
 
 def copy_object(*, src_key: str, dest_key: str) -> str:

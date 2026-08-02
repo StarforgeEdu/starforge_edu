@@ -51,7 +51,8 @@ class MockFCMClient(PushClient):
     def send(
         self, *, token: str, title: str, body: str, data: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        logger.info("[MOCK FCM] token=%s title=%s", token[:12], title)
+        # Device tokens and notification titles are credentials/PII respectively.
+        logger.info("mock_push_delivery accepted")
         if not token or "dead" in token:
             result = {"success": False, "message_id": None, "error": "unregistered", "mock": True}
         else:
@@ -63,7 +64,11 @@ class MockFCMClient(PushClient):
                 "error": None,
                 "mock": True,
             }
-        self.outbox.append({"token": token, "title": title, "body": body, "data": data or {}, **result})
+        # Capture is test-only and opt-in. Staging/dev workers are long-lived;
+        # retaining device credentials and private message bodies in a class
+        # list would create unbounded memory growth and an in-process PII dump.
+        if getattr(settings, "FCM_MOCK_CAPTURE_OUTBOX", False):
+            self.outbox.append({"token": token, "title": title, "body": body, "data": data or {}, **result})
         return result
 
 

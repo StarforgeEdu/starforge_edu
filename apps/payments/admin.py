@@ -20,7 +20,7 @@ class PaymentAttemptInline(admin.TabularInline):
 
     model = PaymentAttempt
     extra = 0
-    fields = ("attempt_no", "error_code", "request_payload", "response_payload", "created_at")
+    fields = ("attempt_no", "error_code", "created_at")
     readonly_fields = fields
     can_delete = False
     show_change_link = True
@@ -68,8 +68,7 @@ class PaymentAdmin(ReadOnlyAdmin):
 
 @admin.register(PaymentAttempt)
 class PaymentAttemptAdmin(ReadOnlyAdmin):
-    """Provider round-trip log — written by the integration layer, so view-only
-    here (append-only history)."""
+    """Privacy-minimized provider outcome log, view-only in the admin."""
 
     list_display = ("id", "payment", "attempt_no", "error_code", "created_at")
     list_filter = ("error_code",)
@@ -87,7 +86,14 @@ class WebhookEventAdmin(ReadOnlyAdmin):
     list_display = ("id", "provider", "event_id", "status", "signature_valid", "created_at")
     list_filter = ("provider", "status", "signature_valid")
     search_fields = ("event_id",)
-    readonly_fields = ("provider", "event_id", "payload", "remote_ip", "created_at", "processed_at")
+    readonly_fields = (
+        "provider",
+        "event_id",
+        "payload",
+        "created_at",
+        "last_attempted_at",
+        "processed_at",
+    )
     date_hierarchy = "created_at"
 
 

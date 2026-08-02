@@ -5,7 +5,7 @@
   retries ≤3 with exponential backoff. Enqueued with ``_schema_name`` from the
   payment-completion chokepoint.
 - ``generate_receipt_pdf`` — renders the fiscal receipt to PDF (weasyprint LAZY,
-  in the service body) → S3 → the key is stored on the receipt payload so
+  in the service body) → S3 → a server-derived key is stored separately so
   ``GET /payments/{id}/receipt/`` can sign it (TD-14). PDF render skips where the
   native lib is absent (test mirrors the academics transcript skip).
 
@@ -131,8 +131,8 @@ def generate_receipt_pdf(self, payment_id: int) -> str | None:
 
 
 # WebhookEvent retention (R6/CONF3). The event ledger is a replay-dedupe + audit table
-# that grows one row per inbound webhook; the per-IP invalid-webhook throttle caps a burst,
-# and this beat task bounds LONG-TERM growth by pruning events past the retention window.
+# that grows one row per authenticated provider webhook (invalid signatures are never
+# persisted), and this beat task bounds long-term growth past the retention window.
 # Safe: providers retry within hours/days, never months, so a pruned old event can't be a
 # live replay; and the recent audit trail (well beyond any provider retry window) is kept.
 WEBHOOK_RETENTION_DAYS = 90

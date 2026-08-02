@@ -6,7 +6,15 @@ from typing import Any
 
 from django.db.models import QuerySet
 
-from apps.academics.models import Exam, ExamResult, ExamType, Grade, Subject, Transcript
+from apps.academics.models import (
+    Exam,
+    ExamLifecycleEvent,
+    ExamResult,
+    ExamType,
+    Grade,
+    Subject,
+    Transcript,
+)
 from core.interfaces import IBaseRepository
 
 
@@ -29,6 +37,9 @@ class IExamTypeRepository(IBaseRepository[ExamType]):
     def slug_taken(self, *, slug: str, exclude_pk: int | None = None) -> bool:
         raise NotImplementedError
 
+    def name_taken(self, *, name: str, exclude_pk: int | None = None) -> bool:
+        raise NotImplementedError
+
 
 class ISubjectRepository(IBaseRepository[Subject]):
     def list_subjects(self) -> QuerySet[Subject]:
@@ -49,12 +60,28 @@ class ISubjectRepository(IBaseRepository[Subject]):
     def code_taken(self, *, code: str, exclude_pk: int | None = None) -> bool:
         raise NotImplementedError
 
-
-class IExamRepository(IBaseRepository[Exam]):
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[Exam]:
+    def name_taken(self, *, name: str, exclude_pk: int | None = None) -> bool:
         raise NotImplementedError
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> Exam | None:
+
+class IExamRepository(IBaseRepository[Exam]):
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str,
+    ) -> QuerySet[Exam]:
+        raise NotImplementedError
+
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str,
+    ) -> Exam | None:
         raise NotImplementedError
 
     def add(self, *, data: dict[str, Any]) -> Exam:
@@ -67,6 +94,9 @@ class IExamRepository(IBaseRepository[Exam]):
         raise NotImplementedError
 
     def results_for(self, exam: Exam) -> QuerySet[ExamResult]:
+        raise NotImplementedError
+
+    def history_for(self, exam: Exam) -> QuerySet[ExamLifecycleEvent]:
         raise NotImplementedError
 
 

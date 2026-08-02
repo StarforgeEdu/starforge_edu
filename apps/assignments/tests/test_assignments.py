@@ -77,6 +77,19 @@ def _member(cohort, branch) -> Any:
     return student
 
 
+def _grant_teacher_scope(user, branch) -> None:
+    """Align legacy API fixtures with the cohort's permission branch."""
+    from apps.users.models import RoleMembership
+    from core.permissions import Role
+
+    RoleMembership.objects.get_or_create(
+        user=user,
+        branch=branch,
+        role=Role.TEACHER,
+    )
+    user.refresh_from_db()
+
+
 # --------------------------------------------------------------------------- #
 # late flag + resubmit limit (knob-driven)
 # --------------------------------------------------------------------------- #
@@ -198,10 +211,17 @@ def test_submit_rejects_foreign_tenant_attachment_key(tenant_a):
             )
         assert exc.value.code == "invalid_attachment_key"
 
-        # A correctly-prefixed key for this tenant is accepted.
+        # A correctly-prefixed but ungranted key is also rejected. Tenant
+        # prefix alone is not proof that the server issued or owns an object.
         good_key = f"{tenant_a.schema_name}/assignments/{'a' * 32}/essay.pdf"
-        sub = services.submit(assignment=assignment, student=student, attachment_keys=[good_key])
-        assert sub.attachments == [good_key]
+        with pytest.raises(UnprocessableEntity) as ungranted:
+            services.submit(
+                assignment=assignment,
+                student=student,
+                attachment_keys=[good_key],
+                actor=student.user,
+            )
+        assert ungranted.value.code == "invalid_attachment_key"
 
 
 def test_concurrent_submit_integrity_error_is_clean_conflict(tenant_a, monkeypatch):
@@ -269,6 +289,7 @@ def test_rubric_sum_cap_rejected_at_create(tenant_a, user_in, as_user):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         cohort: Any = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         cohort_id = cohort.id
@@ -307,6 +328,7 @@ def test_grade_rejects_malformed_rubric_scores_400_not_500(tenant_a, user_in, as
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         cohort = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         assignment: Any = AssignmentFactory(
@@ -331,6 +353,7 @@ def test_patch_max_score_null_is_400_not_conflict(tenant_a, user_in, as_user):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         cohort = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         assignment: Any = AssignmentFactory(cohort=cohort, status=Assignment.Status.DRAFT)
@@ -411,6 +434,19 @@ def test_assignment_put_requires_core_fields_and_preserves_omitted_optional_fiel
     assert data["rubric"] == [{"criterion": "old", "max_points": 5}]
     assert data["max_score"] == "25.00"
     assert data["max_resubmits"] == 3
+
+
+def test_assignment_delete_uses_the_scoped_service_contract(tenant_a, user_in, as_user):
+    director = user_in(tenant_a, roles=["director"])
+    with schema_context(tenant_a.schema_name):
+        assignment = AssignmentFactory(cohort=CohortFactory(branch=BranchFactory()))
+        assignment_id = assignment.pk
+
+    response = as_user(tenant_a, director).delete(f"/api/v1/assignments/{assignment_id}/")
+
+    assert response.status_code == 204, response.content
+    with schema_context(tenant_a.schema_name):
+        assert not Assignment.objects.filter(pk=assignment_id).exists()
 
 
 @pytest.mark.parametrize(
@@ -516,38 +552,47 @@ def test_plagiarism_local_detector_and_api(tenant_a, user_in, as_user):
 
 
 def test_upload_url_key_prefix_and_allowlist(tenant_a, monkeypatch):
-    monkeypatch.setattr(services, "presign_upload", lambda key, content_type="": f"https://s3/{key}")
+    monkeypatch.setattr(
+        services,
+        "presign_post_upload",
+        lambda key, **kwargs: {"url": "https://s3/upload", "fields": {"key": key}},
+    )
     with schema_context(tenant_a.schema_name):
+        actor = StudentProfileFactory().user
         result = services.validate_and_presign_upload(
-            filename="essay.pdf", content_type="application/pdf", size_bytes=1024
+            filename="essay.pdf",
+            content_type="application/pdf",
+            size_bytes=1024,
+            requested_by=actor,
         )
-        assert result["key"].startswith(f"{tenant_a.schema_name}/assignments/")
+        assert result["key"].startswith(f"{tenant_a.schema_name}/assignments/uploads/{actor.pk}/")
         assert result["key"].endswith("/essay.pdf")
 
-        # D2-D review: a filename with path separators / traversal must be
-        # sanitized to its basename so it cannot escape the {uuid}/ isolation.
-        traversal = services.validate_and_presign_upload(
-            filename="../../etc/passwd.pdf", content_type="application/pdf", size_bytes=1024
-        )
-        assert traversal["key"].startswith(f"{tenant_a.schema_name}/assignments/")
-        assert traversal["key"].endswith("/passwd.pdf")
-        assert ".." not in traversal["key"]
-
-        windows = services.validate_and_presign_upload(
-            filename="sub\\dir\\report.pdf", content_type="application/pdf", size_bytes=1024
-        )
-        assert windows["key"].endswith("/report.pdf")
-        assert "\\" not in windows["key"]
+        for unsafe_name in ("../../etc/passwd.pdf", "sub\\dir\\report.pdf", "bad\nname.pdf"):
+            with pytest.raises(UnprocessableEntity) as unsafe:
+                services.validate_and_presign_upload(
+                    filename=unsafe_name,
+                    content_type="application/pdf",
+                    size_bytes=1024,
+                    requested_by=actor,
+                )
+            assert unsafe.value.code == "invalid_filename"
 
         with pytest.raises(UnprocessableEntity) as exc:
             services.validate_and_presign_upload(
-                filename="virus.exe", content_type="application/octet-stream", size_bytes=10
+                filename="virus.exe",
+                content_type="application/octet-stream",
+                size_bytes=10,
+                requested_by=actor,
             )
         assert exc.value.code == "file_type_not_allowed"
 
         with pytest.raises(UnprocessableEntity) as exc2:
             services.validate_and_presign_upload(
-                filename="big.pdf", content_type="application/pdf", size_bytes=10**12
+                filename="big.pdf",
+                content_type="application/pdf",
+                size_bytes=10**12,
+                requested_by=actor,
             )
         assert exc2.value.code == "file_too_large"
 
@@ -570,10 +615,16 @@ def test_public_upload_grant_is_owner_bound_verified_and_single_use(tenant_a, mo
             requested_by=student.user,
         )
         assert result["method"] == "POST"
+        from core.attachment_storage import VerifiedAttachment
+
         monkeypatch.setattr(
             services,
-            "head_object",
-            lambda key: {"ContentLength": 1024, "ContentType": "application/pdf"},
+            "promote_attachment_object",
+            lambda **_kwargs: VerifiedAttachment(
+                size_bytes=1024,
+                content_type="application/pdf",
+                sniffed_type="application/pdf",
+            ),
         )
         submission = services.submit(
             assignment=assignment,
@@ -581,7 +632,12 @@ def test_public_upload_grant_is_owner_bound_verified_and_single_use(tenant_a, mo
             attachment_keys=[result["key"]],
             actor=student.user,
         )
-        assert submission.attachments == [result["key"]]
+        assert len(submission.attachments) == 1
+        assert submission.attachments[0].startswith(
+            f"{tenant_a.schema_name}/assignments/submissions/{submission.pk}/"
+        )
+        assert submission.attachments[0].endswith("/essay.pdf")
+        assert submission.attachments[0] != result["key"]
         grant = AssignmentUploadGrant.objects.get(key=result["key"])
         assert grant.consumed_at is not None
         assert grant.actual_size_bytes == 1024
@@ -735,6 +791,7 @@ def test_teacher_cannot_create_assignment_in_non_taught_cohort(tenant_a, user_in
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         own_cohort: Any = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         foreign_cohort: Any = CohortFactory(branch=branch)  # taught by nobody / another teacher
@@ -761,6 +818,7 @@ def test_teacher_cannot_repoint_assignment_to_non_taught_cohort(tenant_a, user_i
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         own_cohort: Any = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         foreign_cohort: Any = CohortFactory(branch=branch)
@@ -896,6 +954,7 @@ def test_submissions_list_query_budget(tenant_a, user_in, as_user, django_assert
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         cohort = CohortFactory(branch=branch, primary_teacher=teacher_profile)
         assignment: Any = AssignmentFactory(cohort=cohort, status=Assignment.Status.PUBLISHED)

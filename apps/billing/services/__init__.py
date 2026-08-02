@@ -282,8 +282,6 @@ def _run_dunning(*, center_id: int, status: str) -> None:
 
 
 def _dispatch_to_directors(*, center, event_type: str, status: str, date: str) -> None:
-    from core.permissions import Role
-
     try:
         from apps.notifications.services import dispatch
     except Exception:  # notifications lane not merged yet — degrade, never crash
@@ -305,16 +303,30 @@ def _dispatch_to_directors(*, center, event_type: str, status: str, date: str) -
             )
         except Exception:  # one bad recipient must not abort the rest
             logger.exception("billing dunning dispatch failed", extra={"user_id": user_id})
-    _ = Role  # role import documents the director resolution path
 
 
 def _director_user_ids() -> list[int]:
-    """User ids holding an active director RoleMembership in the current schema."""
+    """Active users holding the canonical owner membership in this schema.
+
+    ``RoleMembership.role`` is a compatibility column and can drift on imported
+    custom account types. Trusting it alone could send subscription and contact
+    information to a non-owner account.
+    """
+    from django.db.models import Q
+
     from apps.users.models import RoleMembership
     from core.permissions import Role
 
     return list(
-        RoleMembership.objects.filter(role=Role.DIRECTOR, revoked_at__isnull=True)
+        RoleMembership.objects.filter(revoked_at__isnull=True, user__is_active=True)
+        .filter(
+            Q(
+                account_type__is_active=True,
+                account_type__is_system=True,
+                account_type__slug=Role.DIRECTOR,
+            )
+            | Q(account_type__isnull=True, role=Role.DIRECTOR)
+        )
         .values_list("user_id", flat=True)
         .distinct()
     )

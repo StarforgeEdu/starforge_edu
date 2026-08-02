@@ -184,11 +184,11 @@ def test_cross_branch_task_creation_blocked(tenant_a, user_in, as_user):
 
     cross = teacher_a.post(TASKS, {"title": "x", "branch": branch_b.id}, format="json")
     assert cross.status_code == 403
-    assert cross.json()["code"] == "cross_branch"
+    assert cross.json()["code"] == "out_of_scope"
 
     cross_dept = teacher_a.post(TASKS, {"title": "x", "department": dept_b.id}, format="json")
     assert cross_dept.status_code == 403
-    assert cross_dept.json()["code"] == "cross_branch_dept"
+    assert cross_dept.json()["code"] == "out_of_scope"
 
 
 def test_cannot_assign_a_non_staff_user(tenant_a, as_role):
@@ -197,6 +197,109 @@ def test_cannot_assign_a_non_staff_user(tenant_a, as_role):
     # a student is not staff -> not a valid assignee
     r = director.post(TASKS, {"title": "x", "assignee": student.id}, format="json")
     assert r.status_code == 400
+
+
+def test_shared_bridge_role_cannot_read_transition_or_be_selected_for_another_principal(
+    tenant_a, as_role, client_for, django_assert_num_queries
+):
+    from apps.org.tests.factories import BranchFactory
+    from apps.tasks.models import Task
+    from tests.role_principal_helpers import exact_session_client, shared_staff_teacher_bridge
+
+    director, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        user, teacher, staff = shared_staff_teacher_bridge(
+            branch=branch,
+            staff_role=Role.SUPPORT,
+        )
+        teacher_id = teacher.pk
+        task = Task.objects.create(
+            title="Teacher account only",
+            assignee=user,
+            assignee_principal_kind="teacher",
+            assignee_principal_id=teacher.pk,
+        )
+
+    teacher_client = exact_session_client(
+        client_for,
+        tenant_a,
+        user,
+        principal_kind="teacher",
+        principal_id=teacher_id,
+    )
+    staff_client = exact_session_client(
+        client_for,
+        tenant_a,
+        user,
+        principal_kind="staff",
+        principal_id=staff.pk,
+    )
+    assert [row["id"] for row in _rows(teacher_client.get(f"{TASKS}mine/").json())] == [task.pk]
+    assert _rows(staff_client.get(f"{TASKS}mine/").json()) == []
+    assert staff_client.get(f"{TASKS}{task.pk}/").status_code == 404
+    assert (
+        staff_client.post(f"{TASKS}{task.pk}/transition/", {"status": "done"}, format="json").status_code
+        == 404
+    )
+    assert (
+        teacher_client.post(f"{TASKS}{task.pk}/transition/", {"status": "done"}, format="json").status_code
+        == 200
+    )
+
+    # The compatibility user id is not an acceptable write selector when two
+    # active staff principals sit behind it.
+    ambiguous = director.post(
+        TASKS,
+        {"title": "Unsafe assignment", "branch": branch.pk, "assignee": user.pk},
+        format="json",
+    )
+    assert ambiguous.status_code == 400
+    assert ambiguous.json()["errors"] == {"assignee": ["Choose active task staff in the task's scope."]}
+
+    selected = director.post(
+        TASKS,
+        {
+            "title": "Exact teacher assignment",
+            "branch": branch.pk,
+            "assignee_principal": {"kind": "teacher", "id": teacher.pk},
+        },
+        format="json",
+    )
+    assert selected.status_code == 201, selected.content
+    payload = selected.json()["data"]
+    assert payload["assignee"] == user.pk  # deprecated compatibility bridge
+    assert payload["assignee_principal"]["kind"] == "teacher"
+    assert payload["assignee_principal"]["id"] == teacher.pk
+    assert payload["assignee_name"]
+    assert payload["branch_name"] == branch.name
+    exact_filter = director.get(f"{TASKS}?assignee_kind=teacher&assignee_principal_id={teacher.pk}")
+    assert {row["id"] for row in _rows(exact_filter.json())} == {task.pk, payload["id"]}
+
+    from apps.tasks.presenters import task_to_dict
+    from apps.tasks.repositories.task_repository import TaskRepository
+
+    with schema_context(tenant_a.schema_name), django_assert_num_queries(1):
+        loaded = TaskRepository().get_queryset().get(pk=payload["id"])
+        bounded_payload = task_to_dict(loaded)
+    assert bounded_payload["assignee_name"]
+
+
+def test_assigned_task_protects_bridge_identity_lifecycle(tenant_a, as_role):
+    from django.db.models import ProtectedError
+
+    from apps.users.models import User
+
+    director, _ = as_role(Role.DIRECTOR)
+    _worker_client, worker = as_role(Role.SUPPORT)
+    created = director.post(
+        TASKS,
+        {"title": "Historical owner", "assignee": worker.pk},
+        format="json",
+    )
+    assert created.status_code == 201, created.content
+    with schema_context(tenant_a.schema_name), pytest.raises(ProtectedError):
+        User.objects.get(pk=worker.pk).delete()
 
 
 def test_transition_of_unseen_task_is_404(tenant_a, as_role):
@@ -313,3 +416,196 @@ def test_task_list_routes_support_head(tenant_a, as_role):
     assert director.head(TASKS).status_code == 200
     assert director.head(f"{TASKS}mine/").status_code == 200
     assert director.head(GRADES).status_code == 200
+
+
+def test_task_unknown_fields_filters_and_resource_bounds_are_rejected(tenant_a, as_role):
+    director, _ = as_role(Role.DIRECTOR)
+    assert director.post(TASKS, {"title": "x", "surprise": True}, format="json").status_code == 400
+    assert director.get(f"{TASKS}?surprise=true").status_code == 400
+    assert (
+        director.post(
+            TASKS,
+            {"title": "x", "description": "x" * 20_001},
+            format="json",
+        ).status_code
+        == 400
+    )
+    assert (
+        director.post(
+            "/api/v1/tasks/auto-assign/",
+            {"task_ids": [1, 1], "department": 1},
+            format="json",
+        ).status_code
+        == 400
+    )
+
+
+def test_department_only_write_grant_does_not_expand_to_branch_backlog(tenant_a, user_in, as_user):
+    from apps.org.tests.factories import BranchFactory, DepartmentFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        department = DepartmentFactory(branch=branch)
+    teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    with schema_context(tenant_a.schema_name):
+        RoleMembership.objects.filter(user=teacher_user, branch=branch).update(department=department)
+    teacher = as_user(tenant_a, teacher_user)
+
+    scoped = teacher.post(
+        TASKS,
+        {"title": "Department task", "department": department.pk},
+        format="json",
+    )
+    assert scoped.status_code == 201, scoped.content
+    branch_wide = teacher.post(
+        TASKS,
+        {"title": "Over-broad task", "branch": branch.pk},
+        format="json",
+    )
+    assert branch_wide.status_code == 403
+    assert branch_wide.json()["code"] == "out_of_scope"
+
+
+def test_task_creator_uses_exact_principal_and_survives_bridge_deletion(
+    tenant_a,
+    client_for,
+    django_assert_num_queries,
+):
+    from django.db import DatabaseError, transaction
+
+    from apps.org.tests.factories import BranchFactory
+    from apps.tasks.models import Task
+    from apps.tasks.presenters import task_to_dict
+    from apps.tasks.repositories.task_repository import TaskRepository
+    from tests.role_principal_helpers import exact_session_client, shared_staff_teacher_bridge
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        user, teacher, staff = shared_staff_teacher_bridge(
+            branch=branch,
+            staff_role=Role.SUPPORT,
+        )
+        teacher_id = teacher.pk
+    teacher_client = exact_session_client(
+        client_for,
+        tenant_a,
+        user,
+        principal_kind="teacher",
+        principal_id=teacher_id,
+    )
+    response = teacher_client.post(
+        TASKS,
+        {"title": "Exact creator", "branch": branch.pk},
+        format="json",
+    )
+    assert response.status_code == 201, response.content
+    payload = response.json()["data"]
+    assert payload["created_by"]["kind"] == "teacher"
+    assert payload["created_by"]["id"] == teacher_id
+    assert payload["created_by"]["display_name"]
+    assert payload["created_by_attribution_status"] == "captured"
+
+    with schema_context(tenant_a.schema_name):
+        task_id = payload["id"]
+        with pytest.raises(DatabaseError), transaction.atomic():
+            Task.objects.filter(pk=task_id).update(created_by_principal_id=staff.pk)
+
+        legacy = Task.objects.create(title="Ambiguous legacy creator", created_by=user)
+        legacy_payload = task_to_dict(legacy)
+        assert legacy_payload["created_by"] is None
+        assert legacy_payload["created_by_attribution_status"] == "quarantined"
+
+        from apps.teachers.models import TeacherProfile
+
+        TeacherProfile.objects.filter(pk=teacher_id).update(is_active=False)
+        exact = Task.objects.get(pk=task_id)
+        exact.title = "Historical exact creator"
+        exact.save()
+
+        user.delete()
+        with django_assert_num_queries(1):
+            loaded = TaskRepository().get_queryset().get(pk=task_id)
+            historical = task_to_dict(loaded)
+        assert loaded.created_by_id is None
+        assert historical["created_by"] == {
+            "kind": "teacher",
+            "id": teacher_id,
+            "display_name": None,
+            "account_label": "Teacher",
+        }
+        assert historical["created_by_attribution_status"] == "captured"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_terminal_transitions_serialize_on_the_task_row(tenant_a, monkeypatch):
+    """Two valid OPEN transitions cannot both commit from the same stale image."""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from threading import Event
+
+    from django.db import close_old_connections
+
+    from apps.tasks import services
+    from apps.tasks.models import Task
+    from core.exceptions import UnprocessableEntity
+
+    with schema_context(tenant_a.schema_name):
+        task = Task.objects.create(title="Concurrent transition")
+        task_id = task.pk
+
+    first_holds_lock = Event()
+    release_first = Event()
+    second_started = Event()
+    original_save = Task.save
+
+    def slow_first_save(instance, *args, **kwargs):
+        if instance.pk == task_id and instance.status == Task.Status.DONE:
+            first_holds_lock.set()
+            if not release_first.wait(timeout=10):
+                raise RuntimeError("test timed out waiting to release the first transition")
+        return original_save(instance, *args, **kwargs)
+
+    monkeypatch.setattr(Task, "save", slow_first_save)
+
+    def transition(status: str, *, mark_started: bool = False):
+        close_old_connections()
+        try:
+            with schema_context(tenant_a.schema_name):
+                if mark_started:
+                    second_started.set()
+                stale = Task.objects.get(pk=task_id)
+                try:
+                    result = services.transition_task(
+                        task=stale,
+                        to_status=status,
+                        actor=None,
+                        actor_principal_kind="staff",
+                        actor_principal_id=1,
+                        can_transition_any=True,
+                    )
+                    return ("ok", result.status)
+                except UnprocessableEntity as exc:
+                    return ("invalid", exc.code)
+        finally:
+            close_old_connections()
+
+    second = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(transition, Task.Status.DONE)
+        try:
+            assert first_holds_lock.wait(timeout=10)
+            second = pool.submit(transition, Task.Status.CANCELLED, mark_started=True)
+            assert second_started.wait(timeout=10)
+            # The second worker has started but remains blocked on select_for_update.
+            with pytest.raises(FutureTimeout):
+                second.result(timeout=0.25)
+        finally:
+            release_first.set()
+        assert second is not None
+        assert first.result(timeout=10) == ("ok", Task.Status.DONE)
+        assert second.result(timeout=10) == ("invalid", "invalid_transition")
+
+    with schema_context(tenant_a.schema_name):
+        assert Task.objects.get(pk=task_id).status == Task.Status.DONE
+        Task.objects.filter(pk=task_id).delete()

@@ -1,7 +1,8 @@
 """Content domain signals (emit-only).
 
-Consumers: D4-A AI content summary listens to ``file_upload_confirmed`` to
-generate a summary for the just-confirmed file. Flat primitive kwargs +
+Consumers: D4-A AI content summary listens to ``file_upload_confirmed`` after
+the upload has passed validation and committed as CLEAN, to generate a summary
+for the just-confirmed file. Flat primitive kwargs +
 ``schema_name`` for cross-context Celery dispatch.
 
 Signatures:

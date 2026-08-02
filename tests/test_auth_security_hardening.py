@@ -94,6 +94,32 @@ def test_admin_linked_staff_profile_cannot_role_login_or_request_reset(tenant_a,
         assert staff.check_password(PASSWORD)
 
 
+def test_role_login_rejects_cross_table_username_collision(tenant_a, client_for):
+    from apps.org.models import StaffProfile
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.users.tests.factories import UserFactory
+
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory(username="duplicate-role-login")
+        student.set_password(PASSWORD)
+        student.save(update_fields=["password"])
+        staff = StaffProfile.objects.create(
+            user=UserFactory(),
+            username="duplicate-role-login",
+        )
+        staff.set_password(PASSWORD)
+        staff.save(update_fields=["password"])
+
+    response = client_for(tenant_a).post(
+        ROLE_LOGIN_URL,
+        {"username": "duplicate-role-login", "password": PASSWORD},
+        format="json",
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "invalid_credentials"
+
+
 def test_reset_otp_is_bound_to_exact_role_when_contact_is_shared(tenant_a, client_for, sms_outbox):
     from apps.students.tests.factories import StudentProfileFactory
     from apps.teachers.tests.factories import TeacherProfileFactory
@@ -197,6 +223,44 @@ def test_session_bearer_key_is_hashed_at_rest_and_digest_is_not_a_credential(ten
         assert validate_session_key(raw_key) is None
 
 
+def test_session_idle_timeout_is_enforced_and_revokes_the_row(tenant_a, user_in):
+    from datetime import timedelta
+
+    from django.test import override_settings
+    from django.utils import timezone
+
+    from apps.users.models import Session
+    from core.session_auth import create_session, validate_session_key
+
+    user = user_in(tenant_a, roles=["teacher"])
+    with schema_context(tenant_a.schema_name), override_settings(SESSION_IDLE_TIMEOUT_MINUTES=30):
+        issued = create_session(user)
+        Session.objects.filter(pk=issued.pk).update(last_used_at=timezone.now() - timedelta(minutes=31))
+
+        assert validate_session_key(issued.key) is None
+        issued.refresh_from_db()
+        assert issued.revoked_at is not None
+
+
+def test_passive_websocket_validation_does_not_extend_idle_activity(tenant_a, user_in):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.users.models import Session
+    from core.session_auth import create_session, validate_session_id
+
+    user = user_in(tenant_a, roles=["teacher"])
+    with schema_context(tenant_a.schema_name):
+        issued = create_session(user)
+        stale_activity = timezone.now() - timedelta(minutes=2)
+        Session.objects.filter(pk=issued.pk).update(last_used_at=stale_activity)
+
+        assert validate_session_id(issued.pk, expected_user_id=user.pk, touch=False) is not None
+        issued.refresh_from_db()
+        assert issued.last_used_at == stale_activity
+
+
 def test_legacy_plaintext_session_is_dual_read_then_lazily_hashed(tenant_a, user_in):
     import secrets
     from datetime import timedelta
@@ -297,7 +361,7 @@ def test_session_hash_bulk_cutover_is_post_readiness_not_a_schema_migration():
     deploy_script = (root / "scripts" / "deploy_production.sh").read_text(encoding="utf-8")
     readiness_gate = deploy_script.index('if [[ "$healthy" != "1" ]]')
     cutover = deploy_script.index("python manage.py hash_session_keys")
-    release_marker = deploy_script.index("printf '%s\\n' \"$sha\"")
+    release_marker = deploy_script.index('atomic_marker "${DEPLOY_DIR}/current_release"')
     assert readiness_gate < cutover < release_marker
 
 

@@ -1,3 +1,5 @@
+from typing import cast
+
 from django import forms
 from django.contrib import admin
 
@@ -22,8 +24,7 @@ class TeacherProfileAdminForm(RoleAccountAdminForm):
             account_kind=AccountType.AccountKind.TEACHER,
             is_active=True,
         ).order_by("name")
-        account_type_field = self.fields["account_type"]
-        assert isinstance(account_type_field, forms.ModelChoiceField)
+        account_type_field = cast(forms.ModelChoiceField, self.fields["account_type"])
         account_type_field.queryset = queryset
         if self.instance.pk and self.instance.user_id:
             membership = (

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.db.models import Q, QuerySet
+from django.db.models import QuerySet
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
@@ -34,8 +34,10 @@ from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
 from core.http import read_json, str_field
 from core.listing import apply_filters, paginate
-from core.permissions import Role, get_role_memberships, get_user_roles, has_permission_code
+from core.permissions import get_user_roles, has_permission_code
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import request_role_principal
+from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 
 _DIFFICULTIES = frozenset({"easy", "medium", "hard"})
 
@@ -126,50 +128,47 @@ def _roles(request: HttpRequest) -> set[str]:
     return get_user_roles(request)
 
 
-def _branch_ids(request: HttpRequest) -> set[int]:
-    return {m.branch_id for m in get_role_memberships(request) if m.branch_id}
-
-
-def _is_director(request: HttpRequest) -> bool:
-    user: Any = request.user
-    return bool(user.is_superuser) or Role.DIRECTOR in _roles(request)
+def _branch_ids(request: HttpRequest, permission: str) -> set[int]:
+    """Only branches on memberships that grant this exact operation."""
+    return permission_membership_branch_ids(
+        roles=get_user_roles(request),
+        permission=permission,
+    )
 
 
 def _actor_is_staff(request: HttpRequest) -> bool:
-    return _is_director(request) or has_permission_code(_roles(request), "placement:write")
+    return has_permission_code(_roles(request), "placement:write")
 
 
-def _scoped_tests(request: HttpRequest) -> QuerySet[PlacementTest]:
+def _scoped_tests(request: HttpRequest, *, permission: str) -> QuerySet[PlacementTest]:
     base = _service().tests_base()
-    if _is_director(request):
+    if is_permission_unscoped(request, permission=permission):
         return base
-    if has_permission_code(_roles(request), "placement:write"):
-        return base.filter(Q(created_by=request.user) | Q(branch_id__in=_branch_ids(request)))
-    return base.none()
+    return base.filter(branch_id__in=_branch_ids(request, permission))
 
 
 def _scoped_attempts(request: HttpRequest) -> QuerySet[PlacementAttempt]:
     base = _service().attempts_base()
-    if _is_director(request):
+    if is_permission_unscoped(request, permission="placement:write"):
         return base
-    user: Any = request.user
     if has_permission_code(_roles(request), "placement:write"):
-        return base.filter(Q(assigned_by=user) | Q(test__branch_id__in=_branch_ids(request))).distinct()
+        return base.filter(test__branch_id__in=_branch_ids(request, "placement:write")).distinct()
+    user: Any = request.user
     profile = student_profile_for(user)
     if profile is not None:
         return base.filter(student=profile)
     return base.none()
 
 
-def _scoped_proposals(request: HttpRequest) -> QuerySet:
+def _scoped_proposals(request: HttpRequest, *, permission: str) -> QuerySet:
     base = _service().proposals_base()
-    if _is_director(request):
+    if is_permission_unscoped(request, permission=permission):
         return base
-    return base.filter(Q(proposed_by=request.user) | Q(cohort__branch_id__in=_branch_ids(request))).distinct()
+    return base.filter(cohort__branch_id__in=_branch_ids(request, permission)).distinct()
 
 
-def _get_test(request: HttpRequest, pk: int) -> PlacementTest:
-    obj = _scoped_tests(request).filter(pk=pk).first()
+def _get_test(request: HttpRequest, pk: int, *, permission: str) -> PlacementTest:
+    obj = _scoped_tests(request, permission=permission).filter(pk=pk).first()
     if obj is None:
         raise NotFoundException(code="not_found")
     return obj
@@ -182,8 +181,8 @@ def _get_attempt(request: HttpRequest, pk: int) -> PlacementAttempt:
     return obj
 
 
-def _get_proposal(request: HttpRequest, pk: int):
-    obj = _scoped_proposals(request).filter(pk=pk).first()
+def _get_proposal(request: HttpRequest, pk: int, *, permission: str):
+    obj = _scoped_proposals(request, permission=permission).filter(pk=pk).first()
     if obj is None:
         raise NotFoundException(code="not_found")
     return obj
@@ -244,10 +243,10 @@ def _create_test_data(request: HttpRequest) -> dict[str, Any]:
     data = read_json(request)
     subject = _resolve_subject(data)
     branch = _resolve_branch(data)
-    if not _is_director(request):
+    if not is_permission_unscoped(request, permission="placement:write"):
         # A non-director builds only within their own branch; only the director may
         # create a centre-wide (branch=None) placement test.
-        my_branches = _branch_ids(request)
+        my_branches = _branch_ids(request, "placement:write")
         if branch is None:
             if len(my_branches) == 1:
                 branch = Branch.objects.get(pk=next(iter(my_branches)))
@@ -287,7 +286,7 @@ def tests_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "placement:read")
         qs = apply_filters(
             request,
-            _scoped_tests(request),
+            _scoped_tests(request, permission="placement:read"),
             filter_fields=("status", "branch", "subject"),
             search_fields=("title",),
             ordering_fields=("created_at", "title"),
@@ -308,15 +307,15 @@ def tests_collection_view(request: HttpRequest) -> HttpResponse:
 def test_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, "placement:read")
-        return success(placement_test_to_dict(_get_test(request, pk)))
+        return success(placement_test_to_dict(_get_test(request, pk, permission="placement:read")))
     if request.method in ("PUT", "PATCH"):
         check_perm(request, "placement:write")
-        test = _get_test(request, pk)
+        test = _get_test(request, pk, permission="placement:write")
         test = _service().update_test(test=test, changes=_update_test_changes(request))
         return success(placement_test_to_dict(test))
     if request.method == "DELETE":
         check_perm(request, "placement:write")
-        _service().delete_test(test=_get_test(request, pk))
+        _service().delete_test(test=_get_test(request, pk, permission="placement:write"))
         return no_content()
     return _method_not_allowed()
 
@@ -328,7 +327,7 @@ def test_add_question_view(request: HttpRequest, pk: int) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "placement:write")
     _assert_test_creation_client(request)
-    test = _get_test(request, pk)
+    test = _get_test(request, pk, permission="placement:write")
     data = read_json(request)
     question = _service().add_question(
         test=test,
@@ -361,11 +360,16 @@ def test_generate_view(request: HttpRequest, pk: int) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "placement:write")
     _assert_test_creation_client(request)
-    test = _get_test(request, pk)
+    test = _get_test(request, pk, permission="placement:write")
     data = read_json(request)
     ai_request = _service().request_generation(
         test=test,
         requested_by=request.user,
+        requested_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff", "teacher"},
+            error_code="ai_principal_unavailable",
+        ),
         count=_int_bounded(_require(data, "count"), "count", 1, 50),
         difficulty=_choice(data.get("difficulty", "medium"), "difficulty", _DIFFICULTIES),
         topic=str_field(data, "topic", max_length=200),
@@ -380,7 +384,7 @@ def test_remove_question_view(request: HttpRequest, pk: int, question_id: int) -
         return _method_not_allowed()
     check_perm(request, "placement:write")
     _assert_test_creation_client(request)
-    test = _get_test(request, pk)
+    test = _get_test(request, pk, permission="placement:write")
     question = test.questions.filter(pk=question_id).first()
     if question is None:
         raise NotFoundException(_("That question is not on this test."), code="question_not_found")
@@ -395,7 +399,7 @@ def test_submit_view(request: HttpRequest, pk: int) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "placement:write")
     _assert_test_creation_client(request)
-    test = _service().submit_test(test=_get_test(request, pk))
+    test = _service().submit_test(test=_get_test(request, pk, permission="placement:write"))
     return success(placement_test_to_dict(test))
 
 
@@ -405,7 +409,10 @@ def test_approve_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "placement:approve")
-    test = _service().approve_test(test=_get_test(request, pk), approver=request.user)
+    test = _service().approve_test(
+        test=_get_test(request, pk, permission="placement:approve"),
+        approver=request.user,
+    )
     return success(placement_test_to_dict(test))
 
 
@@ -415,7 +422,7 @@ def test_reject_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "placement:approve")
-    test = _get_test(request, pk)
+    test = _get_test(request, pk, permission="placement:approve")
     test = _service().reject_test(test=test, reviewer=request.user, reason=_reason(request))
     return success(placement_test_to_dict(test))
 
@@ -424,9 +431,9 @@ def test_reject_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 def _assert_attempt_scope(request: HttpRequest, test: PlacementTest, student: StudentProfile) -> None:
-    if _is_director(request):
+    if is_permission_unscoped(request, permission="placement:write"):
         return
-    my_branches = _branch_ids(request)
+    my_branches = _branch_ids(request, "placement:write")
     if test.branch_id is not None and test.branch_id not in my_branches:
         raise PermissionException(_("You can only assign a test from your own branch."), code="cross_branch")
     if student.branch_id not in my_branches:
@@ -525,7 +532,13 @@ def attempt_mark_writing_view(request: HttpRequest, pk: int) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "placement:write")
     ai_request = _service().request_writing_marking(
-        attempt=_get_attempt(request, pk), requested_by=request.user
+        attempt=_get_attempt(request, pk),
+        requested_by=request.user,
+        requested_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff", "teacher"},
+            error_code="ai_principal_unavailable",
+        ),
     )
     return success({"request_id": ai_request.pk, "status": ai_request.status}, status=202)
 
@@ -545,9 +558,9 @@ def attempt_mark_writing_manual_view(request: HttpRequest, pk: int) -> HttpRespo
 
 
 def _assert_proposal_scope(request: HttpRequest, cohort: Cohort) -> None:
-    if _is_director(request):
+    if is_permission_unscoped(request, permission="placement:write"):
         return
-    if cohort.branch_id not in _branch_ids(request):
+    if cohort.branch_id not in _branch_ids(request, "placement:write"):
         raise PermissionException(
             _("You can only place students into your own branch's groups."), code="cross_branch"
         )
@@ -560,7 +573,7 @@ def proposals_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "placement:read")
         qs = apply_filters(
             request,
-            _scoped_proposals(request),
+            _scoped_proposals(request, permission="placement:read"),
             filter_fields=("status", "student", "cohort"),
             default_ordering="-created_at",
         )
@@ -583,7 +596,7 @@ def proposal_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "placement:read")
-    return success(group_proposal_to_dict(_get_proposal(request, pk)))
+    return success(group_proposal_to_dict(_get_proposal(request, pk, permission="placement:read")))
 
 
 @csrf_exempt
@@ -592,7 +605,10 @@ def proposal_accept_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "placement:approve")
-    proposal = _service().accept(proposal=_get_proposal(request, pk), manager=request.user)
+    proposal = _service().accept(
+        proposal=_get_proposal(request, pk, permission="placement:approve"),
+        manager=request.user,
+    )
     return success(group_proposal_to_dict(proposal))
 
 
@@ -602,6 +618,6 @@ def proposal_reject_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "placement:approve")
-    proposal = _get_proposal(request, pk)
+    proposal = _get_proposal(request, pk, permission="placement:approve")
     proposal = _service().reject_proposal(proposal=proposal, manager=request.user, reason=_reason(request))
     return success(group_proposal_to_dict(proposal))

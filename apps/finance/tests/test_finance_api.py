@@ -91,7 +91,56 @@ def test_parent_sees_only_own_childs_balance(tenant_a, user_in, as_user):
     assert Decimal(ok.json()["data"]["outstanding_uzs"]) == Decimal("100000.00")
 
     denied = client.get(f"{OUTSTANDING_URL}?student={other_child.pk}")
-    assert denied.status_code == 403
+    assert denied.status_code == 404
+    assert denied.json()["code"] == "not_found"
+
+
+def test_own_finance_grant_cannot_borrow_parent_identity_from_another_membership(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        actor = user_in(tenant_a)
+        parent = ParentProfileFactory(user=actor)
+        child = StudentProfileFactory()
+        GuardianFactory(parent=parent, student=child)
+        InvoiceFactory(student=child, total_uzs=Decimal("100000.00"))
+
+        staff_finance_type = AccountType.objects.create(
+            name="Self finance helper",
+            slug="self-finance-helper",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=staff_finance_type,
+            permission="finance:read_own",
+        )
+        parent_without_finance_type = AccountType.objects.create(
+            name="Parent without finance",
+            slug="parent-without-finance",
+            account_kind=AccountType.AccountKind.PARENT,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=child.branch,
+            account_type=staff_finance_type,
+            role=staff_finance_type.compatibility_role,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=child.branch,
+            account_type=parent_without_finance_type,
+            role=parent_without_finance_type.compatibility_role,
+        )
+        actor.refresh_from_db()
+
+    response = as_user(tenant_a, actor).get(f"{OUTSTANDING_URL}?student={child.pk}")
+    assert response.status_code == 403
+    assert response.json()["code"] == "forbidden"
 
 
 def test_director_sees_any_balance(tenant_a, as_role):
@@ -162,6 +211,48 @@ def test_invoice_line_oversized_quantity_is_400_not_500(tenant_a, user_in, as_us
         format="json",
     )
     assert resp.status_code == 400, resp.content
+
+
+def test_invoice_line_valid_fields_with_overflowing_product_is_400(tenant_a, user_in, as_user):
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory()
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=student.branch)
+
+    response = as_user(tenant_a, actor).post(
+        INVOICES_URL,
+        {
+            "student": student.pk,
+            "lines": [
+                {
+                    "description": "individually valid but overflowing",
+                    "unit_price_uzs": "9999999999999999.99",
+                    "quantity": "999999.99",
+                }
+            ],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400, response.content
+    assert response.json()["code"] == "invoice_amount_too_large"
+
+
+def test_invoice_line_count_is_bounded(tenant_a, user_in, as_user):
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory()
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=student.branch)
+
+    response = as_user(tenant_a, actor).post(
+        INVOICES_URL,
+        {
+            "student": student.pk,
+            "lines": [{"description": f"line-{index}", "unit_price_uzs": "1.00"} for index in range(501)],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400, response.content
+    assert response.json()["code"] == "validation_error"
 
 
 def test_create_invoice_validation_empty(tenant_a, user_in, as_user):
@@ -242,7 +333,183 @@ def test_accountant_invoice_and_statement_access_is_branch_scoped(tenant_a, user
         ).status_code
         == 403
     )
-    assert client.post(f"/api/v1/finance/students/{other_student.pk}/statement/").status_code == 403
+    statement = client.post(f"/api/v1/finance/students/{other_student.pk}/statement/")
+    # Scoped reads conceal records outside the caller's branch just like invoice
+    # detail; do not turn the statement endpoint into a student-id oracle.
+    assert statement.status_code == 404
+    assert statement.json()["code"] == "not_found"
+
+
+def test_outstanding_total_excludes_historical_invoices_outside_staff_scope(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        historical_branch = BranchFactory(name="Historical balance", slug="historical-balance")
+        current_branch = BranchFactory(name="Current balance", slug="current-balance")
+        student = StudentProfileFactory(branch=current_branch, current_cohort=None)
+        InvoiceFactory(
+            student=student,
+            branch_at_issue=historical_branch,
+            department_at_issue=None,
+            total_uzs=Decimal("100.00"),
+        )
+        visible = InvoiceFactory(
+            student=student,
+            branch_at_issue=current_branch,
+            department_at_issue=None,
+            total_uzs=Decimal("200.00"),
+        )
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=current_branch)
+
+    response = as_user(tenant_a, actor).get(f"{OUTSTANDING_URL}?student={student.pk}")
+
+    assert response.status_code == 200, response.content
+    assert response.json()["data"]["outstanding_uzs"] == "200.00"
+    assert [row["id"] for row in response.json()["data"]["invoices"]] == [visible.pk]
+
+
+def test_outstanding_conceals_student_outside_staff_scope_without_historical_invoice(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        local_branch = BranchFactory(name="Local balance", slug="local-balance")
+        remote_branch = BranchFactory(name="Remote balance", slug="remote-balance")
+        remote_student = StudentProfileFactory(branch=remote_branch, current_cohort=None)
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=local_branch)
+
+    response = as_user(tenant_a, actor).get(f"{OUTSTANDING_URL}?student={remote_student.pk}")
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+def test_outstanding_returns_not_found_for_missing_student(tenant_a, as_role):
+    client, _ = as_role(Role.DIRECTOR)
+
+    response = client.get(f"{OUTSTANDING_URL}?student=2147483647")
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+def test_local_finance_grant_cannot_borrow_stale_owner_membership_scope(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    """An unrelated owner-shaped assignment cannot globalize another grant.
+
+    This models an incomplete canonical migration: the protected director type
+    remains assigned but its grants were narrowed to finance:write. Read
+    authorization comes only from a separate branch-local account type, so the
+    write membership cannot lend organization scope to the read operation.
+    """
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.org.tests.factories import BranchFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        local_branch = BranchFactory(name="Local Finance", slug="local-finance")
+        remote_branch = BranchFactory(name="Remote Finance", slug="remote-finance")
+        local_type = AccountType.objects.create(
+            name="Local fee reader",
+            slug="local-fee-reader",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=local_type,
+            permission="finance:read",
+        )
+        stale_owner_type = AccountType.objects.get(
+            is_system=True,
+            slug=Role.DIRECTOR,
+        )
+        stale_owner_type.permission_rows.all().delete()
+        AccountTypePermission.objects.create(
+            account_type=stale_owner_type,
+            permission="finance:write",
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=local_branch,
+            account_type=local_type,
+            role=local_type.compatibility_role,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=remote_branch,
+            account_type=stale_owner_type,
+            role=Role.DIRECTOR,
+        )
+        local_schedule = FeeScheduleFactory(
+            name="Local schedule",
+            cohort=CohortFactory(branch=local_branch),
+        )
+        remote_schedule = FeeScheduleFactory(
+            name="Remote schedule",
+            cohort=CohortFactory(branch=remote_branch),
+        )
+        local_invoice = InvoiceFactory(
+            number="INV-LOCAL-GRANT-SCOPE",
+            student=StudentProfileFactory(branch=local_branch),
+        )
+        remote_invoice = InvoiceFactory(
+            number="INV-REMOTE-STALE-OWNER",
+            student=StudentProfileFactory(branch=remote_branch),
+        )
+        actor.refresh_from_db()
+
+    client = as_user(tenant_a, actor)
+    fee_response = client.get(FEE_URL)
+    assert fee_response.status_code == 200, fee_response.content
+    assert {row["id"] for row in fee_response.json()["data"]} == {local_schedule.pk}
+    assert remote_schedule.pk not in {row["id"] for row in fee_response.json()["data"]}
+
+    invoice_response = client.get(INVOICES_URL)
+    assert invoice_response.status_code == 200, invoice_response.content
+    assert {row["id"] for row in invoice_response.json()["data"]} == {local_invoice.pk}
+    assert remote_invoice.pk not in {row["id"] for row in invoice_response.json()["data"]}
+
+
+def test_selector_default_roles_exclude_inactive_account_types(tenant_a, user_in):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.finance import selectors
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(number="INV-INACTIVE-ACCOUNT-TYPE")
+        actor = user_in(tenant_a)
+        account_type = AccountType.objects.create(
+            name="Temporary finance reader",
+            slug="temporary-finance-reader",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=account_type,
+            permission="finance:read",
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=invoice.branch_at_issue,
+            account_type=account_type,
+            role=account_type.compatibility_role,
+        )
+        account_type.is_active = False
+        account_type.save(update_fields={"is_active"})
+        actor.refresh_from_db()
+
+        visible = selectors.scoped_invoice_summaries(user=actor)
+        assert not visible.filter(pk=invoice.pk).exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +543,48 @@ def test_fee_schedule_write_requires_finance_write(tenant_a, as_role):
         FEE_URL, {"name": "Y", "amount_uzs": "100000.00", "billing_period": "monthly"}, format="json"
     )
     assert ok.status_code == 201
+
+
+def test_branch_scoped_finance_writer_cannot_mutate_tenant_global_configuration(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Scoped finance", slug="scoped-finance")
+        cohort = CohortFactory(branch=branch)
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=branch)
+    client = as_user(tenant_a, actor)
+
+    global_fee = client.post(
+        FEE_URL,
+        {"name": "Global fee", "amount_uzs": "100.00", "billing_period": "monthly"},
+        format="json",
+    )
+    assert global_fee.status_code == 403
+    assert global_fee.json()["code"] == "out_of_scope"
+    global_method = client.post(
+        "/api/v1/finance/payment-methods/",
+        {"name": "Global method"},
+        format="json",
+    )
+    assert global_method.status_code == 403
+    assert global_method.json()["code"] == "out_of_scope"
+
+    scoped_fee = client.post(
+        FEE_URL,
+        {
+            "name": "Scoped fee",
+            "amount_uzs": "100.00",
+            "billing_period": "monthly",
+            "cohort": cohort.pk,
+        },
+        format="json",
+    )
+    assert scoped_fee.status_code == 201, scoped_fee.content
 
 
 def test_fee_schedule_authorized_detail_crud(tenant_a, as_role):
@@ -428,15 +737,47 @@ def test_cashier_can_only_read_and_close_own_shift(tenant_a, user_in, as_user):
     listing = client.get("/api/v1/finance/cashier-shifts/")
     assert listing.status_code == 200
     assert [row["id"] for row in listing.json()["data"]] == [own.pk]
-    assert client.get(f"/api/v1/finance/cashier-shifts/{other.pk}/").status_code == 403
+    assert client.get(f"/api/v1/finance/cashier-shifts/{other.pk}/").status_code == 404
     assert (
         client.post(
             f"/api/v1/finance/cashier-shifts/{other.pk}/close/",
             {"closing_cash_uzs": "0.00"},
             format="json",
         ).status_code
-        == 403
+        == 404
     )
+
+
+def test_cashier_scope_cannot_borrow_remote_accountant_identity(tenant_a, user_in, as_user):
+    from apps.finance import services
+    from apps.org.tests.factories import BranchFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        local_branch = BranchFactory(name="Local till", slug="local-till")
+        remote_branch = BranchFactory(name="Remote accounts", slug="remote-accounts")
+    actor = user_in(tenant_a, roles=[Role.CASHIER], branch=local_branch)
+    local_other = user_in(tenant_a, roles=[Role.CASHIER], branch=local_branch)
+    remote_other = user_in(tenant_a, roles=[Role.CASHIER], branch=remote_branch)
+    with schema_context(tenant_a.schema_name):
+        RoleMembership.objects.create(
+            user=actor,
+            branch=remote_branch,
+            role=Role.ACCOUNTANT,
+        )
+        actor.refresh_from_db()
+        local_own_shift = services.open_cashier_shift(cashier=actor, branch=local_branch)
+        local_other_shift = services.open_cashier_shift(cashier=local_other, branch=local_branch)
+        remote_other_shift = services.open_cashier_shift(cashier=remote_other, branch=remote_branch)
+
+    client = as_user(tenant_a, actor)
+    listing = client.get("/api/v1/finance/cashier-shifts/")
+    assert listing.status_code == 200, listing.content
+    visible_ids = {row["id"] for row in listing.json()["data"]}
+    assert visible_ids == {local_own_shift.pk, remote_other_shift.pk}
+    assert local_other_shift.pk not in visible_ids
+    assert client.get(f"/api/v1/finance/cashier-shifts/{local_other_shift.pk}/").status_code == 404
+    assert client.get(f"/api/v1/finance/cashier-shifts/{remote_other_shift.pk}/").status_code == 200
 
 
 # --------------------------------------------------------------------------- #
@@ -447,13 +788,18 @@ def test_cashier_can_only_read_and_close_own_shift(tenant_a, user_in, as_user):
 def test_statement_request_returns_202(tenant_a, user_in, as_user, monkeypatch):
     from apps.finance import services as fin_services
 
-    monkeypatch.setattr(fin_services, "render_statement_pdf", lambda *, student, locale="en": b"%PDF")
+    monkeypatch.setattr(
+        fin_services,
+        "render_statement_pdf",
+        lambda *, student, locale="en", invoice_ids=None: b"%PDF",
+    )
     monkeypatch.setattr(
         "infrastructure.storage.s3_client.upload_bytes",
         lambda key, data, *, content_type="application/octet-stream": key,
     )
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory()
+        InvoiceFactory(student=student)
     accountant = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=student.branch)
     client = as_user(tenant_a, accountant)
     resp = client.post(f"/api/v1/finance/students/{student.pk}/statement/", {"locale": "en"}, format="json")
@@ -482,8 +828,19 @@ def test_statement_request_rejects_missing_student_before_enqueue(tenant_a, as_r
 def test_statement_result_authorized_done_path(tenant_a, as_role, monkeypatch):
     from django.core.cache import cache
 
-    client, _ = as_role(Role.DIRECTOR)
-    cache.set(f"finance:statement:{tenant_a.schema_name}:task-ready", "statements/ready.pdf")
+    client, actor = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory()
+    key = f"{tenant_a.schema_name}/documents/statement_{invoice.student_id}_20260802112233_{'a' * 32}.pdf"
+    cache.set(
+        f"finance:statement:{tenant_a.schema_name}:task-ready",
+        {
+            "key": key,
+            "requested_by_id": actor.pk,
+            "student_id": invoice.student_id,
+            "invoice_ids": [invoice.pk],
+        },
+    )
     monkeypatch.setattr(
         "infrastructure.storage.s3_client.presign_download",
         lambda key, *, expires_in: f"signed:{key}:{expires_in}",
@@ -492,8 +849,73 @@ def test_statement_result_authorized_done_path(tenant_a, as_role, monkeypatch):
     assert response.status_code == 200
     assert response.json()["data"] == {
         "status": "done",
-        "url": "signed:statements/ready.pdf:600",
+        "url": f"signed:{key}:600",
     }
+
+
+def test_statement_result_rechecks_every_artifact_invoice_scope(
+    tenant_a,
+    user_in,
+    as_user,
+    monkeypatch,
+):
+    from django.core.cache import cache
+
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        historical_branch = BranchFactory(name="Historical statement", slug="historical-statement")
+        current_branch = BranchFactory(name="Current statement", slug="current-statement")
+        student = StudentProfileFactory(branch=current_branch)
+        historical_invoice = InvoiceFactory(
+            student=student,
+            branch_at_issue=historical_branch,
+        )
+        current_invoice = InvoiceFactory(
+            student=student,
+            branch_at_issue=current_branch,
+        )
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=current_branch)
+    key = f"{tenant_a.schema_name}/documents/statement_{student.pk}_20260802112233_{'b' * 32}.pdf"
+    cache.set(
+        f"finance:statement:{tenant_a.schema_name}:task-stale-scope",
+        {
+            "key": key,
+            "requested_by_id": actor.pk,
+            "student_id": student.pk,
+            "invoice_ids": sorted([historical_invoice.pk, current_invoice.pk]),
+        },
+    )
+    monkeypatch.setattr(
+        "infrastructure.storage.s3_client.presign_download",
+        lambda *_args, **_kwargs: pytest.fail("an artifact outside current scope must never be signed"),
+    )
+
+    response = as_user(tenant_a, actor).get("/api/v1/finance/statements/task-stale-scope/")
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
+def test_statement_result_rejects_cross_tenant_or_legacy_cache_key(tenant_a, as_role, monkeypatch):
+    from django.core.cache import cache
+
+    client, actor = as_role(Role.DIRECTOR)
+    cache.set(
+        f"finance:statement:{tenant_a.schema_name}:task-untrusted",
+        {
+            "key": "another_tenant/documents/statement_17_20260802112233.pdf",
+            "requested_by_id": actor.pk,
+            "student_id": 17,
+        },
+    )
+    monkeypatch.setattr(
+        "infrastructure.storage.s3_client.presign_download",
+        lambda *_args, **_kwargs: pytest.fail("an untrusted statement key must never be signed"),
+    )
+
+    response = client.get("/api/v1/finance/statements/task-untrusted/")
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
 
 
 # --------------------------------------------------------------------------- #
@@ -507,10 +929,12 @@ def test_invoice_list_query_budget(as_role, tenant_a, django_assert_max_num_quer
         student = StudentProfileFactory()
         for _ in range(20):
             InvoiceFactory(student=student, total_uzs=Decimal("100000.00"))
-    # +1 for billing paywall middleware subscription check
-    with django_assert_max_num_queries(10):  # +1: A-2 per-request permission-override load
+    # The register is a scalar summary query: no line/allocation prefetches. +1 for
+    # billing paywall and +1 for the per-request permission-override load.
+    with django_assert_max_num_queries(8):
         body = client.get(INVOICES_URL).json()
     assert set(body) == {"success", "data", "pagination"}
+    assert all("lines" not in row and "allocations" not in row for row in body["data"])
 
 
 # --------------------------------------------------------------------------- #
@@ -533,3 +957,66 @@ def test_invoice_list_includes_readable_name_companions(tenant_a, as_role):
     assert "student_name" in row
     assert row["cohort_name"] == "Algebra A"
     assert row["fee_schedule_name"] == "Monthly Tuition"
+
+
+def test_invoice_list_is_lightweight_and_reports_exact_outstanding_while_detail_is_full(
+    tenant_a,
+    as_role,
+):
+    from apps.finance.models import Invoice, InvoiceLine, PaymentAllocation
+
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(
+            status=Invoice.Status.PARTIALLY_PAID,
+            total_uzs=Decimal("150000.00"),
+        )
+        InvoiceLine.objects.create(
+            invoice=invoice,
+            description="Tuition",
+            line_type=InvoiceLine.LineType.TUITION,
+            quantity=Decimal("1.00"),
+            unit_price_uzs=Decimal("150000.00"),
+            amount_uzs=Decimal("150000.00"),
+        )
+        PaymentAllocation.objects.create(
+            invoice=invoice,
+            payment_id=991001,
+            amount_uzs=Decimal("40000.00"),
+        )
+
+    register_row = next(
+        row for row in client.get(INVOICES_URL, {"page_size": 100}).json()["data"] if row["id"] == invoice.pk
+    )
+    assert register_row["total_uzs"] == "150000.00"
+    assert register_row["outstanding_uzs"] == "110000.00"
+    assert "lines" not in register_row
+    assert "allocations" not in register_row
+
+    detail = client.get(f"{INVOICES_URL}{invoice.pk}/").json()["data"]
+    assert detail["outstanding_uzs"] == "110000.00"
+    assert len(detail["lines"]) == 1
+    assert len(detail["allocations"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("draft", "0.00"),
+        ("void", "0.00"),
+        ("paid", "0.00"),
+        ("issued", "150000.00"),
+        ("overdue", "150000.00"),
+    ],
+)
+def test_invoice_list_outstanding_respects_receivable_status(tenant_a, as_role, status, expected):
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(status=status, total_uzs=Decimal("150000.00"))
+
+    row = next(
+        item
+        for item in client.get(INVOICES_URL, {"page_size": 100}).json()["data"]
+        if item["id"] == invoice.pk
+    )
+    assert row["outstanding_uzs"] == expected

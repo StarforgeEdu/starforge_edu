@@ -82,6 +82,17 @@ class LessonFileAdmin(admin.ModelAdmin):
     list_display = ("title", "status", "content_type", "size_bytes", "version", "download_count")
     list_filter = ("status",)
     search_fields = ("title", "s3_key")
+    readonly_fields = (
+        "s3_key",
+        "thumbnail_key",
+        "status",
+        "reject_reason",
+        "size_bytes",
+        "view_count",
+        "download_count",
+        "created_at",
+        "updated_at",
+    )
     autocomplete_fields = (
         "lesson",
         "folder",

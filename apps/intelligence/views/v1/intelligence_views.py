@@ -1,6 +1,6 @@
 """Intelligence HTTP views (layered, off DRF).
 
-Seven read-only A-3 facets (transparent rules, no black box): dropout-risk list +
+Read-only A-3 facets (transparent rules, no black box): executive snapshot, dropout-risk list +
 detail, branch ranking, family-health retention feed, a student's journey timeline,
 the risk rules, and teacher engagement. All are GET. Every facet is scoped in the
 view (which students/branches/teachers the caller may see) and rendered from the
@@ -9,29 +9,63 @@ preserved apps.intelligence.selectors read layer via IIntelligenceService.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
+from django.conf import settings
+from django.core.cache import cache
 from django.db.models import Q
 from django.http import HttpRequest, HttpResponse
+from django.utils import timezone, translation
+from django.utils.cache import patch_vary_headers
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 
+from apps.intelligence.dto import ExecutiveSummaryContext
+from apps.intelligence.executive import (
+    EXECUTIVE_CACHE_SECONDS,
+    executive_cache_key,
+    included_executive_sections,
+    parse_executive_query,
+    resolve_executive_scope,
+)
 from apps.intelligence.interfaces.services import IIntelligenceService
+from apps.intelligence.openapi_contracts import (
+    EXECUTIVE_GET_CONTRACT,
+    EXECUTIVE_HEAD_CONTRACT,
+)
 from apps.org.models import Branch
+from apps.org.selectors import get_center_settings
 from apps.students.models import StudentProfile
 from apps.students.selectors import scoped_students
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
-from core.listing import paginate_sequence
+from core.listing import (
+    DEFAULT_PAGE_SIZE,
+    paginate_sequence,
+    positive_int_filter,
+    validate_pagination_filters,
+)
+from core.openapi_contracts import openapi_contract
 from core.permissions import (
-    Role,
     _request_overrides,
     get_user_roles,
     has_permission_code,
 )
 from core.responses import error, success
-from core.scoping import permission_membership_scope_q, permission_membership_scopes
+from core.role_principals import request_role_principal
+from core.scoping import (
+    is_permission_unscoped,
+    permission_membership_branch_wide_ids,
+    permission_membership_scope_q,
+    permission_membership_scopes,
+    request_permission_membership_allows,
+)
+from core.utils import stable_hash
+
+logger = logging.getLogger("starforge.intelligence")
 
 # Only STAFF memberships grant a branch scope for the intelligence facets — a
 # student/parent membership must never (e.g. via an A-2 grant of intelligence:read)
@@ -44,6 +78,25 @@ def _service() -> IIntelligenceService:
 
 def _method_not_allowed() -> HttpResponse:
     return error("Method not allowed.", code="method_not_allowed", status=405)
+
+
+def _validate_query(request: HttpRequest, *, allowed: set[str]) -> None:
+    """Reject ambiguous or misspelled decision-register selectors."""
+    unknown = sorted(set(request.GET) - allowed)
+    if unknown:
+        raise ValidationException(
+            "Unknown query parameter.",
+            code="validation_error",
+            fields={field: ["Unknown query parameter."] for field in unknown},
+        )
+    duplicates = sorted(name for name in request.GET if len(request.GET.getlist(name)) != 1)
+    if duplicates:
+        raise ValidationException(
+            "Query parameter may be supplied only once.",
+            code="validation_error",
+            fields={field: ["Supply this parameter once."] for field in duplicates},
+        )
+    validate_pagination_filters(request)
 
 
 def _page_results(request: HttpRequest, payload: dict[str, Any]) -> dict[str, Any]:
@@ -59,6 +112,47 @@ def _page_results(request: HttpRequest, payload: dict[str, Any]) -> dict[str, An
     }
 
 
+def _page_values(request: HttpRequest) -> tuple[int, int]:
+    return (
+        positive_int_filter(request, "page") or 1,
+        positive_int_filter(request, "page_size") or DEFAULT_PAGE_SIZE,
+    )
+
+
+def _executive_response(
+    request: HttpRequest,
+    payload: dict[str, Any],
+) -> HttpResponse:
+    """Return a private conditional response for one already-scoped payload."""
+
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    etag = f'"{stable_hash(encoded)}"'
+    if _if_none_match(request.headers.get("If-None-Match", ""), etag):
+        response = HttpResponse(status=304)
+    else:
+        response = success(payload)
+    response["ETag"] = etag
+    # The server-side snapshot cache is short-lived, but a management browser
+    # must revalidate on every navigation so revoking its bearer session cannot
+    # leave a fresh protected response reusable from the browser cache.
+    response["Cache-Control"] = "private, no-cache, max-age=0, must-revalidate"
+    patch_vary_headers(response, ("Accept-Language", "Authorization"))
+    return response
+
+
+def _if_none_match(header: str, etag: str) -> bool:
+    """Weak comparison is correct for GET/HEAD ``If-None-Match``."""
+
+    if not header:
+        return False
+    expected = etag.removeprefix("W/")
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate == "*" or candidate.removeprefix("W/") == expected:
+            return True
+    return False
+
+
 def _can_see_finance(request: HttpRequest) -> bool:
     """Whether to include the overdue-payment flag — only callers who may see
     finance (finance:read / superuser) get the financial signal."""
@@ -66,7 +160,7 @@ def _can_see_finance(request: HttpRequest) -> bool:
     if req.user.is_superuser:
         return True
     roles = get_user_roles(req)
-    if Role.DIRECTOR in roles:
+    if is_permission_unscoped(request, permission="finance:read"):
         return True
     if not has_permission_code(roles, "finance:read", _request_overrides(req)):
         return False
@@ -87,28 +181,54 @@ def _can_see_finance(request: HttpRequest) -> bool:
     return bool(intelligence_scopes) and all(
         any(
             finance.branch_id == intelligence.branch_id
-            and (finance.department_id is None or finance.department_id == intelligence.department_id)
+            # Legacy risk/family selectors accept one finance flag but do not
+            # carry immutable department boundaries into their invoice
+            # subqueries. Only a branch-wide finance grant is therefore safe;
+            # an exact department grant must not become a same-branch arrears
+            # oracle. The executive summary has its own exact snapshot scope.
+            and finance.department_id is None
             for finance in finance_scopes
         )
         for intelligence in intelligence_scopes
     )
 
 
-def _scoped_branches(request: HttpRequest):
-    """Branches the caller may rank: the director/superuser sees every (live) branch,
-    a branch-scoped STAFF role sees only the branch(es) they belong to, non-staff none."""
-    qs = Branch.objects.filter(archived_at__isnull=True)
+def _branch_wide_permission_intersection(
+    request: HttpRequest,
+    *permissions: str,
+) -> set[int] | None:
+    """Exact branch intersection, or ``None`` for organization-wide access."""
+    if request.user.is_superuser:
+        return None
     roles = get_user_roles(request)
-    if request.user.is_superuser or Role.DIRECTOR in roles:
-        return qs
-    return qs.filter(
-        permission_membership_scope_q(
+    allowed: set[int] | None = None
+    for permission in permissions or ("intelligence:read",):
+        if is_permission_unscoped(
+            request,
+            permission=permission,
+            account_kinds={"staff", "teacher"},
+        ):
+            continue
+        branch_ids = permission_membership_branch_wide_ids(
             roles=roles,
-            permission="intelligence:read",
-            branch_field="id",
+            permission=permission,
             account_kinds={"staff", "teacher"},
         )
-    )
+        allowed = branch_ids if allowed is None else allowed & branch_ids
+    return allowed
+
+
+def _scoped_branches(request: HttpRequest, *permissions: str):
+    """Branches covered branch-wide by every requested permission.
+
+    Branch ranking and family-health selectors have no department dimension. A
+    department-only membership therefore cannot be safely widened to its whole
+    branch. Multiple permissions are intersected membership-by-membership so a
+    parents grant in Branch B cannot be borrowed for intelligence in Branch A.
+    """
+    qs = Branch.objects.filter(archived_at__isnull=True)
+    allowed = _branch_wide_permission_intersection(request, *permissions)
+    return qs if allowed is None else qs.filter(pk__in=allowed)
 
 
 def _scoped_teachers(request: HttpRequest):
@@ -120,7 +240,7 @@ def _scoped_teachers(request: HttpRequest):
 
     base = TeacherProfile.objects.select_related("user")
     roles = get_user_roles(request)
-    if request.user.is_superuser or Role.DIRECTOR in roles:
+    if is_permission_unscoped(request, permission="intelligence:read"):
         return base
     staff_scope = permission_membership_scope_q(
         roles=roles,
@@ -140,13 +260,31 @@ def _scoped_teachers(request: HttpRequest):
 
 
 def _is_family(request: HttpRequest, student) -> bool:
-    """The student themselves, or one of their guardians."""
-    user: Any = request.user
-    if student.user_id == user.id:
-        return True
+    """Whether the exact signed-in role principal owns this family relation.
+
+    The compatibility ``User`` bridge may back staff, teacher, parent, and
+    student accounts simultaneously. It is not an authorization identity.
+    """
+    kind = str(getattr(request, "principal_kind", "") or "")
+    if kind not in {"", "student", "parent"}:
+        return False
+    try:
+        principal = request_role_principal(
+            request,
+            allowed_kinds={"student", "parent"},
+        )
+    except PermissionException:
+        return False
+    if principal.kind == "student":
+        return principal.principal_id == student.pk
     from apps.parents.models import Guardian
 
-    return Guardian.objects.filter(student=student, parent__user=user).exists()
+    return Guardian.objects.filter(
+        student=student,
+        parent_id=principal.principal_id,
+        parent__user_id=principal.user_id,
+        revoked_at__isnull=True,
+    ).exists()
 
 
 def _scoped_risk_students(request: HttpRequest):
@@ -160,7 +298,7 @@ def _scoped_risk_students(request: HttpRequest):
 
     roles = get_user_roles(request)
     qs = StudentProfile.objects.select_related("user", "branch", "current_cohort")
-    if request.user.is_superuser or Role.DIRECTOR in roles:
+    if is_permission_unscoped(request, permission="intelligence:read"):
         return qs
     visible = permission_membership_scope_q(
         roles=roles,
@@ -179,28 +317,116 @@ def _scoped_risk_students(request: HttpRequest):
     return qs.filter(visible).distinct()
 
 
+@openapi_contract(
+    path="/api/v1/intelligence/executive-summary/",
+    operations=(EXECUTIVE_GET_CONTRACT, EXECUTIVE_HEAD_CONTRACT),
+)
+@csrf_exempt
+@require_auth
+def executive_summary_view(request: HttpRequest) -> HttpResponse:
+    """One permission-pruned snapshot for a leadership workspace.
+
+    Scope filters are resolved against the exact staff membership that grants
+    ``intelligence:read``.  Each optional domain section is then included only
+    when its own read permission covers that entire selected scope.
+    """
+
+    if request.method not in ("GET", "HEAD"):
+        return _method_not_allowed()
+    check_perm(request, "intelligence:read")
+    branch_id, department_id, window = parse_executive_query(request)
+    scope = resolve_executive_scope(
+        request,
+        branch_id=branch_id,
+        department_id=department_id,
+    )
+    principal = request_role_principal(
+        request,
+        allowed_kinds={"staff"},
+        error_code="management_principal_unavailable",
+    )
+    included_sections = included_executive_sections(request, scope)
+    center_settings = get_center_settings()
+    requested_locale = translation.get_language()
+    if not request.headers.get("Accept-Language") and center_settings.default_language:
+        requested_locale = center_settings.default_language
+    locale = (requested_locale or settings.LANGUAGE_CODE).replace("_", "-").lower()
+    # Finance storage is still explicitly Decimal-major ``*_uzs``.  Do not
+    # relabel those values with a configurable presentation currency until the
+    # versioned multi-currency migration supplies converted amounts.
+    currency = "UZS"
+    cache_seconds = max(
+        30,
+        min(
+            60,
+            int(
+                getattr(
+                    settings,
+                    "EXECUTIVE_SUMMARY_CACHE_SECONDS",
+                    EXECUTIVE_CACHE_SECONDS,
+                )
+            ),
+        ),
+    )
+    key = executive_cache_key(
+        request,
+        scope=scope,
+        window=window,
+        included_sections=included_sections,
+        locale=locale,
+        currency=currency,
+        user_id=principal.user_id,
+        principal_kind=principal.kind,
+        principal_id=principal.principal_id,
+    )
+    try:
+        payload = cache.get(key)
+    except Exception:
+        # The snapshot cache is an optimization, not an authorization source.
+        # A Redis incident must not turn an otherwise healthy, authoritative SQL
+        # dashboard into a 500. Avoid the key in logs because it fingerprints the
+        # caller's exact permission/scope combination.
+        logger.warning("Executive summary cache read failed.", exc_info=True)
+        payload = None
+    if not isinstance(payload, dict):
+        payload = _service().executive_summary(
+            context=ExecutiveSummaryContext(
+                generated_at=timezone.now(),
+                scope=scope,
+                window=window,
+                locale=locale,
+                currency=currency,
+                included_sections=included_sections,
+                user_id=principal.user_id,
+                principal_kind=principal.kind,
+                principal_id=principal.principal_id,
+            )
+        )
+        try:
+            cache.set(key, payload, timeout=cache_seconds)
+        except Exception:
+            logger.warning("Executive summary cache write failed.", exc_info=True)
+    return _executive_response(request, payload)
+
+
 @csrf_exempt
 @require_auth
 def risk_list_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "intelligence:read")
+    _validate_query(request, allowed={"cohort", "page", "page_size"})
     qs = _scoped_risk_students(request)
-    cohort = request.GET.get("cohort")
-    if cohort:
-        try:
-            cohort_id = int(cohort)
-        except ValueError:
-            raise ValidationException(
-                "Invalid query parameter.",
-                code="invalid_query_param",
-                fields={"cohort": ["Must be an integer."]},
-            ) from None
+    cohort_id = positive_int_filter(request, "cohort")
+    if cohort_id is not None:
         qs = qs.filter(current_cohort_id=cohort_id)
+    page, page_size = _page_values(request)
     return success(
-        _page_results(
-            request,
-            _service().risk_list(students=qs, include_finance=_can_see_finance(request)),
+        _service().risk_list(
+            students=qs,
+            include_finance=_can_see_finance(request),
+            page=page,
+            page_size=page_size,
         )
     )
 
@@ -211,6 +437,7 @@ def risk_detail_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "intelligence:read")
+    _validate_query(request, allowed=set())
     student = _scoped_risk_students(request).filter(pk=student_id).first()
     if student is None:
         raise NotFoundException(_("Student not found."), code="not_found")
@@ -223,6 +450,7 @@ def branch_ranking_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "intelligence:read")
+    _validate_query(request, allowed={"page", "page_size"})
     return success(
         _page_results(
             request,
@@ -239,22 +467,26 @@ def family_health_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "intelligence:read")
-    # Naming a family + surfacing their children's risk needs family-record
-    # visibility — gate out teachers (intelligence:read but no parents:read).
-    req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
-    if not (
-        req.user.is_superuser
-        or has_permission_code(get_user_roles(req), "parents:read", _request_overrides(req))
-    ):
+    _validate_query(request, allowed={"page", "page_size"})
+    # Naming a family + surfacing children's risk needs parents:read at the
+    # same branch-wide scope. An unrelated grant must not make an empty/denied
+    # result look like a legitimate zero-family register.
+    branch_ids = _branch_wide_permission_intersection(
+        request,
+        "intelligence:read",
+        "parents:read",
+    )
+    if branch_ids == set():
         raise PermissionException(
             _("Family health needs visibility of family records."), code="not_permitted"
         )
+    visible_branches = Branch.objects.filter(archived_at__isnull=True)
+    if branch_ids is not None:
+        visible_branches = visible_branches.filter(pk__in=branch_ids)
     return success(
         _page_results(
             request,
-            _service().family_health(
-                branches=_scoped_branches(request), include_finance=_can_see_finance(request)
-            ),
+            _service().family_health(branches=visible_branches, include_finance=_can_see_finance(request)),
         )
     )
 
@@ -267,19 +499,35 @@ def student_journey_view(request: HttpRequest, student_id: int) -> HttpResponse:
     everywhere else, can't read it). Invoices need finance:read or being the family."""
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
+    _validate_query(request, allowed=set())
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     roles = get_user_roles(req)
     student = scoped_students(user=request.user, roles=roles).filter(pk=student_id).first()
     if student is None:
         raise NotFoundException(_("Student not found."), code="not_found")
-    overrides = _request_overrides(req)
     is_family = _is_family(request, student)
-    # scoped_students alone would admit any STAFF_ROLES member (incl. IT) — require the
-    # real read perm for staff; an out-of-scope caller gets 404 (no existence leak).
-    if not (request.user.is_superuser or is_family or has_permission_code(roles, "students:read", overrides)):
+    cohort = student.current_cohort
+    department_id = cohort.department_id if cohort is not None else None
+    can_read_student = request_permission_membership_allows(
+        request,
+        permission="students:read",
+        branch_id=student.branch_id,
+        department_id=department_id,
+        account_kinds={"staff", "teacher"},
+    )
+    # Out-of-scope callers receive 404 so this endpoint cannot confirm a student id.
+    if not (request.user.is_superuser or is_family or can_read_student):
         raise NotFoundException(_("Student not found."), code="not_found")
     include_finance = (
-        request.user.is_superuser or is_family or has_permission_code(roles, "finance:read", overrides)
+        request.user.is_superuser
+        or is_family
+        or request_permission_membership_allows(
+            request,
+            permission="finance:read",
+            branch_id=student.branch_id,
+            department_id=department_id,
+            account_kinds={"staff", "teacher"},
+        )
     )
     return success(_service().student_journey(student=student, include_finance=include_finance))
 
@@ -290,6 +538,7 @@ def rules_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "intelligence:read")
+    _validate_query(request, allowed=set())
     return success(_service().rules())
 
 
@@ -299,4 +548,12 @@ def teacher_engagement_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "intelligence:read")
-    return success(_page_results(request, _service().teacher_engagement(teachers=_scoped_teachers(request))))
+    _validate_query(request, allowed={"page", "page_size"})
+    page, page_size = _page_values(request)
+    return success(
+        _service().teacher_engagement(
+            teachers=_scoped_teachers(request),
+            page=page,
+            page_size=page_size,
+        )
+    )

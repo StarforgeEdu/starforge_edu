@@ -12,15 +12,16 @@ from apps.org.presenters import transfer_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException
-from core.http import int_field, read_json, trimmed_str_field
+from core.http import int_field, read_json, reject_unknown_fields, trimmed_str_field
 from core.listing import apply_filters, paginate
 from core.permissions import get_user_roles
 from core.responses import created, error, paginated, success
-from core.scoping import is_unscoped, permission_membership_branch_ids
+from core.scoping import is_permission_unscoped, permission_membership_branch_wide_ids
 
 _RESOURCE = "org"
-_FILTERS = ("user", "from_branch", "to_branch")
+_FILTERS = ("student", "from_branch", "to_branch")
 _ORDERING = ("created_at",)
+_CREATE_FIELDS = frozenset({"student", "to_branch", "reason"})
 
 
 def _service() -> IBranchTransferService:
@@ -35,9 +36,12 @@ def _query(request: HttpRequest) -> QuerySet[BranchTransfer]:
     Branch B -> C personnel movements merely because it can list branch names.
     """
     queryset = _service().list()
-    if is_unscoped(request):
+    if is_permission_unscoped(request, permission=f"{_RESOURCE}:read"):
         return queryset
-    allowed = permission_membership_branch_ids(
+    # Transfer rows have immutable branch attribution but no immutable
+    # department snapshot. Department-only grants cannot be narrowed safely and
+    # therefore see no transfer-person history.
+    allowed = permission_membership_branch_wide_ids(
         roles=get_user_roles(request),
         permission=f"{_RESOURCE}:read",
     )
@@ -62,20 +66,23 @@ def transfers_collection_view(request: HttpRequest) -> HttpResponse:
         permission = f"{_RESOURCE}:write"
         check_perm(request, permission)
         body = read_json(request)
-        student_id = int_field(body, "student", required=True)
-        to_branch_id = int_field(body, "to_branch", required=True)
+        reject_unknown_fields(body, allowed=_CREATE_FIELDS)
+        student_id = int_field(body, "student", required=True, min_value=1)
+        to_branch_id = int_field(body, "to_branch", required=True, min_value=1)
         reason = trimmed_str_field(body, "reason", max_length=64)
         roles = get_user_roles(request)
         allowed_branch_ids = (
             None
-            if is_unscoped(request)
-            else permission_membership_branch_ids(roles=roles, permission=permission)
+            if is_permission_unscoped(request, permission=permission)
+            else permission_membership_branch_wide_ids(roles=roles, permission=permission)
         )
         transfer = _service().transfer_student(
             student_id=student_id,  # type: ignore[arg-type]  # required parser guarantees int
             to_branch_id=to_branch_id,  # type: ignore[arg-type]
             reason=reason,
             actor=request.user,
+            actor_principal_kind=getattr(request, "principal_kind", ""),
+            actor_principal_id=getattr(request, "principal_id", None),
             allowed_branch_ids=allowed_branch_ids,
         )
         return created(transfer_to_dict(transfer))

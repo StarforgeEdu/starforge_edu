@@ -7,8 +7,14 @@ on demo.localhost:8000). Idempotent.
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import django
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.development")
 django.setup()
@@ -20,6 +26,7 @@ from django_tenants.utils import schema_context  # noqa: E402
 from apps.tenancy.models import Center  # noqa: E402
 from apps.tenancy.services import provision_center  # noqa: E402
 from apps.users.models import User  # noqa: E402
+from scripts.local_seed_safety import assert_local_seed_environment  # noqa: E402
 
 
 # Dev storage bootstrap (D2-E-8): expire abandoned tmp uploads, allow browser PUT.
@@ -35,7 +42,8 @@ def _tmp_lifecycle_config() -> dict:
         "Rules": [
             {
                 "ID": f"expire-tmp-uploads-{schema}",
-                "Filter": {"Prefix": f"{schema}/tmp/"},
+                # S3 lifecycle prefix, not a local temporary directory.
+                "Filter": {"Prefix": f"{schema}/tmp/"},  # nosec B108
                 "Status": "Enabled",
                 "Expiration": {"Days": 7},
             }
@@ -163,6 +171,9 @@ def _seed_demo_domain(actor: User) -> None:
 
 
 def main() -> None:
+    from django.conf import settings
+
+    assert_local_seed_environment(settings, project_root=PROJECT_ROOT)
     # Map the apex host to the public schema — without this Domain row,
     # django-tenants 404s http://localhost:8000/admin/ entirely.
     from django_tenants.utils import get_public_schema_name
@@ -213,8 +224,11 @@ def main() -> None:
         print(f"Center {slug} already exists")
 
     with schema_context(slug):
+        # ``admin`` belongs to the role-native local Director used by the CEO
+        # console seed. Keep Django administration a distinct principal so rerunning
+        # this seed can never promote the product account to superuser.
         admin, created = User.objects.get_or_create(
-            username="admin",
+            username="admin.django",
             defaults={
                 "phone": "+998901234567",
                 "is_staff": True,
@@ -227,7 +241,7 @@ def main() -> None:
             admin.is_staff = True
             admin.is_superuser = True
             admin.save()
-            print("created tenant superuser admin / starforge-dev (demo.localhost)")
+            print("created tenant superuser admin.django / starforge-dev (demo.localhost)")
         else:
             print("superuser already exists")
 

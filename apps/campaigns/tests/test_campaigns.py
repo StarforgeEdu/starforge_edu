@@ -15,8 +15,7 @@ CAMPAIGNS = "/api/v1/campaigns/"
 
 
 def _student(branch, *, status=None, cohort=None, with_phone=True):
-    """A student in `branch`; with_phone gives them a primary guardian whose user
-    carries a phone (the SMS target). Call inside schema_context."""
+    """A student in ``branch`` with an optional role-native family SMS target."""
     from apps.parents.tests.factories import GuardianFactory, ParentProfileFactory
     from apps.students.models import StudentProfile
     from apps.students.tests.factories import StudentProfileFactory
@@ -28,6 +27,10 @@ def _student(branch, *, status=None, cohort=None, with_phone=True):
         parent = ParentProfileFactory.create()  # parent.user gets a unique phone
         GuardianFactory.create(parent=parent, student=student, is_primary=True)
     else:
+        student.phone = ""
+        student.save(update_fields=["phone"])
+        # Keep the hidden bridge blank as a regression fixture: campaigns must
+        # never fall back to bridge PII after the role-native cutover.
         student.user.phone = None
         student.user.save(update_fields=["phone"])
     return student
@@ -193,7 +196,25 @@ def test_failed_send_is_recorded(tenant_a, user_in, as_user, monkeypatch):
     assert body["failed_count"] == 1
     recip = _recipients(client, cid)[0]
     assert recip["status"] == "failed"
-    assert recip["error"]  # the failure reason is captured for the audit trail
+    assert recip["error"] == "delivery_failed"
+    assert "gateway down" not in str(recip)
+
+    # Legacy rows may contain raw provider exceptions. The presenter must still
+    # reduce them to the stable public error code.
+    with schema_context(tenant_a.schema_name):
+        from apps.campaigns.models import Campaign, CampaignRecipient
+
+        CampaignRecipient.objects.filter(campaign_id=cid).update(
+            error="provider https://user:password@gateway/private failed"
+        )
+        Campaign.objects.filter(pk=cid).update(last_error="broker credential=secret")
+    legacy_recipient = _recipients(client, cid)[0]
+    legacy_campaign = client.get(f"{CAMPAIGNS}{cid}/").json()["data"]
+    assert legacy_recipient["error"] == "delivery_failed"
+    assert legacy_campaign["last_error"] == "delivery_failed"
+    assert "password" not in str(legacy_recipient)
+    assert "secret" not in str(legacy_campaign)
+
     again = _send(client, cid)
     assert again.status_code == 422
     assert again.json()["code"] == "campaign_delivery_failed"

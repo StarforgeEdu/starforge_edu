@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 
 from apps.students.models import StudentProfile
 
@@ -31,3 +32,24 @@ class TransitionDTO:
     to_status: str
     reason_code: str = ""
     note: str = ""
+
+
+@dataclass(frozen=True)
+class LeadershipProfileWindowDTO:
+    """Inclusive, organization-time window for one leadership profile."""
+
+    date_from: date
+    date_to: date
+
+
+@dataclass(frozen=True)
+class LeadershipProfileAccessDTO:
+    """Sections proven accessible for this exact student and request scope."""
+
+    academics: bool = False
+    assignments: bool = False
+    attendance: bool = False
+    teachers: bool = False
+    family: bool = False
+    safeguarding: bool = False
+    finance: bool = False

@@ -1,11 +1,11 @@
 """Notification receivers — the single bridge from domain signals to dispatch().
 
 Connected in ``NotificationsConfig.ready()``. Domain apps emit emit-only signals
-(inside ``transaction.on_commit``); these receivers resolve the recipient(s) and
-call ``services.dispatch()`` once per recipient. Each receiver runs inside the
-emitting tenant's schema (the signal carries ``schema_name`` for any cross-context
-re-dispatch, but since signals fire synchronously after commit on the request
-thread the schema is already active).
+(inside ``transaction.on_commit``); ordinary low-cardinality receivers resolve the
+recipient(s) and call ``services.dispatch()`` once per recipient. High-cardinality
+bulk schedule events enqueue one tenant-scoped coordinator instead, keeping the
+request commit path out of the lessons x recipients fan-out. Each receiver runs
+inside the emitting tenant's schema and every asynchronous hop carries that schema.
 
 Signal -> EventType -> recipient mapping table (D3-C-4):
 
@@ -19,6 +19,7 @@ Signal -> EventType -> recipient mapping table (D3-C-4):
 | schedule.lesson_reminder_due          | schedule.lesson_reminder        | cohort members (students)             |
 | schedule.lesson_cancelled             | schedule.lesson_reminder        | cohort members (students)             |
 | schedule.lesson_rescheduled           | schedule.lesson_reminder        | cohort members (students)             |
+| schedule.lessons_bulk_rescheduled     | schedule.lesson_reminder        | cohort members (async, bounded)       |
 | auth.login_succeeded                  | auth.new_device_login           | the logging-in user                   |
 | cohorts.cohort_member_moved           | students.enrollment_changed     | the student + guardians               |
 | finance.invoice_issued                | finance.invoice_issued          | payer (created_by) + primary guardian |
@@ -53,36 +54,80 @@ logger = logging.getLogger("starforge.notifications")
 # ---------------------------------------------------------------------------
 # Recipient resolution helpers
 # ---------------------------------------------------------------------------
-def _guardian_user_ids(student_id: int) -> list[int]:
+def _guardian_recipients(student_id: int) -> list[dict]:
     from apps.parents.models import Guardian
 
-    return list(Guardian.objects.filter(student_id=student_id).values_list("parent__user_id", flat=True))
+    return [
+        {"user_id": user_id, "principal_kind": "parent", "principal_id": parent_id}
+        for user_id, parent_id in Guardian.objects.filter(
+            student_id=student_id,
+            revoked_at__isnull=True,
+            parent__is_active=True,
+            parent__user__is_active=True,
+        ).values_list("parent__user_id", "parent_id")
+    ]
 
 
-def _primary_guardian_user_id(student_id: int) -> int | None:
+def _primary_guardian_recipient(student_id: int) -> dict | None:
     from apps.parents.models import Guardian
 
-    return (
-        Guardian.objects.filter(student_id=student_id, is_primary=True)
-        .values_list("parent__user_id", flat=True)
+    row = (
+        Guardian.objects.filter(
+            student_id=student_id,
+            is_primary=True,
+            revoked_at__isnull=True,
+            parent__is_active=True,
+            parent__user__is_active=True,
+        )
+        .values_list("parent__user_id", "parent_id")
         .first()
     )
+    if row is None:
+        return None
+    return {"user_id": row[0], "principal_kind": "parent", "principal_id": row[1]}
 
 
-def _student_user_id(student_id: int) -> int | None:
+def _student_recipient(student_id: int) -> dict | None:
     from apps.students.models import StudentProfile
 
-    return StudentProfile.objects.filter(pk=student_id).values_list("user_id", flat=True).first()
+    user_id = (
+        StudentProfile.objects.filter(pk=student_id, is_active=True, user__is_active=True)
+        .values_list("user_id", flat=True)
+        .first()
+    )
+    if user_id is None:
+        return None
+    return {"user_id": user_id, "principal_kind": "student", "principal_id": student_id}
 
 
-def _cohort_member_user_ids(cohort_id: int) -> list[int]:
+def _cohort_member_recipients(cohort_id: int) -> list[dict]:
     from apps.cohorts.models import CohortMembership
 
-    return list(
-        CohortMembership.objects.filter(cohort_id=cohort_id, end_date__isnull=True).values_list(
-            "student__user_id", flat=True
-        )
+    return [
+        {"user_id": user_id, "principal_kind": "student", "principal_id": student_id}
+        for user_id, student_id in CohortMembership.objects.filter(
+            cohort_id=cohort_id,
+            end_date__isnull=True,
+            student__is_active=True,
+            student__user__is_active=True,
+        ).values_list("student__user_id", "student_id")
+    ]
+
+
+def _staff_recipient(user_id: int | None) -> dict | None:
+    if user_id is None:
+        return None
+    from apps.org.models import StaffProfile
+
+    profile_id = (
+        StaffProfile.objects.filter(user_id=user_id, is_active=True).values_list("pk", flat=True).first()
     )
+    if profile_id is None:
+        # Preserve the row as quarantine evidence; dispatch's conservative
+        # resolver may still prove a different single role, but never guesses
+        # that a finance/approval actor is staff merely from a bridge User id.
+        return {"user_id": user_id}
+    return {"user_id": user_id, "principal_kind": "staff", "principal_id": profile_id}
 
 
 def _push_cohort_attendance(*, lesson_id: int, payload: dict) -> None:
@@ -110,12 +155,83 @@ _FANOUT_INLINE_MAX = 25
 _FANOUT_CHUNK = 100
 
 
-def _dispatch_many(*, user_ids, event_type: str, context: dict, dedupe_prefix: str | None = None) -> None:
-    unique = list(dict.fromkeys(uid for uid in user_ids if uid is not None))  # de-dupe, preserve order
+def _recipient_descriptor(value) -> dict | None:
+    """Normalize an exact descriptor or a legacy bridge recipient safely.
+
+    Old queued jobs and a few internal callers supplied a User id/object.  Keep
+    that compatibility boundary narrow: an id is promoted only when durable
+    evidence proves one role principal.  Ambiguous/missing evidence stays an
+    unattributed descriptor so ``dispatch`` quarantines it instead of sending
+    to every role sharing the bridge account.
+    """
+
+    if isinstance(value, dict):
+        user_id = value.get("user_id")
+        principal_kind = value.get("principal_kind")
+        principal_id = value.get("principal_id")
+    else:
+        user_id = (
+            value if isinstance(value, int) and not isinstance(value, bool) else getattr(value, "pk", None)
+        )
+        principal_kind = None
+        principal_id = None
+    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        return None
+    if principal_kind is not None or principal_id is not None:
+        return {
+            "user_id": user_id,
+            "principal_kind": principal_kind,
+            "principal_id": principal_id,
+        }
+
+    from apps.notifications.principals import resolve_recipient_principal
+
+    principal = resolve_recipient_principal(user_id=user_id)
+    descriptor: dict[str, object] = {"user_id": user_id}
+    if principal.is_deliverable and principal.kind is not None and principal.principal_id is not None:
+        descriptor.update(
+            principal_kind=principal.kind,
+            principal_id=principal.principal_id,
+        )
+    return descriptor
+
+
+def _dispatch_many(
+    *,
+    recipients=None,
+    user_ids=None,
+    event_type: str,
+    context: dict,
+    dedupe_prefix: str | None = None,
+) -> None:
+    if recipients is not None and user_ids is not None:
+        raise ValueError("Provide recipients or legacy user_ids, not both.")
+    unique: list[dict] = []
+    seen: set[tuple[object, object, object]] = set()
+    for value in recipients if recipients is not None else (user_ids or []):
+        recipient = _recipient_descriptor(value)
+        if recipient is None:
+            continue
+        key = (
+            recipient.get("user_id"),
+            recipient.get("principal_kind"),
+            recipient.get("principal_id"),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(recipient)
     if len(unique) <= _FANOUT_INLINE_MAX:
-        for uid in unique:
+        for recipient in unique:
+            uid = recipient["user_id"]
             dedupe_key = f"{dedupe_prefix}:{uid}" if dedupe_prefix else None
-            services.dispatch(event_type=event_type, recipient_id=uid, context=context, dedupe_key=dedupe_key)
+            services.dispatch(
+                event_type=event_type,
+                recipient_id=uid,
+                recipient_principal_kind=recipient.get("principal_kind"),
+                recipient_principal_id=recipient.get("principal_id"),
+                context=context,
+                dedupe_key=dedupe_key,
+            )
         return
     # Large fan-out -> chunked Celery (mirrors announce_cohort); same dedupe contract.
     from celery_tasks.notification_tasks import dispatch_many_chunk
@@ -124,7 +240,7 @@ def _dispatch_many(*, user_ids, event_type: str, context: dict, dedupe_prefix: s
     schema = current_schema()
     for i in range(0, len(unique), _FANOUT_CHUNK):
         dispatch_many_chunk.delay(
-            user_ids=unique[i : i + _FANOUT_CHUNK],
+            recipients=unique[i : i + _FANOUT_CHUNK],
             event_type=event_type,
             context=context,
             dedupe_prefix=dedupe_prefix,
@@ -136,19 +252,16 @@ def _dispatch_many(*, user_ids, event_type: str, context: dict, dedupe_prefix: s
 # Attendance (D2-B)
 # ---------------------------------------------------------------------------
 def _connect_attendance() -> None:
-    try:
-        from apps.attendance.signals import student_marked_absent, student_marked_late
-    except Exception:  # pragma: no cover - sibling lane not present
-        return
+    from apps.attendance.signals import student_marked_absent, student_marked_late
 
     @receiver(student_marked_absent, dispatch_uid="notifications.student_marked_absent", weak=False)
     def on_student_marked_absent(sender, *, record_id, student_id, lesson_id, auto, schema_name="", **kwargs):
         from apps.notifications.models import EventType
 
-        guardians = _guardian_user_ids(student_id)
+        guardians = _guardian_recipients(student_id)
         context = {"student_id": student_id, "lesson_id": lesson_id, "auto": auto}
         _dispatch_many(
-            user_ids=guardians,
+            recipients=guardians,
             event_type=EventType.ATTENDANCE_ABSENT,
             context=context,
             dedupe_prefix=f"attendance.absent:{record_id}",
@@ -174,7 +287,7 @@ def _connect_attendance() -> None:
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_guardian_user_ids(student_id),
+            recipients=_guardian_recipients(student_id),
             event_type=EventType.ATTENDANCE_LATE,
             context={"student_id": student_id, "lesson_id": lesson_id},
             dedupe_prefix=f"attendance.late:{record_id}",
@@ -195,10 +308,7 @@ def _connect_attendance() -> None:
 # Academics (D2-C) — grade_changed bridges to grades_published
 # ---------------------------------------------------------------------------
 def _connect_academics() -> None:
-    try:
-        from apps.academics.signals import grade_changed
-    except Exception:  # pragma: no cover
-        return
+    from apps.academics.signals import grade_changed
 
     @receiver(grade_changed, dispatch_uid="notifications.grade_changed", weak=False)
     def on_grade_changed(sender, *, instance, old_score, new_score, actor_id, schema_name="", **kwargs):
@@ -207,7 +317,7 @@ def _connect_academics() -> None:
         student_id = getattr(instance, "student_id", None)
         if student_id is None:
             return
-        recipients = [_student_user_id(student_id), *_guardian_user_ids(student_id)]
+        recipients = [_student_recipient(student_id), *_guardian_recipients(student_id)]
         context = {"student_id": student_id, "new_score": str(new_score)}
         # Dedupe per (result, new_score), NOT per result pk: a grade CORRECTION
         # (50->60 then 60->70) is a distinct event the student/parent must hear
@@ -215,7 +325,7 @@ def _connect_academics() -> None:
         # after the first. The score makes each distinct correction notify once
         # while a double-fire of the same overwrite still collapses.
         _dispatch_many(
-            user_ids=recipients,
+            recipients=recipients,
             event_type=EventType.ACADEMICS_GRADES_PUBLISHED,
             context=context,
             dedupe_prefix=f"academics.grades_published:{getattr(instance, 'pk', '')}:{new_score}",
@@ -226,21 +336,18 @@ def _connect_academics() -> None:
 # Assignments (D2-D)
 # ---------------------------------------------------------------------------
 def _connect_assignments() -> None:
-    try:
-        from apps.assignments.signals import (
-            assignment_due_soon,
-            assignment_published,
-            submission_graded,
-        )
-    except Exception:  # pragma: no cover
-        return
+    from apps.assignments.signals import (
+        assignment_due_soon,
+        assignment_published,
+        submission_graded,
+    )
 
     @receiver(assignment_published, dispatch_uid="notifications.assignment_published", weak=False)
     def on_assignment_published(sender, *, assignment_id, cohort_id, schema_name="", **kwargs):
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_cohort_member_user_ids(cohort_id),
+            recipients=_cohort_member_recipients(cohort_id),
             event_type=EventType.ASSIGNMENTS_CREATED,
             context={"assignment_id": assignment_id, "cohort_id": cohort_id},
             dedupe_prefix=f"assignments.created:{assignment_id}",
@@ -251,7 +358,7 @@ def _connect_assignments() -> None:
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_cohort_member_user_ids(cohort_id),
+            recipients=_cohort_member_recipients(cohort_id),
             event_type=EventType.ASSIGNMENTS_DUE_SOON,
             context={"assignment_id": assignment_id, "due_at": str(due_at)},
             dedupe_prefix=f"assignments.due_soon:{assignment_id}",
@@ -261,14 +368,18 @@ def _connect_assignments() -> None:
     def on_submission_graded(sender, *, submission_id, student_id, score, schema_name="", **kwargs):
         from apps.notifications.models import EventType
 
-        recipients = [_student_user_id(student_id), *_guardian_user_ids(student_id)]
+        recipients = [_student_recipient(student_id), *_guardian_recipients(student_id)]
         # Same correction issue as grade_changed: re-grading a submission
         # (grade_submission uses update_or_create) is a distinct event. Include
         # the score so each new grade notifies once and a double-fire collapses.
         _dispatch_many(
-            user_ids=recipients,
+            recipients=recipients,
             event_type=EventType.ASSIGNMENTS_GRADED,
-            context={"submission_id": submission_id, "score": str(score)},
+            context={
+                "submission_id": submission_id,
+                "student_id": student_id,
+                "score": str(score),
+            },
             dedupe_prefix=f"assignments.graded:{submission_id}:{score}",
         )
 
@@ -277,14 +388,12 @@ def _connect_assignments() -> None:
 # Schedule (D2-A)
 # ---------------------------------------------------------------------------
 def _connect_schedule() -> None:
-    try:
-        from apps.schedule.signals import (
-            lesson_cancelled,
-            lesson_reminder_due,
-            lesson_rescheduled,
-        )
-    except Exception:  # pragma: no cover
-        return
+    from apps.schedule.signals import (
+        lesson_cancelled,
+        lesson_reminder_due,
+        lesson_rescheduled,
+        lessons_bulk_rescheduled,
+    )
 
     def _lesson_recipients(lesson_id):
         from apps.schedule.models import Lesson
@@ -292,14 +401,14 @@ def _connect_schedule() -> None:
         cohort_id = Lesson.objects.filter(pk=lesson_id).values_list("cohort_id", flat=True).first()
         if cohort_id is None:
             return []
-        return _cohort_member_user_ids(cohort_id)
+        return _cohort_member_recipients(cohort_id)
 
     @receiver(lesson_reminder_due, dispatch_uid="notifications.lesson_reminder_due", weak=False)
     def on_lesson_reminder_due(sender, *, lesson_id, schema_name="", **kwargs):
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_lesson_recipients(lesson_id),
+            recipients=_lesson_recipients(lesson_id),
             event_type=EventType.SCHEDULE_LESSON_REMINDER,
             context={"lesson_id": lesson_id, "kind": "reminder"},
             dedupe_prefix=f"schedule.lesson_reminder:{lesson_id}",
@@ -310,7 +419,7 @@ def _connect_schedule() -> None:
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_lesson_recipients(lesson_id),
+            recipients=_lesson_recipients(lesson_id),
             event_type=EventType.SCHEDULE_LESSON_REMINDER,
             context={"lesson_id": lesson_id, "kind": "cancelled"},
             dedupe_prefix=f"schedule.lesson_cancelled:{lesson_id}",
@@ -327,10 +436,38 @@ def _connect_schedule() -> None:
         # move's old_start=A equals the 1st's). moved_at = the moved lesson's updated_at,
         # bumped on every save, so it is monotonic + unique per move and never repeats.
         _dispatch_many(
-            user_ids=_lesson_recipients(lesson_id),
+            recipients=_lesson_recipients(lesson_id),
             event_type=EventType.SCHEDULE_LESSON_REMINDER,
             context={"lesson_id": lesson_id, "kind": "rescheduled", "old_start": old_start},
             dedupe_prefix=f"schedule.lesson_rescheduled:{lesson_id}:{moved_at or old_start}",
+        )
+
+    @receiver(
+        lessons_bulk_rescheduled,
+        dispatch_uid="notifications.lessons_bulk_rescheduled",
+        weak=False,
+    )
+    def on_lessons_bulk_rescheduled(
+        sender,
+        *,
+        cohort_id,
+        moves,
+        schema_name="",
+        **kwargs,
+    ):
+        """Queue one coordinator; never resolve recipients on the request thread.
+
+        The coordinator streams the cohort once and publishes bounded child jobs.
+        Supplying ``schema_name`` explicitly preserves the tenant when the worker
+        executes after this request's schema context has gone away.
+        """
+        from celery_tasks.notification_tasks import coordinate_lesson_reschedule_fanout
+        from core.utils import current_schema
+
+        coordinate_lesson_reschedule_fanout.delay(
+            cohort_id=cohort_id,
+            moves=list(moves),
+            _schema_name=schema_name or current_schema(),
         )
 
 
@@ -338,10 +475,7 @@ def _connect_schedule() -> None:
 # Auth (D1-C) — new device login
 # ---------------------------------------------------------------------------
 def _connect_auth() -> None:
-    try:
-        from apps.auth.signals import login_succeeded
-    except Exception:  # pragma: no cover
-        return
+    from apps.auth.signals import login_succeeded
 
     @receiver(login_succeeded, dispatch_uid="notifications.login_succeeded", weak=False)
     def on_login_succeeded(
@@ -353,6 +487,8 @@ def _connect_auth() -> None:
         user_agent="",
         device_id="",
         is_new_device=False,
+        principal_kind="",
+        principal_id=None,
         schema_name="",
         **kwargs,
     ):
@@ -367,6 +503,8 @@ def _connect_auth() -> None:
         services.dispatch(
             event_type=EventType.AUTH_NEW_DEVICE_LOGIN,
             recipient_id=user_id,
+            recipient_principal_kind=principal_kind,
+            recipient_principal_id=principal_id,
             context={"ip": ip, "user_agent": user_agent},
             dedupe_key=f"auth.new_device_login:{user_id}:{device_fingerprint}",
         )
@@ -376,18 +514,15 @@ def _connect_auth() -> None:
 # Cohorts (D1-D) — enrollment changed (bridged from member-moved)
 # ---------------------------------------------------------------------------
 def _connect_cohorts() -> None:
-    try:
-        from apps.cohorts.signals import cohort_member_moved
-    except Exception:  # pragma: no cover
-        return
+    from apps.cohorts.signals import cohort_member_moved
 
     @receiver(cohort_member_moved, dispatch_uid="notifications.cohort_member_moved", weak=False)
     def on_cohort_member_moved(sender, *, student_id, to_cohort_id, schema_name="", **kwargs):
         from apps.notifications.models import EventType
 
-        recipients = [_student_user_id(student_id), *_guardian_user_ids(student_id)]
+        recipients = [_student_recipient(student_id), *_guardian_recipients(student_id)]
         _dispatch_many(
-            user_ids=recipients,
+            recipients=recipients,
             event_type=EventType.STUDENTS_ENROLLMENT_CHANGED,
             context={"student_id": student_id, "to_cohort_id": to_cohort_id},
         )
@@ -398,30 +533,24 @@ def _connect_cohorts() -> None:
 # ---------------------------------------------------------------------------
 def _invoice_recipients(invoice_id, student_id):
     """Payer (invoice.created_by) + the student's primary guardian."""
-    recipients: list[int | None] = []
-    try:
-        from apps.finance.models import Invoice
+    from apps.finance.models import Invoice
 
-        created_by = Invoice.objects.filter(pk=invoice_id).values_list("created_by_id", flat=True).first()
-        recipients.append(created_by)
-    except Exception:  # pragma: no cover - finance not merged yet
-        pass
-    recipients.append(_primary_guardian_user_id(student_id))
+    recipients: list[dict | None] = []
+    created_by = Invoice.objects.filter(pk=invoice_id).values_list("created_by_id", flat=True).first()
+    recipients.append(_staff_recipient(created_by))
+    recipients.append(_primary_guardian_recipient(student_id))
     return recipients
 
 
 def _connect_finance() -> None:
-    try:
-        from apps.finance.signals import invoice_issued, payment_reminder
-    except Exception:  # pragma: no cover - Lane A not merged yet
-        return
+    from apps.finance.signals import invoice_issued, payment_reminder
 
     @receiver(invoice_issued, dispatch_uid="notifications.invoice_issued", weak=False)
     def on_invoice_issued(sender, *, invoice_id, student_id, schema_name="", **kwargs):
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_invoice_recipients(invoice_id, student_id),
+            recipients=_invoice_recipients(invoice_id, student_id),
             event_type=EventType.FINANCE_INVOICE_ISSUED,
             context={"invoice_id": invoice_id, "student_id": student_id},
             dedupe_prefix=f"finance.invoice_issued:{invoice_id}",
@@ -445,7 +574,7 @@ def _connect_finance() -> None:
         # producer bucket when it is present.
         cycle = reminder_cycle or reminder_date or timezone.localdate().isoformat()
         _dispatch_many(
-            user_ids=_invoice_recipients(invoice_id, student_id),
+            recipients=_invoice_recipients(invoice_id, student_id),
             event_type=EventType.FINANCE_PAYMENT_REMINDER,
             context={
                 "invoice_id": invoice_id,
@@ -460,10 +589,7 @@ def _connect_finance() -> None:
 # Payments (D3-B) — payment completed / failed
 # ---------------------------------------------------------------------------
 def _connect_payments() -> None:
-    try:
-        from apps.payments.signals import payment_completed, payment_failed
-    except Exception:  # pragma: no cover - Lane B not merged yet
-        return
+    from apps.payments.signals import payment_completed, payment_failed
 
     @receiver(payment_completed, dispatch_uid="notifications.payment_completed", weak=False)
     def on_payment_completed(
@@ -472,9 +598,13 @@ def _connect_payments() -> None:
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_invoice_recipients(invoice_id, student_id),
+            recipients=_invoice_recipients(invoice_id, student_id),
             event_type=EventType.PAYMENTS_PAYMENT_COMPLETED,
-            context={"payment_id": payment_id, "amount_uzs": str(amount_uzs)},
+            context={
+                "payment_id": payment_id,
+                "student_id": student_id,
+                "amount_uzs": str(amount_uzs),
+            },
             dedupe_prefix=f"payments.payment_completed:{payment_id}",
         )
 
@@ -485,9 +615,13 @@ def _connect_payments() -> None:
         from apps.notifications.models import EventType
 
         _dispatch_many(
-            user_ids=_invoice_recipients(invoice_id, student_id),
+            recipients=_invoice_recipients(invoice_id, student_id),
             event_type=EventType.PAYMENTS_PAYMENT_FAILED,
-            context={"payment_id": payment_id, "amount_uzs": str(amount_uzs)},
+            context={
+                "payment_id": payment_id,
+                "student_id": student_id,
+                "amount_uzs": str(amount_uzs),
+            },
             dedupe_prefix=f"payments.payment_failed:{payment_id}",
         )
 

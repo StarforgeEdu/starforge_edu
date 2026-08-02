@@ -42,12 +42,22 @@ from core.http import bool_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
 from core.permissions import Role, _request_overrides, role_effective_permissions
 from core.responses import created, error, no_content, paginated, success
+from core.scoping import assert_permission_organization_scope
 
 _RESOURCE = "access"
 
 
 def _method_not_allowed() -> HttpResponse:
     return error(str(_("Method not allowed.")), code="method_not_allowed", status=405)
+
+
+def _check_organization_permission(request: HttpRequest, permission: str) -> None:
+    check_perm(request, permission)
+    assert_permission_organization_scope(
+        request,
+        permission=permission,
+        account_kinds={"staff"},
+    )
 
 
 def _reject_unknown(body: dict[str, Any], allowed: set[str]) -> None:
@@ -104,7 +114,7 @@ def _service() -> IAccessService:
 @require_auth
 def overrides_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method == "GET":
-        check_perm(request, f"{_RESOURCE}:read")
+        _check_organization_permission(request, f"{_RESOURCE}:read")
         qs = apply_filters(
             request,
             _service().list_overrides(),
@@ -114,8 +124,9 @@ def overrides_collection_view(request: HttpRequest) -> HttpResponse:
         items, total, page, size = paginate(request, qs)
         return paginated([override_to_dict(o) for o in items], total=total, page=page, page_size=size)
     if request.method == "POST":
-        check_perm(request, f"{_RESOURCE}:write")
+        _check_organization_permission(request, f"{_RESOURCE}:write")
         body = read_json(request)
+        _reject_unknown(body, {"role", "permission", "effect", "note"})
         dto = OverrideDTO(
             role=str_field(body, "role", max_length=32),
             permission=str_field(body, "permission", max_length=64),
@@ -130,14 +141,19 @@ def overrides_collection_view(request: HttpRequest) -> HttpResponse:
 @require_auth
 def override_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
-    check_perm(request, f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write")
+    _check_organization_permission(
+        request,
+        f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write",
+    )
     override = _service().get_override(pk)
     if override is None:
         raise NotFoundException(code="not_found")
     if read:
         return success(override_to_dict(override))
     if request.method in ("PUT", "PATCH"):
-        return success(override_to_dict(_service().update_override(override, _changes(read_json(request)))))
+        body = read_json(request)
+        _reject_unknown(body, {"role", "permission", "effect", "note"})
+        return success(override_to_dict(_service().update_override(override, _changes(body))))
     if request.method == "DELETE":
         _service().delete_override(override)
         return no_content()
@@ -165,7 +181,7 @@ def access_roles_view(request: HttpRequest) -> HttpResponse:
     as {granted, revoked} so a verb carved out of a resource-wildcard is visible."""
     if request.method != "GET":
         return error("Method not allowed.", code="method_not_allowed", status=405)
-    check_perm(request, f"{_RESOURCE}:read")
+    _check_organization_permission(request, f"{_RESOURCE}:read")
     req: Any = request  # _request_overrides is duck-typed on the request (typed Request upstream)
     overrides = _request_overrides(req)  # one query, shared across all roles
     roles = {role: role_effective_permissions(role, overrides) for role in Role.ALL}
@@ -179,7 +195,7 @@ def access_permissions_view(request: HttpRequest) -> HttpResponse:
     everything the static matrix references)."""
     if request.method != "GET":
         return error("Method not allowed.", code="method_not_allowed", status=405)
-    check_perm(request, f"{_RESOURCE}:read")
+    _check_organization_permission(request, f"{_RESOURCE}:read")
     return success(
         {
             "permissions": sorted(permission_catalogue()),
@@ -193,7 +209,7 @@ def access_permissions_view(request: HttpRequest) -> HttpResponse:
 @require_auth
 def account_types_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method == "GET":
-        check_perm(request, f"{_RESOURCE}:read")
+        _check_organization_permission(request, f"{_RESOURCE}:read")
         queryset = apply_filters(
             request,
             account_type_queryset(),
@@ -208,7 +224,7 @@ def account_types_collection_view(request: HttpRequest) -> HttpResponse:
             page_size=size,
         )
     if request.method == "POST":
-        check_perm(request, f"{_RESOURCE}:write")
+        _check_organization_permission(request, f"{_RESOURCE}:write")
         body = read_json(request)
         _reject_unknown(
             body,
@@ -232,7 +248,10 @@ def account_types_collection_view(request: HttpRequest) -> HttpResponse:
 @require_auth
 def account_type_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
-    check_perm(request, f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write")
+    _check_organization_permission(
+        request,
+        f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write",
+    )
     account_type = get_account_type(pk)
     if read:
         return success(account_type_to_dict(account_type))
@@ -265,7 +284,10 @@ def account_type_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
 @require_auth
 def account_type_permissions_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
-    check_perm(request, f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write")
+    _check_organization_permission(
+        request,
+        f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write",
+    )
     account_type = get_account_type(pk)
     if read:
         return success(
@@ -295,7 +317,7 @@ def account_type_assignments_view(
 ) -> HttpResponse:
     if request.method == "GET":
         check_perm(request, f"{_RESOURCE}:read")
-        queryset = assignment_queryset(request)
+        queryset = assignment_queryset(request, permission=f"{_RESOURCE}:read")
         if account_type_pk is not None:
             queryset = queryset.filter(account_type_id=account_type_pk)
         principal_kind = request.GET.get("principal_kind", "")
@@ -310,7 +332,10 @@ def account_type_assignments_view(
 
             principal_id = _required_int({"principal_id": principal_id_raw}, "principal_id")
             principal = resolve_principal(principal_kind, principal_id)
-            queryset = queryset.filter(user_id=principal.user_id)
+            principal_queryset = queryset.filter(user_id=principal.user_id)
+            if not principal_queryset.exists():
+                raise NotFoundException(_("Principal not found."), code="principal_not_found")
+            queryset = principal_queryset
         queryset = apply_filters(
             request,
             queryset,
@@ -355,7 +380,7 @@ def account_type_assignment_detail_view(request: HttpRequest, pk: int) -> HttpRe
     check_perm(request, f"{_RESOURCE}:write")
     if request.method != "DELETE":
         return _method_not_allowed()
-    membership = assignment_queryset(request).filter(pk=pk).first()
+    membership = assignment_queryset(request, permission=f"{_RESOURCE}:write").filter(pk=pk).first()
     if membership is None:
         raise NotFoundException(_("Assignment not found."), code="assignment_not_found")
     revoke_account_type_assignment(membership, actor=request.user, request=request)
@@ -367,7 +392,7 @@ def account_type_assignment_detail_view(request: HttpRequest, pk: int) -> HttpRe
 def account_type_effective_permissions_view(request: HttpRequest) -> HttpResponse:
     if request.method != "GET":
         return _method_not_allowed()
-    check_perm(request, f"{_RESOURCE}:read")
+    _check_organization_permission(request, f"{_RESOURCE}:read")
     principal_kind = request.GET.get("principal_kind", "")
     principal_id = _required_int(
         {"principal_id": request.GET.get("principal_id")},

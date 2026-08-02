@@ -9,19 +9,47 @@ from __future__ import annotations
 
 from django.db.models import QuerySet
 
-from apps.notifications.models import Notification, NotificationPreference
+from apps.notifications.models import (
+    DELIVERABLE_ATTRIBUTION_STATUSES,
+    Notification,
+    NotificationPreference,
+)
 
 
-def feed_for_user(*, user) -> QuerySet[Notification]:
-    """The user's own notifications, newest first (cursor-paginated by the view)."""
+def feed_for_user(
+    *, user, recipient_principal_kind: str, recipient_principal_id: int
+) -> QuerySet[Notification]:
+    """One exact role principal's notifications, newest first."""
     # user is surfaced (id + user_name) in notification_to_dict, so join it here —
     # no extra query per row (keeps the feed query budget flat).
-    return Notification.objects.select_related("user").filter(user=user).order_by("-created_at")
+    return (
+        Notification.objects.select_related("user")
+        .filter(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+            attribution_status__in=DELIVERABLE_ATTRIBUTION_STATUSES,
+        )
+        .order_by("-created_at")
+    )
 
 
-def unread_count(*, user) -> int:
-    return Notification.objects.filter(user=user, read_at__isnull=True).count()
+def unread_count(*, user, recipient_principal_kind: str, recipient_principal_id: int) -> int:
+    return Notification.objects.filter(
+        user=user,
+        recipient_principal_kind=recipient_principal_kind,
+        recipient_principal_id=recipient_principal_id,
+        attribution_status__in=DELIVERABLE_ATTRIBUTION_STATUSES,
+        read_at__isnull=True,
+    ).count()
 
 
-def preferences_for_user(*, user) -> QuerySet[NotificationPreference]:
-    return NotificationPreference.objects.filter(user=user).order_by("event_type", "channel")
+def preferences_for_user(
+    *, user, recipient_principal_kind: str, recipient_principal_id: int
+) -> QuerySet[NotificationPreference]:
+    return NotificationPreference.objects.filter(
+        user=user,
+        recipient_principal_kind=recipient_principal_kind,
+        recipient_principal_id=recipient_principal_id,
+        attribution_status__in=DELIVERABLE_ATTRIBUTION_STATUSES,
+    ).order_by("event_type", "channel")

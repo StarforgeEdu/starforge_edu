@@ -18,11 +18,40 @@ from core.repositories import BaseRepository
 class ApprovalRequestRepository(BaseRepository[ApprovalRequest], IApprovalRequestRepository):
     model = ApprovalRequest
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[ApprovalRequest]:
-        return selectors.scoped_requests(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> QuerySet[ApprovalRequest]:
+        return selectors.scoped_requests(
+            user=user,
+            roles=roles,
+            permission=permission,
+            include_requested_by=include_requested_by,
+        )
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> ApprovalRequest | None:
-        return selectors.scoped_requests(user=user, roles=roles).filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> ApprovalRequest | None:
+        return (
+            selectors.scoped_requests(
+                user=user,
+                roles=roles,
+                permission=permission,
+                include_requested_by=include_requested_by,
+            )
+            .filter(pk=pk)
+            .first()
+        )
 
 
 class LedgerEntryRepository(BaseRepository[LedgerEntry], ILedgerEntryRepository):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 from dateutil.rrule import DAILY, MONTHLY, WEEKLY, YEARLY, rrulestr
 from django.apps import apps as django_apps
@@ -13,7 +14,12 @@ from django.utils.translation import gettext_lazy as _
 
 from apps.schedule.models import Lesson, RecurrenceRule, Term
 from apps.schedule.selectors import check_conflicts, check_occurrence_conflicts
-from apps.schedule.signals import lesson_cancelled, lesson_reminder_due, lesson_rescheduled
+from apps.schedule.signals import (
+    lesson_cancelled,
+    lesson_reminder_due,
+    lesson_rescheduled,
+    lessons_bulk_rescheduled,
+)
 from core.exceptions import ConflictException, ValidationException
 from core.utils import current_schema
 
@@ -320,18 +326,25 @@ def move_occurrence(lesson: Lesson, *, starts_at, ends_at, actor=None) -> Lesson
     return lesson
 
 
-def _emit_rescheduled(*, lesson_id: int, old_start, moved_at: str, actor_id, schema: str):
-    """Build an on_commit callback that emits lesson_rescheduled with kwargs
-    matching move_occurrence — a factory binds the per-lesson values cleanly
-    (avoids late-binding pitfalls of a loop lambda). ``moved_at`` (the moved lesson's
-    updated_at) is the per-move dedupe discriminator (see move_occurrence)."""
+def _emit_bulk_rescheduled(
+    *,
+    cohort_id: int,
+    moves: tuple[dict[str, object], ...],
+    actor_id: int | None,
+    schema: str,
+):
+    """Build the single post-commit event for a rule-wide move.
 
-    def _send():
-        lesson_rescheduled.send(
+    The tuple contains primitive JSON-safe snapshots only.  Each operation also
+    carries a stable random ``move_id``: wall clocks can repeat under clock
+    correction/frozen tests, while a retry must retain the same idempotency key.
+    """
+
+    def _send() -> None:
+        lessons_bulk_rescheduled.send(
             sender=Lesson,
-            lesson_id=lesson_id,
-            old_start=old_start.isoformat(),
-            moved_at=moved_at,
+            cohort_id=cohort_id,
+            moves=moves,
             actor_id=actor_id,
             schema_name=schema,
         )
@@ -342,10 +355,9 @@ def _emit_rescheduled(*, lesson_id: int, old_start, moved_at: str, actor_id, sch
 @transaction.atomic
 def bulk_reschedule(rule: RecurrenceRule, *, shift_minutes: int, actor=None) -> int:
     """Shift every FUTURE scheduled lesson of the rule by `shift_minutes`,
-    all-or-nothing: any induced conflict rolls the whole batch back. Each shifted
-    lesson emits lesson_rescheduled on commit (matching move_occurrence) so D3-C's
-    on_lesson_rescheduled notifies students/parents — a bulk shift is the highest-
-    impact reschedule and must not be silent."""
+    all-or-nothing: any induced conflict rolls the whole batch back.  One aggregate
+    post-commit signal carries every shifted occurrence to bounded asynchronous
+    notification fan-out; the request never dispatches lessons x recipients inline."""
     delta = dt.timedelta(minutes=shift_minutes)
     now = timezone.now()
     lessons = list(
@@ -402,17 +414,26 @@ def bulk_reschedule(rule: RecurrenceRule, *, shift_minutes: int, actor=None) -> 
         lesson.status = Lesson.Status.SCHEDULED
     schema = current_schema()
     actor_id = getattr(actor, "pk", None)
-    for lesson in lessons:
-        transaction.on_commit(
-            _emit_rescheduled(
-                lesson_id=lesson.pk,
-                old_start=old_starts[lesson.id],
-                moved_at=lesson.updated_at.isoformat(),  # per-move dedupe discriminator
-                actor_id=actor_id,
-                schema=schema,
-            )
+    moves = tuple(
+        {
+            "lesson_id": lesson.pk,
+            "old_start": old_starts[lesson.id].isoformat(),
+            "moved_at": lesson.updated_at.isoformat(),
+            # Stable across fan-out retries, distinct for every actual move even
+            # when the application clock repeats.
+            "move_id": uuid.uuid4().hex,
+        }
+        for lesson in lessons
+    )
+    transaction.on_commit(
+        _emit_bulk_rescheduled(
+            cohort_id=rule.cohort_id,
+            moves=moves,
+            actor_id=actor_id,
+            schema=schema,
         )
-    return len(lessons)
+    )
+    return len(moves)
 
 
 # ---------------------------------------------------------------------------

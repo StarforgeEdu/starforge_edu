@@ -6,7 +6,7 @@ from __future__ import annotations
 import csv
 import io
 import itertools
-from typing import Any
+from typing import Any, cast
 
 from django.db import transaction
 from django.utils import timezone
@@ -23,6 +23,10 @@ from core.utils import current_schema
 # Max rows accepted in one CSV import — bounds a single request's DB write fan-out
 # even within the file-size cap (a small file can hold very many short rows).
 MAX_IMPORT_ROWS = 5000
+# A 5,000-row identity CSV fits comfortably below this ceiling. The tenant's
+# generic content-upload allowance may be hundreds of megabytes and must never
+# control an endpoint that parses the complete file in request memory.
+MAX_IMPORT_BYTES = 2 * 1024 * 1024
 
 # Enrollment state machine (D1-LD-3). Terminal: graduated. withdrawn re-enrolls.
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
@@ -152,7 +156,10 @@ def create_student(
         location=location,
         previous_school=previous_school,
         medical_notes=medical_notes,
-        emergency_contacts=emergency_contacts or [],
+        # EncryptedJSONField exposes a native list at the model boundary even
+        # though its encrypted storage base is TextField. The custom field owns
+        # serialization; this cast only narrows django-stubs' storage-level type.
+        emergency_contacts=cast(Any, emergency_contacts or []),
     )
     # Creation at a later status writes the synthetic event chain so the
     # D1-LD-3 invariants (event history + enrollment_date) hold from birth.
@@ -249,14 +256,22 @@ def import_students_csv(*, file_obj, branch) -> dict[str, Any]:
     """Create one user+profile per CSV row inside a savepoint so a bad row never
     aborts the valid ones (D1-LD-5). Columns: phone, email, first_name, last_name."""
     settings_obj = get_center_settings()
-    max_bytes = settings_obj.max_upload_mb * 1024 * 1024
+    max_bytes = min(settings_obj.max_upload_mb * 1024 * 1024, MAX_IMPORT_BYTES)
     size = getattr(file_obj, "size", None)
     if size is not None and size > max_bytes:
         raise ValidationException(
-            _("File exceeds the maximum upload size of %(mb)s MB.") % {"mb": settings_obj.max_upload_mb},
+            _("CSV files may not exceed %(bytes)s bytes.") % {"bytes": max_bytes},
             code="file_too_large",
         )
-    content = file_obj.read()
+    # Do not trust the multipart metadata alone: a custom upload handler or
+    # future caller can omit/forge ``size``. A bounded read keeps memory use
+    # deterministic and detects a streamed payload one byte past the limit.
+    content = file_obj.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise ValidationException(
+            _("CSV files may not exceed %(bytes)s bytes.") % {"bytes": max_bytes},
+            code="file_too_large",
+        )
     if isinstance(content, bytes):
         try:
             # utf-8-sig strips Excel's BOM and is a no-op for BOM-less UTF-8.

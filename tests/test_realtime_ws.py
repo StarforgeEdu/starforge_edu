@@ -23,6 +23,7 @@ import pytest
 from asgiref.sync import sync_to_async
 from channels.layers import get_channel_layer
 from channels.testing import WebsocketCommunicator
+from django.conf import settings
 from django_tenants.utils import schema_context
 
 from config.asgi import application
@@ -37,15 +38,63 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # helpers
 # --------------------------------------------------------------------------- #
 def _mint_access(tenant, user) -> str:
-    from apps.auth.services import issue_token
+    from apps.notifications.principals import resolve_recipient_principal
+    from apps.notifications.tests.helpers import ensure_notification_principal
+    from core.session_auth import create_session
 
     with schema_context(tenant.schema_name):
-        return issue_token(user)["access"]
+        principal = resolve_recipient_principal(user_id=user.pk)
+        if not principal.is_deliverable:
+            roles = set(user.role_memberships.filter(revoked_at__isnull=True).values_list("role", flat=True))
+            if "student" in roles:
+                kind = "student"
+            elif "teacher" in roles:
+                kind = "teacher"
+            elif "parent" in roles:
+                kind = "parent"
+            else:
+                kind = "staff"
+            membership = user.role_memberships.filter(revoked_at__isnull=True).first()
+            ensure_notification_principal(
+                user,
+                kind=kind,
+                branch=membership.branch if membership is not None else None,
+            )
+            principal = resolve_recipient_principal(user_id=user.pk)
+        assert principal.kind is not None
+        assert principal.principal_id is not None
+        user.notification_principal_kind = principal.kind
+        user.notification_principal_id = principal.principal_id
+        session = create_session(
+            user,
+            principal_kind=principal.kind,
+            principal_id=principal.principal_id,
+        )
+        return session.key
+
+
+def _notification_group(tenant, user) -> str:
+    from infrastructure.websocket.groups import notification_principal_group
+
+    return notification_principal_group(
+        tenant.schema_name,
+        user.notification_principal_kind,
+        user.notification_principal_id,
+    )
+
+
+def _notification_event(user, **payload) -> dict:
+    return {
+        "type": "notification.message",
+        "recipient_principal_kind": user.notification_principal_kind,
+        "recipient_principal_id": user.notification_principal_id,
+        **payload,
+    }
 
 
 async def _connect(path: str, headers, token: str | None = None):
-    url = f"{path}?token={token}" if token else path
-    comm = WebsocketCommunicator(application, url, headers=headers)
+    protocols = [f"bearer.{token}"] if token else None
+    comm = WebsocketCommunicator(application, path, headers=headers, subprotocols=protocols)
     connected, code = await comm.connect()
     return comm, connected, code
 
@@ -113,11 +162,8 @@ async def test_notifications_revoked_session_rejected_4401(tenant_a, user_in):
 @pytest.mark.channels
 @pytest.mark.asyncio
 @pytest.mark.django_db(transaction=True)
-async def test_notifications_bearer_subprotocol_is_echoed(tenant_a, user_in):
-    """Browser auth offers a single Sec-WebSocket-Protocol value `bearer.<token>`.
-    Per RFC 6455 the server MUST echo one of the OFFERED values — echoing a bare
-    `bearer` (never offered) fails the browser handshake. Assert the exact offered
-    value is echoed (and the token-in-subprotocol auth path connects)."""
+async def test_notifications_bearer_subprotocol_is_not_echoed(tenant_a, user_in):
+    """The credential authenticates but is never copied into the response header."""
 
     @sync_to_async
     def _mint():
@@ -129,14 +175,103 @@ async def test_notifications_bearer_subprotocol_is_echoed(tenant_a, user_in):
     comm = WebsocketCommunicator(application, "/ws/notifications/", headers=HOST_A, subprotocols=[offered])
     connected, subprotocol = await comm.connect()
     assert connected
-    assert subprotocol == offered  # echoes the offered value, not "bearer"
+    assert subprotocol is None
     await comm.disconnect()
 
 
 @pytest.mark.channels
 @pytest.mark.asyncio
 @pytest.mark.django_db(transaction=True)
-async def test_notifications_authed_joins_only_private_user_group(tenant_a, user_in):
+async def test_notifications_selects_only_safe_application_subprotocol(tenant_a, user_in):
+    from infrastructure.websocket.consumers import APPLICATION_SUBPROTOCOL
+
+    @sync_to_async
+    def _mint():
+        user = user_in(tenant_a, roles=["teacher"])
+        return _mint_access(tenant_a, user)
+
+    token = await _mint()
+    offered = f"bearer.{token}"
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/notifications/",
+        headers=HOST_A,
+        subprotocols=[APPLICATION_SUBPROTOCOL, offered],
+    )
+    connected, subprotocol = await comm.connect()
+    assert connected
+    assert subprotocol == APPLICATION_SUBPROTOCOL
+    await comm.disconnect()
+
+
+@pytest.mark.channels
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_notifications_http_only_cookie_auth_connects_without_exposing_token(tenant_a, user_in):
+    @sync_to_async
+    def _mint():
+        user = user_in(tenant_a, roles=["teacher"])
+        return _mint_access(tenant_a, user)
+
+    token = await _mint()
+    cookie = f"theme=dark; {settings.API_SESSION_COOKIE_NAME}={token}".encode("latin1")
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/notifications/",
+        headers=[*HOST_A, (b"origin", b"http://a.localhost"), (b"cookie", cookie)],
+    )
+    connected, subprotocol = await comm.connect()
+    assert connected
+    assert subprotocol is None
+    await comm.disconnect()
+
+
+@pytest.mark.channels
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_notifications_cookie_auth_rejects_cross_origin_handshake(tenant_a, user_in):
+    @sync_to_async
+    def _mint():
+        user = user_in(tenant_a, roles=["teacher"])
+        return _mint_access(tenant_a, user)
+
+    token = await _mint()
+    cookie = f"{settings.API_SESSION_COOKIE_NAME}={token}".encode("latin1")
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/notifications/",
+        headers=[*HOST_A, (b"origin", b"http://hostile.localhost"), (b"cookie", cookie)],
+    )
+    connected, code = await comm.connect()
+    assert not connected
+    assert code == 4403
+
+
+@pytest.mark.channels
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_notifications_bearer_auth_rejects_cross_origin_handshake(tenant_a, user_in):
+    @sync_to_async
+    def _mint():
+        user = user_in(tenant_a, roles=["teacher"])
+        return _mint_access(tenant_a, user)
+
+    token = await _mint()
+    comm = WebsocketCommunicator(
+        application,
+        "/ws/notifications/",
+        headers=[*HOST_A, (b"origin", b"http://hostile.localhost")],
+        subprotocols=[f"bearer.{token}"],
+    )
+    connected, code = await comm.connect()
+    assert not connected
+    assert code == 4403
+
+
+@pytest.mark.channels
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_notifications_authed_joins_only_private_principal_group(tenant_a, user_in):
     """Notification sockets subscribe only to the recipient-specific group.
 
     There is no branch notification producer; joining a broad branch group both
@@ -154,16 +289,17 @@ async def test_notifications_authed_joins_only_private_user_group(tenant_a, user
                 .values_list("branch_id", flat=True)
                 .first()
             )
-        return user.pk, branch_id, _mint_access(tenant_a, user)
+        token = _mint_access(tenant_a, user)
+        return branch_id, _notification_group(tenant_a, user), _notification_event(user), token
 
-    user_pk, branch_id, token = await _mint()
+    branch_id, principal_group, principal_event, token = await _mint()
     comm, connected, _ = await _connect("/ws/notifications/", HOST_A, token)
     assert connected
 
-    # User group reaches the socket.
+    # The exact role-principal group reaches the socket.
     await _group_send(
-        f"{tenant_a.schema_name}.user.{user_pk}",
-        {"type": "notification.message", "id": 1, "title": "u", "body": "b"},
+        principal_group,
+        {**principal_event, "id": 1, "title": "u", "body": "b"},
     )
     user_frame = await comm.receive_json_from(timeout=5)
     assert user_frame["type"] == "notification"
@@ -172,7 +308,7 @@ async def test_notifications_authed_joins_only_private_user_group(tenant_a, user
     # A broad branch-group send must not reach this private notification feed.
     await _group_send(
         f"{tenant_a.schema_name}.branch.{branch_id}",
-        {"type": "notification.message", "id": 2, "title": "b", "body": "b"},
+        {**principal_event, "id": 2, "title": "b", "body": "b"},
     )
     assert await comm.receive_nothing(timeout=0.3)
     await comm.disconnect()
@@ -210,6 +346,87 @@ async def test_notifications_e2e_delivery_via_dispatch(tenant_a, user_in):
     assert frame["payload"]["event_type"] == EventType.ATTENDANCE_ABSENT
     assert frame["payload"]["data"]["student_id"] == 7
     await comm.disconnect()
+
+
+@pytest.mark.channels
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_notification_realtime_never_crosses_shared_user_principals(tenant_a):
+    """Student and staff sockets sharing one bridge User receive separate events."""
+
+    @sync_to_async
+    def _setup():
+        from apps.org.models import StaffProfile
+        from apps.org.tests.factories import BranchFactory
+        from apps.students.tests.factories import StudentProfileFactory
+        from apps.users.models import RoleMembership
+        from apps.users.tests.factories import UserFactory
+        from core.session_auth import create_session
+        from infrastructure.websocket.groups import notification_principal_group
+
+        with schema_context(tenant_a.schema_name):
+            branch = BranchFactory()
+            user = UserFactory()
+            student = StudentProfileFactory(user=user, branch=branch)
+            staff = StaffProfile.objects.create(
+                user=user,
+                username=f"staff.{user.username}",
+                password=user.password,
+            )
+            RoleMembership.objects.create(user=user, branch=branch, role="student")
+            RoleMembership.objects.create(user=user, branch=branch, role="director")
+            student_session = create_session(
+                user,
+                principal_kind="student",
+                principal_id=student.pk,
+            )
+            staff_session = create_session(
+                user,
+                principal_kind="staff",
+                principal_id=staff.pk,
+            )
+            return {
+                "student_token": student_session.key,
+                "staff_token": staff_session.key,
+                "student_group": notification_principal_group(tenant_a.schema_name, "student", student.pk),
+                "staff_group": notification_principal_group(tenant_a.schema_name, "staff", staff.pk),
+                "student_id": student.pk,
+                "staff_id": staff.pk,
+            }
+
+    setup = await _setup()
+    student_socket, student_connected, _ = await _connect(
+        "/ws/notifications/", HOST_A, setup["student_token"]
+    )
+    staff_socket, staff_connected, _ = await _connect("/ws/notifications/", HOST_A, setup["staff_token"])
+    assert student_connected
+    assert staff_connected
+
+    await _group_send(
+        setup["student_group"],
+        {
+            "type": "notification.message",
+            "recipient_principal_kind": "student",
+            "recipient_principal_id": setup["student_id"],
+            "id": 11,
+        },
+    )
+    assert (await student_socket.receive_json_from(timeout=5))["payload"]["id"] == 11
+    assert await staff_socket.receive_nothing(timeout=0.3)
+
+    await _group_send(
+        setup["staff_group"],
+        {
+            "type": "notification.message",
+            "recipient_principal_kind": "staff",
+            "recipient_principal_id": setup["staff_id"],
+            "id": 12,
+        },
+    )
+    assert (await staff_socket.receive_json_from(timeout=5))["payload"]["id"] == 12
+    assert await student_socket.receive_nothing(timeout=0.3)
+    await student_socket.disconnect()
+    await staff_socket.disconnect()
 
 
 # --------------------------------------------------------------------------- #
@@ -511,9 +728,10 @@ async def test_revoked_session_closes_live_socket_4401(tenant_a, user_in, monkey
     @sync_to_async
     def _mint():
         user = user_in(tenant_a)
-        return user.pk, _mint_access(tenant_a, user)
+        token = _mint_access(tenant_a, user)
+        return user.pk, _notification_group(tenant_a, user), _notification_event(user), token
 
-    user_pk, token = await _mint()
+    user_pk, principal_group, principal_event, token = await _mint()
     comm, connected, _ = await _connect("/ws/notifications/", HOST_A, token)
     assert connected
 
@@ -534,9 +752,42 @@ async def test_revoked_session_closes_live_socket_4401(tenant_a, user_in, monkey
             break
     assert closed_code == 4401
 
-    # Group membership discarded: a send to the user group now reaches nothing.
-    await _group_send(f"{tenant_a.schema_name}.user.{user_pk}", {"type": "notification.message", "id": 9})
+    # Group membership discarded: a send to the principal group reaches nothing.
+    await _group_send(principal_group, {**principal_event, "id": 9})
     assert await comm.receive_nothing(timeout=0.3)
+
+
+@pytest.mark.channels
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_revocation_is_checked_before_next_notification(tenant_a, user_in):
+    """No notification is delivered during the periodic-heartbeat revocation window."""
+
+    @sync_to_async
+    def _mint():
+        user = user_in(tenant_a)
+        token = _mint_access(tenant_a, user)
+        return user.pk, _notification_group(tenant_a, user), _notification_event(user), token
+
+    user_pk, principal_group, principal_event, token = await _mint()
+    comm, connected, _ = await _connect("/ws/notifications/", HOST_A, token)
+    assert connected
+
+    @sync_to_async
+    def _revoke():
+        from core.session_auth import revoke_all_for_user
+
+        with schema_context(tenant_a.schema_name):
+            revoke_all_for_user(user_pk)
+
+    await _revoke()
+    await _group_send(
+        principal_group,
+        {**principal_event, "id": 77, "title": "must not leak"},
+    )
+    output = await comm.receive_output(timeout=2)
+    assert output["type"] == "websocket.close"
+    assert output["code"] == 4401
 
 
 @pytest.mark.channels
@@ -592,15 +843,14 @@ async def test_disconnect_clears_group_memberships(tenant_a, user_in):
     @sync_to_async
     def _mint():
         user = user_in(tenant_a, roles=["teacher"])
-        return user.pk, _mint_access(tenant_a, user)
+        token = _mint_access(tenant_a, user)
+        return _notification_group(tenant_a, user), _notification_event(user), token
 
-    user_pk, token = await _mint()
+    principal_group, principal_event, token = await _mint()
     comm, connected, _ = await _connect("/ws/notifications/", HOST_A, token)
     assert connected
-    user_group = f"{tenant_a.schema_name}.user.{user_pk}"
-
     # While connected the group reaches the socket.
-    await _group_send(user_group, {"type": "notification.message", "id": 1})
+    await _group_send(principal_group, {**principal_event, "id": 1})
     live = await comm.receive_json_from(timeout=5)
     assert live["payload"]["id"] == 1
 
@@ -609,7 +859,7 @@ async def test_disconnect_clears_group_memberships(tenant_a, user_in):
     # user joins, then a send to the old group reaches the NEW socket only once
     # (the stale membership would otherwise duplicate). Simpler: re-send and
     # assert the disconnected communicator buffers nothing new.
-    await _group_send(user_group, {"type": "notification.message", "id": 2})
+    await _group_send(principal_group, {**principal_event, "id": 2})
     assert await comm.receive_nothing(timeout=0.3)
 
 
@@ -617,8 +867,7 @@ async def test_disconnect_clears_group_memberships(tenant_a, user_in):
 # Producer-uniqueness grep (TD-15, D4-LC-6)
 # --------------------------------------------------------------------------- #
 def test_group_send_producer_uniqueness():
-    """`channel_layer.group_send` may be IMPORTED only under apps/notifications/
-    + infrastructure/websocket/. dispatch is the single producer (TD-15)."""
+    """Private group producers stay in their owning domain or websocket adapter."""
     pattern = re.compile(r"from\s+infrastructure\.websocket\.channel_layer\s+import\s+group_send")
     offenders: list[str] = []
     # Restrict the static check to project source. REPO_ROOT.rglob also traverses
@@ -629,7 +878,11 @@ def test_group_send_producer_uniqueness():
             rel = py.relative_to(REPO_ROOT).as_posix()
             if "/tests/" in rel:
                 continue
-            if rel.startswith("apps/notifications/") or rel.startswith("infrastructure/websocket/"):
+            if (
+                rel == "apps/messaging/services/__init__.py"
+                or rel.startswith("apps/notifications/")
+                or rel.startswith("infrastructure/websocket/")
+            ):
                 continue
             text = py.read_text(encoding="utf-8", errors="ignore")
             if pattern.search(text):

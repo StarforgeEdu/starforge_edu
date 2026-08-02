@@ -37,3 +37,14 @@ ESKIZ_USE_MOCK = True
 SECURE_SSL_REDIRECT = False
 SESSION_COOKIE_SECURE = False
 CSRF_COOKIE_SECURE = False
+API_SESSION_COOKIE_NAME = "starforge_session"
+API_SESSION_COOKIE_SECURE = False
+
+# The Vite console is same-origin from the browser's perspective but proxies to
+# demo.localhost during development. Trust only the explicit loopback dev origins
+# for Django's Origin check; production keeps its environment allowlist.
+CSRF_TRUSTED_ORIGINS = [
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://demo.localhost:5173",
+]

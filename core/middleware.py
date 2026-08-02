@@ -14,6 +14,7 @@ Concerns, ordered in `config.settings.base.MIDDLEWARE`:
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
@@ -26,13 +27,16 @@ from django.http import HttpRequest, HttpResponse, JsonResponse
 from django_tenants.utils import get_public_schema_name
 
 from core.logging_filters import request_id_var
+from core.rate_config import RateConfigurationError, parse_rate
 
 REQUEST_ID_HEADER = "X-Request-ID"
+logger = logging.getLogger("starforge.middleware")
 
 # Inbound ids are attacker-controlled and end up in log lines (`req={request_id}`)
 # and the response header — restrict to a safe charset and a sane length so a
 # crafted value cannot forge/split log records or trigger BadHeaderError.
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+PAYMENT_WEBHOOK_PATH_RE = re.compile(r"^/api/v1/webhooks/(?:click|payme|uzum)/[-A-Za-z0-9_]+/$")
 
 GetResponse = Callable[[HttpRequest], HttpResponse]
 
@@ -78,7 +82,13 @@ class HealthCheckMiddleware:
         if request.path == "/healthz/live":
             return JsonResponse({"status": "ok"})
         if request.path == "/healthz/ready":
-            if not self._admit_probe(request):
+            try:
+                admitted = self._admit_probe(request)
+            except RateConfigurationError:
+                logger.critical("Invalid HEALTH_READY_RATELIMIT configuration.", exc_info=True)
+                body, status = self._not_ready_result()
+                return JsonResponse(body, status=status)
+            if not admitted:
                 response = JsonResponse(
                     {"success": False, "code": "throttled", "message": "Too many readiness probes."},
                     status=429,
@@ -90,10 +100,17 @@ class HealthCheckMiddleware:
 
     @classmethod
     def _admit_probe(cls, request: HttpRequest) -> bool:
+        from core.privacy import private_fingerprint
         from core.utils import client_ip
 
-        limit, window = _parse_rate(getattr(settings, "HEALTH_READY_RATELIMIT", "30/min"))
-        ident = client_ip(request) or "unknown"
+        limit, window = _parse_rate(
+            getattr(settings, "HEALTH_READY_RATELIMIT", "30/min"),
+            setting_name="HEALTH_READY_RATELIMIT",
+        )
+        ident = private_fingerprint(
+            client_ip(request) or "unknown",
+            namespace="health-ready-probe",
+        )
         now = time.monotonic()
         with cls._lock:
             started, count = cls._probe_buckets.get(ident, (now, 0))
@@ -126,22 +143,16 @@ class HealthCheckMiddleware:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
         except Exception:
-            return {
-                "success": False,
-                "code": "not_ready",
-                "message": "Database unavailable.",
-            }, 503
+            logger.error("Readiness database probe failed.", exc_info=True)
+            return HealthCheckMiddleware._not_ready_result()
         try:
             from infrastructure.cache.redis_client import get_redis
 
             redis = get_redis()
             redis.ping()
         except Exception:
-            return {
-                "success": False,
-                "code": "not_ready",
-                "message": "Cache unavailable.",
-            }, 503
+            logger.error("Readiness cache probe failed.", exc_info=True)
+            return HealthCheckMiddleware._not_ready_result()
         if getattr(settings, "HEALTH_REQUIRE_CELERY_HEARTBEAT", False):
             from celery_tasks.health_tasks import RUNTIME_HEARTBEAT_KEY
 
@@ -149,12 +160,19 @@ class HealthCheckMiddleware:
                 if not redis.get(RUNTIME_HEARTBEAT_KEY):
                     raise RuntimeError("missing heartbeat")
             except Exception:
-                return {
-                    "success": False,
-                    "code": "not_ready",
-                    "message": "Background workers unavailable.",
-                }, 503
+                logger.error("Readiness worker-heartbeat probe failed.", exc_info=True)
+                return HealthCheckMiddleware._not_ready_result()
         return {"status": "ready"}, 200
+
+    @staticmethod
+    def _not_ready_result() -> tuple[dict[str, object], int]:
+        """Return one public shape while component-level diagnostics stay in logs."""
+
+        return {
+            "success": False,
+            "code": "not_ready",
+            "message": "Service is not ready.",
+        }, 503
 
 
 class InactiveTenantMiddleware:
@@ -184,13 +202,24 @@ class InactiveTenantMiddleware:
 # Blanket API rate limit — both view styles (TD: keep 100k-user headroom sane)
 # ---------------------------------------------------------------------------
 
-_RATE_PERIODS = {"sec": 1, "second": 1, "min": 60, "minute": 60, "hour": 3600, "day": 86400}
+
+def _parse_rate(rate: object, *, setting_name: str = "rate limit") -> tuple[int, int]:
+    """Strict DRF-style rate parser retained as the middleware's public helper."""
+
+    return parse_rate(rate, setting_name=setting_name)
 
 
-def _parse_rate(rate: str) -> tuple[int, int]:
-    """DRF-style ``"1000/min"`` -> ``(limit, window_seconds)``."""
-    num, _, period = rate.partition("/")
-    return int(num), _RATE_PERIODS[period.strip().rstrip("s") or "min"]
+def _rate_limit_unavailable_response() -> JsonResponse:
+    """Render failures raised before the inner JSON-error middleware can run."""
+
+    return JsonResponse(
+        {
+            "success": False,
+            "code": "temporarily_unavailable",
+            "message": "This operation is temporarily unavailable.",
+        },
+        status=503,
+    )
 
 
 class ApiRateLimitMiddleware:
@@ -198,9 +227,10 @@ class ApiRateLimitMiddleware:
     ``UserRateThrottle``/``AnonRateThrottle`` pair the migrated plain views no
     longer pass through (they bypass DRF dispatch entirely).
 
-    Every request is first bucketed by client IP, regardless of the Authorization
-    value. Credential-free traffic also receives the stricter anonymous cap;
-    valid sessions receive a stable user-id cap only after authentication. It
+    Every request is first bucketed by client IP, regardless of the presented
+    credential. Credential-free traffic also receives the stricter anonymous
+    cap; Bearer- and cookie-present traffic is authenticated later and valid
+    sessions receive a stable user-id cap. It
     sits before tenant resolution so a flood is rejected before it costs a schema
     lookup. OPTIONS preflights are exempt (CORS
     preflights never reached DRF's view-level throttles either). Endpoint-specific
@@ -219,14 +249,22 @@ class ApiRateLimitMiddleware:
         # brute-force / credential-stuffing against staff & superuser accounts on
         # every tenant subdomain and the apex. Throttle the POST by client IP.
         if request.method == "POST" and request.path.endswith("/admin/login/"):
-            from core.exceptions import ThrottledException
+            from core.exceptions import ServiceUnavailableException, ThrottledException
             from core.ratelimit import check_rate
             from core.utils import client_ip
 
             ident = client_ip(request) or "anon"
-            limit, window = _parse_rate(getattr(settings, "ADMIN_LOGIN_RATELIMIT", "10/min"))
             try:
+                limit, window = _parse_rate(
+                    getattr(settings, "ADMIN_LOGIN_RATELIMIT", "10/min"),
+                    setting_name="ADMIN_LOGIN_RATELIMIT",
+                )
                 check_rate(scope="admin_login", key=ident, limit=limit, window=window)
+            except RateConfigurationError:
+                logger.critical("Invalid ADMIN_LOGIN_RATELIMIT configuration.", exc_info=True)
+                return _rate_limit_unavailable_response()
+            except ServiceUnavailableException:
+                return _rate_limit_unavailable_response()
             except ThrottledException as exc:
                 response = JsonResponse(
                     {"success": False, "code": exc.code, "message": str(exc.detail)}, status=429
@@ -234,7 +272,7 @@ class ApiRateLimitMiddleware:
                 response["Retry-After"] = str(int(exc.wait or window))
                 return response
 
-        # Payment-provider webhooks (/api/v1/webhooks/...) are unauthenticated at the
+        # Payment-provider webhooks are unauthenticated at the
         # HTTP layer (signature-verified in the view) and pushed from the provider's
         # FIXED server IP(s). The blanket anon limiter runs BEFORE tenant resolution and
         # keys on client IP, so ALL tenants' callbacks for one provider collapse into a
@@ -243,11 +281,14 @@ class ApiRateLimitMiddleware:
         # desyncing the money path. Exempt them: they carry their own signature auth +
         # replay dedupe (WebhookEvent) + provider retry, so IP throttling is both
         # ineffective (spoofable) and harmful here.
-        if request.path.startswith("/api/v1/webhooks/"):
+        # Keep the exemption narrower than the URL namespace: otherwise arbitrary
+        # or future routes below ``/webhooks/`` silently bypass every blanket cap.
+        # Only the three registered POST callback shapes qualify.
+        if request.method == "POST" and PAYMENT_WEBHOOK_PATH_RE.fullmatch(request.path):
             return self.get_response(request)
 
         if request.method != "OPTIONS" and request.path.startswith("/api/"):
-            from core.exceptions import ThrottledException
+            from core.exceptions import ServiceUnavailableException, ThrottledException
             from core.ratelimit import check_rate
             from core.utils import client_ip
 
@@ -256,7 +297,8 @@ class ApiRateLimitMiddleware:
                 # Always charge the source IP before tenant resolution. Random,
                 # rotating Bearer strings can no longer mint fresh buckets.
                 preauth_limit, preauth_window = _parse_rate(
-                    getattr(settings, "API_RATELIMIT_PREAUTH", "300/min")
+                    getattr(settings, "API_RATELIMIT_PREAUTH", "300/min"),
+                    setting_name="API_RATELIMIT_PREAUTH",
                 )
                 check_rate(
                     scope="api_pre_auth",
@@ -265,16 +307,36 @@ class ApiRateLimitMiddleware:
                     window=preauth_window,
                 )
                 # Credential-free traffic also receives the tighter anonymous
-                # cap. Valid sessions get a stable user-id bucket after auth.
+                # cap. Recognized credential wire formats skip that duplicate
+                # bucket, then valid sessions/devices get a stable principal
+                # bucket after tenant resolution/authentication. Invalid Bearer,
+                # cookie, and Agent values still pay the pre-auth IP cap above,
+                # so rotating garbage credentials cannot mint unlimited buckets.
                 auth = request.META.get("HTTP_AUTHORIZATION", "")
-                if not (auth[:7].lower() == "bearer " and auth[7:].strip()):
-                    anon_limit, anon_window = _parse_rate(getattr(settings, "API_RATELIMIT_ANON", "60/min"))
+                bearer_present = auth[:7].lower() == "bearer " and bool(auth[7:].strip())
+                agent_present = False
+                if auth.startswith("Agent "):
+                    from apps.printing.authentication import is_branch_agent_authorization
+
+                    agent_present = is_branch_agent_authorization(auth)
+                cookie_name = getattr(settings, "API_SESSION_COOKIE_NAME", "starforge_session")
+                cookie_present = bool(request.COOKIES.get(cookie_name, "").strip())
+                if not (bearer_present or agent_present or cookie_present):
+                    anon_limit, anon_window = _parse_rate(
+                        getattr(settings, "API_RATELIMIT_ANON", "60/min"),
+                        setting_name="API_RATELIMIT_ANON",
+                    )
                     check_rate(
                         scope="api_anon",
                         key=ident,
                         limit=anon_limit,
                         window=anon_window,
                     )
+            except RateConfigurationError:
+                logger.critical("Invalid API rate-limit configuration.", exc_info=True)
+                return _rate_limit_unavailable_response()
+            except ServiceUnavailableException:
+                return _rate_limit_unavailable_response()
             except ThrottledException as exc:
                 # Middleware-raised exceptions skip process_exception — render the
                 # envelope directly (same shape the views produce).
@@ -442,7 +504,9 @@ class AppAvailabilityMiddleware:
     A disabled app — or one whose HARD dependency is down — answers a clean
     ``503 service_unavailable`` JSON, so ONE app going down never takes the rest of the API
     with it. An app running DEGRADED (a SOFT dependency down) is served normally but its JSON
-    success envelope gains a ``warnings`` list naming what's degraded. Only touches
+    success envelope gains a structured, executive-safe ``warnings`` entry. Dependency names
+    remain available through the operator system-status endpoint rather than leaking into
+    ordinary user-facing responses. Only touches
     ``/api/v1/<mount>/`` routes; ``admin``/``schema``/health and unmanaged paths pass through.
     """
 
@@ -461,8 +525,12 @@ class AppAvailabilityMiddleware:
         return response
 
     def _resolve(self, request: HttpRequest):
-        """A 503 ``HttpResponse`` to short-circuit a down app, or a (possibly empty) warnings
-        list / ``None`` to proceed."""
+        """Return a 503 short circuit, structured degradation warnings, or ``None``.
+
+        ``resolve_status`` deliberately retains detailed dependency strings for the
+        authenticated operator status surface. Normal API responses receive a stable public
+        warning DTO so internal app labels and outage topology are not exposed to end users.
+        """
         from core.availability import (
             STATUS_DISABLED,
             STATUS_UNAVAILABLE,
@@ -479,16 +547,38 @@ class AppAvailabilityMiddleware:
             return None
         status, warnings = resolve_status(app)
         if status in (STATUS_DISABLED, STATUS_UNAVAILABLE):
-            detail = warnings[0] if warnings else f"The {app} service is currently unavailable."
-            return JsonResponse(
-                {"success": False, "code": "service_unavailable", "message": detail}, status=503
+            logger.warning(
+                "Capability unavailable for app %s with status %s: %s",
+                app,
+                status,
+                warnings,
             )
-        return warnings  # degraded -> non-empty; fully up -> empty
+            return JsonResponse(
+                {
+                    "success": False,
+                    "code": "service_unavailable",
+                    "message": "This capability is temporarily unavailable.",
+                },
+                status=503,
+            )
+        if not warnings:
+            return None
+        return [
+            {
+                "code": "information_delayed",
+                "message": "Some information may be delayed.",
+                "affected_sections": [mount],
+            }
+        ]
 
     @staticmethod
-    def _inject_warnings(response: HttpResponse, warnings: list[str]) -> None:
-        """Add a ``warnings`` key to a JSON SUCCESS envelope; leave errors, webhooks,
-        streaming, and non-JSON bodies untouched."""
+    def _inject_warnings(response: HttpResponse, warnings: list[dict[str, object]]) -> None:
+        """Merge warnings into a JSON success envelope without clobbering view warnings.
+
+        Error, streaming, non-JSON, and malformed success responses remain untouched. Existing
+        warnings win on duplicate ``(code, affected_sections)`` identities so a view can supply
+        a more specific message than the middleware fallback.
+        """
         if getattr(response, "streaming", False) or response.status_code >= 400:
             return
         if "application/json" not in response.get("Content-Type", ""):
@@ -499,8 +589,51 @@ class AppAvailabilityMiddleware:
             body = json.loads(response.content)
         except (ValueError, TypeError):
             return
-        if not isinstance(body, dict) or "success" not in body:
+        if not isinstance(body, dict) or body.get("success") is not True:
             return
-        body["warnings"] = warnings
+        existing = body.get("warnings", [])
+        if not isinstance(existing, list):
+            return
+
+        def warning_identity(value: object) -> tuple[str, tuple[str, ...]] | None:
+            if not isinstance(value, dict):
+                return None
+            code = value.get("code")
+            sections = value.get("affected_sections")
+            if not isinstance(code, str) or not isinstance(sections, list):
+                return None
+            if not sections or not all(isinstance(section, str) for section in sections):
+                return None
+            return code, tuple(sections)
+
+        merged = list(existing)
+        identities: set[tuple[str, tuple[str, ...]]] = set()
+        for existing_warning in existing:
+            if identity := warning_identity(existing_warning):
+                identities.add(identity)
+        for warning in warnings:
+            identity = warning_identity(warning)
+            if identity is not None and identity not in identities:
+                merged.append(warning)
+                identities.add(identity)
+        body["warnings"] = merged
         response.content = json.dumps(body).encode("utf-8")
         response["Content-Length"] = str(len(response.content))
+
+
+class OrganizationTimezoneMiddleware:
+    """Activate authoritative organization business time for one tenant request.
+
+    The context manager owns public-schema bypass and restoration, including when
+    downstream middleware or a view raises, so worker threads cannot leak one tenant's
+    timezone into the next request.
+    """
+
+    def __init__(self, get_response: GetResponse) -> None:
+        self.get_response = get_response
+
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        from core.timezones import organization_timezone_context
+
+        with organization_timezone_context():
+            return self.get_response(request)

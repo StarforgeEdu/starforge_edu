@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "tenant_host": "tenant.example.com",
+  "director": {
+    "username": "release.director",
+    "password": "REPLACE_WITH_DEDICATED_SMOKE_PASSWORD"
+  },
+  "manager": {
+    "username": "release.manager",
+    "password": "REPLACE_WITH_DEDICATED_SMOKE_PASSWORD"
+  },
+  "manager_out_of_scope_user_id": 999999,
+  "catalog": [
+    {
+      "name": "director-student-register",
+      "role": "director",
+      "path": "/api/v1/students/?page=1&page_size=1",
+      "required_json_pointers": ["/success", "/data"]
+    }
+  ]
+}

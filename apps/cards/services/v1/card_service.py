@@ -103,8 +103,9 @@ class WalletService(IWalletService):
         self.repository = repository
 
     def wallet_payload(self, *, student) -> dict[str, Any]:
-        wallet = self.repository.get_or_create_for(student=student)
-        return {"wallet": wallet, "transactions": self.repository.recent_transactions(wallet=wallet)}
+        wallet = self.repository.get_for(student=student)
+        transactions = self.repository.recent_transactions(wallet=wallet) if wallet is not None else []
+        return {"wallet": wallet, "transactions": transactions}
 
     def get_student_in_scope(self, *, student_id: int, is_director: bool, branch_ids: set[int]):
         student = self.repository.get_student(student_id=student_id)

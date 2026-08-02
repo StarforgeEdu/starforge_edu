@@ -26,6 +26,8 @@ class BranchTransferService(IBranchTransferService):
         to_branch_id: int,
         reason: str,
         actor,
+        actor_principal_kind: str,
+        actor_principal_id: int | None,
         allowed_branch_ids: set[int] | None,
     ) -> BranchTransfer:
         from apps.org.services import transfer_student
@@ -35,5 +37,7 @@ class BranchTransferService(IBranchTransferService):
             to_branch_id=to_branch_id,
             reason=reason,
             actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
             allowed_branch_ids=allowed_branch_ids,
         )

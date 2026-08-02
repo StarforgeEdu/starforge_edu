@@ -1,7 +1,8 @@
 """Rate limiting for the layered (plain-Django) view style — replaces DRF throttles.
 
-A fixed-window counter in the cache, keyed by ``scope:key`` (e.g. login attempts
-per IP, or per username). Used two ways:
+A fixed-window counter in the cache, keyed by ``scope:HMAC(key)`` (e.g. login
+attempts per IP, or per username). Plain identifiers never reach Redis. Used two
+ways:
 
     @ratelimit(limit=10, window=60, scope="login_ip")   # by client IP (default key)
     def login_view(request): ...
@@ -15,6 +16,7 @@ can't slip past the cap.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from functools import wraps
 from typing import Any
@@ -23,21 +25,35 @@ from django.core.cache import cache
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext_lazy as _
 
-from core.exceptions import ThrottledException
+from core.exceptions import ServiceUnavailableException, ThrottledException
+from core.privacy import private_fingerprint
 from core.utils import client_ip
+
+logger = logging.getLogger("starforge.ratelimit")
 
 
 def _consume(scope: str, key: str, limit: int, window: int) -> None:
-    bucket = f"rl:{scope}:{key}"
+    key_ref = private_fingerprint(key, namespace=f"rate-limit:{scope}")
+    bucket = f"rl:{scope}:{key_ref}"
     # cache.add sets the counter to 1 with the window TTL only if absent — the first
     # request in a window. Subsequent ones incr the existing counter (TTL preserved).
-    if cache.add(bucket, 1, timeout=window):
-        return
     try:
-        count = cache.incr(bucket)
-    except ValueError:  # key expired between add and incr — treat as a fresh window
-        cache.set(bucket, 1, timeout=window)
-        return
+        if cache.add(bucket, 1, timeout=window):
+            return
+        try:
+            count = cache.incr(bucket)
+        except ValueError:  # key expired between add and incr — start a fresh window
+            cache.set(bucket, 1, timeout=window)
+            return
+    except Exception as exc:
+        # Security-sensitive throttles must never fail open when their shared
+        # counter is unavailable. Do not include the identifier (or its digest) in
+        # logs; the request id already provides an operator correlation handle.
+        logger.error("Rate-limit backend unavailable for scope %s.", scope, exc_info=True)
+        raise ServiceUnavailableException(
+            _("This operation is temporarily unavailable."),
+            code="temporarily_unavailable",
+        ) from exc
     if count > limit:
         raise ThrottledException(_("Too many requests. Please slow down."), wait=window)
 

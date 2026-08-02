@@ -9,7 +9,7 @@ provider signature BEFORE touching any row (CODE-GUIDE §3 item 5).
 F-1 signature tampering:
   - Click bad sign -> error ``-1``, zero Payment rows.
   - Payme wrong HTTP Basic -> ``-32504``, HTTP 200, JSON-RPC error member.
-  - Uzum bad HMAC -> rejected, ``WebhookEvent.status == "rejected"``.
+  - Uzum bad HMAC -> rejected before attacker-controlled audit storage.
 
 F-2 replay protection:
   - Same Payme ``CreateTransaction`` id twice -> identical response, ONE Payment.
@@ -100,6 +100,26 @@ def test_click_invalid_signature_rejected_minus_1_zero_rows(configured_a):
     assert helpers.payment_rows(configured_a) == []
 
 
+def test_click_prepare_rejects_fractional_invoice_even_when_rounded_amount_is_signed(configured_a):
+    """A provider-initiated prepare cannot bypass the checkout precision gate."""
+    invoice = helpers.seed_open_invoice(
+        configured_a,
+        number="INV-CLICK-FRACTIONAL-PREPARE",
+        amount_uzs="149999.99",
+    )
+    payload = bld.make_click_prepare(
+        click_trans_id="click-fractional-prepare",
+        merchant_trans_id=invoice.number,
+        amount="150000",
+    )
+
+    response = _post_click(configured_a, payload)
+
+    assert response.status_code == 200
+    assert response.json()["error"] == -2  # Click ERROR_INVALID_AMOUNT
+    assert helpers.payment_rows(configured_a, provider="click") == []
+
+
 def test_payme_wrong_basic_auth_minus_32504_http200(configured_a):
     """Payme: wrong Basic auth -> -32504, HTTP 200, JSON-RPC error member."""
     payload = bld.payme_check_perform(amount_tiyin=AMOUNT_TIYIN, account=ACCOUNT)
@@ -112,15 +132,13 @@ def test_payme_wrong_basic_auth_minus_32504_http200(configured_a):
     assert helpers.payment_rows(configured_a) == []
 
 
-def test_uzum_bad_hmac_rejected_webhookevent(configured_a):
-    """Uzum: bad HMAC -> rejected; a WebhookEvent row records status=rejected."""
+def test_uzum_bad_hmac_is_rejected_without_persisting_attacker_nonce(configured_a):
+    """Uzum: bad HMAC is rejected before attacker-controlled audit storage."""
     body, headers = bld.make_uzum_webhook(order_id=ACCOUNT["order_id"], amount=AMOUNT_UZS, tamper_sign=True)
     resp = _post_uzum(configured_a, body, headers)
     # Uzum/Click use the standard TD-18 envelope on errors (Lane B decision).
     assert resp.status_code in (400, 401, 403), resp.content
-    events = helpers.webhook_event_rows(configured_a, provider="uzum")
-    assert events, "a WebhookEvent should be recorded even for a rejected webhook"
-    assert any(e.status == "rejected" and e.signature_valid is False for e in events)
+    assert helpers.webhook_event_rows(configured_a, provider="uzum") == []
     assert helpers.payment_rows(configured_a) == []
 
 
@@ -156,10 +174,11 @@ def test_click_complete_replay_duplicate_single_allocation(configured_a):
     """Same Click click_trans_id complete twice -> second recorded duplicate;
     allocation runs exactly once."""
     prepare = bld.make_click_prepare(merchant_trans_id=ACCOUNT["order_id"], amount=AMOUNT_UZS)
-    _post_click(configured_a, prepare)
+    prepared = _post_click(configured_a, prepare)
     complete = bld.make_click_complete(
         click_trans_id=prepare["click_trans_id"],
         merchant_trans_id=ACCOUNT["order_id"],
+        merchant_prepare_id=str(prepared.json()["merchant_prepare_id"]),
         amount=AMOUNT_UZS,
     )
     first = _post_click(configured_a, complete)
@@ -210,8 +229,17 @@ def test_click_complete_processing_error_is_rejected_not_swallowed(configured_a,
         raise RuntimeError("simulated deadlock")
 
     monkeypatch.setattr(services, "process_click_complete", _boom)
+    prepare = bld.make_click_prepare(
+        click_trans_id="click-boom-1",
+        merchant_trans_id=ACCOUNT["order_id"],
+        amount=AMOUNT_UZS,
+    )
+    prepared = _post_click(configured_a, prepare)
     complete = bld.make_click_complete(
-        click_trans_id="click-boom-1", merchant_trans_id=ACCOUNT["order_id"], amount=AMOUNT_UZS
+        click_trans_id="click-boom-1",
+        merchant_trans_id=ACCOUNT["order_id"],
+        merchant_prepare_id=str(prepared.json()["merchant_prepare_id"]),
+        amount=AMOUNT_UZS,
     )
     resp = _post_click(configured_a, complete)
     assert resp.json()["error"] != 0
@@ -269,20 +297,10 @@ def test_inactive_center_slug_404(configured_a):
 
 
 # --------------------------------------------------------------------------- #
-# R6/CONF3 — storage-exhaustion DoS: throttle ONLY the invalid-signature path
-# (a valid provider callback is never touched), plus WebhookEvent retention.
+# R6/CONF3 — storage-exhaustion DoS: invalid signatures never create rows;
+# authenticated replay rows have bounded retention.
 # --------------------------------------------------------------------------- #
-def test_invalid_webhook_flood_is_capped_per_ip(configured_a, monkeypatch):
-    """A forged-signature flood from one IP stops inserting WebhookEvent rows once the
-    per-IP invalid-webhook budget is spent — bounding the storage DoS — while still
-    recording the first few for audit."""
-    from django.core.cache import cache
-
-    from apps.payments import webhook_views
-
-    cache.clear()  # a clean per-IP bucket (LocMem cache persists across tests)
-    monkeypatch.setattr(webhook_views, "WEBHOOK_INVALID_RATELIMIT", 2)
-
+def test_invalid_webhook_flood_never_persists_attacker_nonces(configured_a):
     for i in range(5):
         body, headers = bld.make_uzum_webhook(
             event_id=f"flood-{i}", order_id=ACCOUNT["order_id"], amount=AMOUNT_UZS, tamper_sign=True
@@ -290,22 +308,11 @@ def test_invalid_webhook_flood_is_capped_per_ip(configured_a, monkeypatch):
         _post_uzum(configured_a, body, headers)
 
     events = helpers.webhook_event_rows(configured_a, provider="uzum")
-    assert len(events) == 2  # only the first 2 forged webhooks recorded; the rest dropped pre-INSERT
-    assert all(e.status == "rejected" for e in events)
+    assert events == []
 
 
-def test_valid_webhook_is_never_throttled(configured_a, monkeypatch):
-    """The invalid-path throttle must never touch a validly-signed callback (the money
-    path can't be re-broken — the reason R4-02 removed the blanket webhook limit). Even
-    after the invalid budget is exhausted for this IP, a valid webhook is recorded + acked."""
-    from django.core.cache import cache
-
-    from apps.payments import webhook_views
-
-    cache.clear()
-    monkeypatch.setattr(webhook_views, "WEBHOOK_INVALID_RATELIMIT", 1)
-
-    for i in range(3):  # exhaust the invalid budget for this IP
+def test_valid_webhook_still_enters_authenticated_replay_ledger(configured_a):
+    for i in range(3):
         body, headers = bld.make_uzum_webhook(
             event_id=f"bad-{i}", order_id=ACCOUNT["order_id"], amount=AMOUNT_UZS, tamper_sign=True
         )
@@ -321,7 +328,7 @@ def test_valid_webhook_is_never_throttled(configured_a, monkeypatch):
 
 def test_prune_webhook_events_removes_old_keeps_recent(configured_a):
     """The retention beat sweep deletes WebhookEvent rows past the window and keeps recent
-    ones — bounding long-term growth even under a distributed flood."""
+    ones, bounding authenticated replay-ledger growth."""
     from datetime import timedelta
 
     from django.utils import timezone

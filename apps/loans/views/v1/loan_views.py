@@ -23,11 +23,10 @@ from core.container import container
 from core.exceptions import NotFoundException, ValidationException
 from core.http import decimal_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
-from core.permissions import get_user_roles, has_permission_code
+from core.permissions import get_user_roles
 from core.responses import created, error, paginated, success
 from core.scoping import (
-    assert_permission_membership_scope,
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_branch_ids,
 )
 
@@ -39,19 +38,22 @@ def _service() -> ILoanService:
     return container.resolve(ILoanService)  # type: ignore[type-abstract]
 
 
-def _scope(request: HttpRequest) -> tuple[bool, bool, set[int]]:
-    """(is_unscoped, is_collector, branch_ids). is_unscoped = director/superuser (all);
-    is_collector = holds loan:collect (their branches + centre-wide); else borrower-scoped."""
+def _scope(request: HttpRequest, *, permission: str) -> tuple[bool, bool, set[int]]:
+    """Return exact global/handler/branch scope for one loan operation.
+
+    A read grant and a collection grant may belong to different memberships.
+    Resolving the operation explicitly prevents either grant from borrowing the
+    other's branch boundary.
+    """
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     roles = get_user_roles(req)
-    unscoped = is_unscoped(req)
-    is_collector = has_permission_code(roles, "loan:collect")
-    branch_ids = permission_membership_branch_ids(roles=roles, permission="loan:collect")
-    return unscoped, is_collector, branch_ids
+    unscoped = is_permission_unscoped(req, permission=permission)
+    branch_ids = permission_membership_branch_ids(roles=roles, permission=permission)
+    return unscoped, unscoped or bool(branch_ids), branch_ids
 
 
-def _get_visible(request: HttpRequest, pk: int):
-    is_unscoped, is_collector, branch_ids = _scope(request)
+def _get_visible(request: HttpRequest, pk: int, *, permission: str):
+    is_unscoped, is_collector, branch_ids = _scope(request, permission=permission)
     loan = _service().get_visible(
         is_unscoped=is_unscoped, is_collector=is_collector, user=request.user, branch_ids=branch_ids, pk=pk
     )
@@ -65,7 +67,7 @@ def _get_visible(request: HttpRequest, pk: int):
 def loans_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):  # HEAD -> list (200), as the old ViewSet mapped it
         check_perm(request, f"{_RESOURCE}:read")
-        is_unscoped, is_collector, branch_ids = _scope(request)
+        is_unscoped, is_collector, branch_ids = _scope(request, permission="loan:read")
         qs = _service().scoped_list(
             is_unscoped=is_unscoped, is_collector=is_collector, user=request.user, branch_ids=branch_ids
         )
@@ -89,7 +91,7 @@ def loan_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
-    return success(loan_to_dict(_get_visible(request, pk)))
+    return success(loan_to_dict(_get_visible(request, pk, permission="loan:read")))
 
 
 @csrf_exempt
@@ -98,7 +100,7 @@ def loan_repay_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:collect")
-    loan = _get_visible(request, pk)  # scoped -> a cross-branch collector 404s
+    loan = _get_visible(request, pk, permission="loan:collect")
     body = read_json(request)
     amount = decimal_field(body, "amount_uzs", max_digits=18)
     if amount is None or amount < _MIN_AMOUNT:
@@ -125,7 +127,7 @@ def loan_repayments_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
-    loan = _get_visible(request, pk)
+    loan = _get_visible(request, pk, permission="loan:read")
     rows = _service().repayments_of(loan=loan)
     return success([repayment_to_dict(r) for r in rows])
 
@@ -145,19 +147,41 @@ def _create_loan(request: HttpRequest) -> HttpResponse:
             code="validation_error",
             fields={"amount_uzs": ["Must be a number >= 0.01."]},
         )
-    branch = _resolve_branch(request, body)
+    allowed_branch_ids = _write_branch_scope(request)
+    branch = _resolve_branch(body, allowed_branch_ids=allowed_branch_ids)
     borrower = _resolve_borrower(request, body)
     dto = CreateLoanDTO(title=title, amount_uzs=amount, description=str_field(body, "description"))
-    loan = _service().create(dto, requested_by=request.user, branch=branch, borrower=borrower)
+    loan = _service().create(
+        dto,
+        requested_by=request.user,
+        branch=branch,
+        borrower=borrower,
+        allowed_branch_ids=allowed_branch_ids,
+    )
     fetched = _service().annotated_get(pk=loan.pk) or loan
     return created(loan_to_dict(fetched))
 
 
-def _resolve_branch(request: HttpRequest, body: dict[str, Any]):
-    """Resolve an OPTIONAL branch id to a non-archived Branch (unknown/archived -> 400)."""
+def _write_branch_scope(request: HttpRequest) -> set[int] | None:
+    if is_permission_unscoped(request, permission="loan:write"):
+        return None
+    return permission_membership_branch_ids(
+        roles=get_user_roles(request),
+        permission="loan:write",
+    )
+
+
+def _resolve_branch(
+    body: dict[str, Any],
+    *,
+    allowed_branch_ids: set[int] | None,
+):
+    """Resolve an explicit branch; the approval domain derives omitted targets."""
     if body.get("branch") is None:
         return None
     branch_id = int_field(body, "branch", required=True)
+    if allowed_branch_ids is not None and branch_id not in allowed_branch_ids:
+        raise NotFoundException(code="not_found")
     branch = _service().resolve_branch(branch_id=branch_id)  # type: ignore[arg-type]
     if branch is None:
         raise ValidationException(
@@ -165,16 +189,6 @@ def _resolve_branch(request: HttpRequest, body: dict[str, Any]):
             code="validation_error",
             fields={"branch": ["No such active branch."]},
         )
-    # A loans:write holder may only attribute a loan (and its OUT disbursement +
-    # repayments) to their OWN branch — every read path here is branch-scoped, so
-    # accepting an arbitrary branch on the write path mis-attributes the money and
-    # leaks a branch-id existence oracle. No-op for an unscoped caller (director).
-    assert_permission_membership_scope(
-        request,
-        permission="loan:write",
-        branch_id=branch.id,
-        enforce_department=False,
-    )
     return branch
 
 

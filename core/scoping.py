@@ -15,7 +15,6 @@ from django.db.models import Q, QuerySet
 from core.permissions import (
     MembershipGrantScope,
     PermissionRoleSet,
-    Role,
     _code_allowed,
     get_role_memberships,
     get_user_roles,
@@ -24,10 +23,76 @@ from core.permissions import (
 
 
 def is_unscoped(request: Any) -> bool:
-    """True when the caller bypasses branch scoping (superuser or DIRECTOR)."""
+    """True for superusers and canonical organization-owner memberships.
+
+    The legacy ``role`` column is not trusted when an AccountType exists.  This
+    prevents a stale/malformed ``role='director'`` value on a custom account type
+    from lending global scope to unrelated grants.
+    """
     if getattr(getattr(request, "user", None), "is_superuser", False):
         return True
-    return any(m.role == Role.DIRECTOR for m in get_role_memberships(request))
+    return any(scope.is_organization_wide for scope in get_user_roles(request).membership_scopes)
+
+
+def permission_membership_is_unscoped(
+    *,
+    roles: Iterable[str],
+    permission: str,
+    account_kinds: Iterable[str] | None = None,
+) -> bool:
+    """Whether an organization-wide membership supplies this exact permission.
+
+    A director assignment is an organization-wide boundary, but it must not lend
+    that boundary to a permission granted by a different membership.  Keeping the
+    check permission-specific closes that cross-membership scope escalation while
+    preserving the intended director behavior.
+    """
+    return any(
+        membership.is_organization_wide
+        for membership in permission_membership_scopes(
+            roles=roles,
+            permission=permission,
+            account_kinds=account_kinds,
+        )
+    )
+
+
+def is_permission_unscoped(
+    request: Any,
+    *,
+    permission: str,
+    account_kinds: Iterable[str] | None = None,
+) -> bool:
+    """Request form of :func:`permission_membership_is_unscoped`."""
+    if getattr(getattr(request, "user", None), "is_superuser", False):
+        return True
+    return permission_membership_is_unscoped(
+        roles=get_user_roles(request),
+        permission=permission,
+        account_kinds=account_kinds,
+    )
+
+
+def assert_permission_organization_scope(
+    request: Any,
+    *,
+    permission: str,
+    account_kinds: Iterable[str] | None = None,
+) -> None:
+    """Require this exact permission to come from an organization-wide grant.
+
+    Use this for tenant-global configuration that cannot be safely narrowed to a
+    branch or department (for example, editing account-type permission sets).
+    """
+    if is_permission_unscoped(
+        request,
+        permission=permission,
+        account_kinds=account_kinds,
+    ):
+        return
+    from core.exceptions import PermissionException
+
+    raise PermissionException(code="out_of_scope")
 
 
 def branch_ids(request: Any) -> set[int]:
@@ -102,12 +167,18 @@ def permission_membership_scope_q(
     Branch A cannot accidentally borrow the user's unrelated Branch B account
     type. Legacy/null memberships retain matrix+override compatibility.
     """
-    scoped = Q(pk__in=[])
-    for membership in permission_membership_scopes(
+    memberships = permission_membership_scopes(
         roles=roles,
         permission=permission,
         account_kinds=account_kinds,
-    ):
+    )
+    # ``Q()`` is neutral when OR-ed with another predicate, so use an explicit
+    # always-true row predicate for an exact permission-bearing director scope.
+    if any(membership.is_organization_wide for membership in memberships):
+        return Q(pk__isnull=False)
+
+    scoped = Q(pk__in=[])
+    for membership in memberships:
         if membership.department_id is None or department_field is None:
             scoped |= Q(**{branch_field: membership.branch_id})
         else:
@@ -167,6 +238,32 @@ def permission_membership_branch_ids(
     }
 
 
+def permission_membership_branch_wide_ids(
+    *,
+    roles: Iterable[str],
+    permission: str,
+    account_kinds: Iterable[str] | None = None,
+) -> set[int]:
+    """Branch ids where ``permission`` is granted without a department limit.
+
+    Use this for shared branch resources that have no department attribute with
+    which to enforce a narrower membership (for example branch policy, rooms,
+    or cross-branch transfer history). Organization-wide callers are handled by
+    :func:`is_permission_unscoped` before this helper is used.
+    """
+    return {
+        membership.branch_id
+        for membership in permission_membership_scopes(
+            roles=roles,
+            permission=permission,
+            account_kinds=account_kinds,
+        )
+        if membership.branch_id is not None
+        and membership.department_id is None
+        and not membership.is_organization_wide
+    }
+
+
 def permission_membership_department_ids(
     *,
     roles: Iterable[str],
@@ -195,16 +292,25 @@ def request_permission_membership_allows(
     account_kinds: Iterable[str] | None = None,
 ) -> bool:
     """Whether the exact membership granting ``permission`` covers the target."""
-    if is_unscoped(request):
+    if getattr(getattr(request, "user", None), "is_superuser", False):
         return True
     roles = get_user_roles(request)
     if not isinstance(roles, PermissionRoleSet):
         return False
     allowed_kinds = set(account_kinds) if account_kinds is not None else None
     for membership in roles.membership_scopes:
-        if membership.branch_id != branch_id:
-            continue
         if allowed_kinds is not None and membership.account_kind not in allowed_kinds:
+            continue
+        allowed = (
+            has_permission_code({membership.role}, permission)
+            if membership.is_legacy_fallback
+            else _code_allowed(set(membership.grants), set(), permission)
+        )
+        if not allowed:
+            continue
+        if membership.is_organization_wide:
+            return True
+        if membership.branch_id != branch_id:
             continue
         if (
             enforce_department
@@ -212,13 +318,7 @@ def request_permission_membership_allows(
             and membership.department_id != department_id
         ):
             continue
-        allowed = (
-            has_permission_code({membership.role}, permission)
-            if membership.is_legacy_fallback
-            else _code_allowed(set(membership.grants), set(), permission)
-        )
-        if allowed:
-            return True
+        return True
     return False
 
 
@@ -255,7 +355,11 @@ def scope_to_permission_memberships(
     account_kinds: Iterable[str] | None = None,
 ) -> QuerySet:
     """Filter rows by the exact memberships supplying ``permission``."""
-    if is_unscoped(request):
+    if is_permission_unscoped(
+        request,
+        permission=permission,
+        account_kinds=account_kinds,
+    ):
         return queryset
     return queryset.filter(
         permission_membership_scope_q(

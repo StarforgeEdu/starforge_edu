@@ -25,11 +25,18 @@ pytestmark = pytest.mark.django_db
 REQ = "/api/v1/approvals/requests/"
 
 
-def _student_id(tenant) -> int:
+def _student_id(tenant, requester=None) -> int:
     from apps.students.tests.factories import StudentProfileFactory
 
     with schema_context(tenant.schema_name):
-        return StudentProfileFactory.create().id
+        branch_id = (
+            requester.role_memberships.filter(revoked_at__isnull=True)
+            .values_list("branch_id", flat=True)
+            .first()
+            if requester is not None
+            else None
+        )
+        return StudentProfileFactory.create(**({"branch_id": branch_id} if branch_id else {})).id
 
 
 def _set_policy(tenant, *, enabled=True, excused_only=True) -> None:
@@ -86,8 +93,8 @@ def _request(client, *, student_id, attendance_id, amount="50000"):
 
 def test_request_rejected_when_center_has_not_opted_in(tenant_a, as_role):
     """The policy is OFF by default — a center must explicitly enable absence deductions."""
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
     r = _request(teacher, student_id=sid, attendance_id=aid)
     assert r.status_code == 400, r.content
@@ -98,8 +105,8 @@ def test_excused_only_policy_rejects_a_plain_absence(tenant_a, as_role):
     """With the default excused-only policy, an unexcused (plain ABSENT) record does not
     qualify — only an absence with an accepted reason (EXCUSED) earns a credit."""
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid, status=AttendanceRecord.Status.ABSENT)
     r = _request(teacher, student_id=sid, attendance_id=aid)
     assert r.status_code == 400
@@ -108,8 +115,8 @@ def test_excused_only_policy_rejects_a_plain_absence(tenant_a, as_role):
 
 def test_plain_absence_allowed_when_policy_does_not_require_excuse(tenant_a, as_role):
     _set_policy(tenant_a, enabled=True, excused_only=False)
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid, status=AttendanceRecord.Status.ABSENT)
     r = _request(teacher, student_id=sid, attendance_id=aid)
     assert r.status_code == 201, r.content
@@ -118,8 +125,8 @@ def test_plain_absence_allowed_when_policy_does_not_require_excuse(tenant_a, as_
 
 def test_a_present_record_is_not_an_absence(tenant_a, as_role):
     _set_policy(tenant_a, enabled=True, excused_only=False)
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid, status=AttendanceRecord.Status.PRESENT)
     r = _request(teacher, student_id=sid, attendance_id=aid)
     assert r.status_code == 400
@@ -129,9 +136,9 @@ def test_a_present_record_is_not_an_absence(tenant_a, as_role):
 def test_attendance_must_belong_to_the_named_student(tenant_a, as_role):
     """Anti-fraud: you cannot pin another student's absence to this student's deduction."""
     _set_policy(tenant_a, enabled=True, excused_only=False)
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
-    other_sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
+    other_sid = _student_id(tenant_a, teacher_user)
     aid_other = _absence(tenant_a, student_id=other_sid)
     r = _request(teacher, student_id=sid, attendance_id=aid_other)
     assert r.status_code == 400
@@ -140,9 +147,9 @@ def test_attendance_must_belong_to_the_named_student(tenant_a, as_role):
 
 def test_approving_materializes_a_credit_discount(tenant_a, as_role):
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, director_user = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
 
     rid = _request(teacher, student_id=sid, attendance_id=aid, amount="45000").json()["data"]["id"]
@@ -170,9 +177,9 @@ def test_correcting_the_absence_retires_the_unclaimed_credit(tenant_a, as_role):
     attended. clear_absence_deduction (called by mark_attendance on an absent->present
     transition) retires a still-active credit and stamps the audit trail."""
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
     rid = _request(teacher, student_id=sid, attendance_id=aid, amount="45000").json()["data"]["id"]
     discount_id = director.post(f"{REQ}{rid}/approve/", {}, format="json").json()["data"]["payload"][
@@ -199,9 +206,9 @@ def test_approve_re_enforces_excused_only_after_excuse_revoked(tenant_a, as_role
     excuse is revoked (EXCUSED->ABSENT) before approval, approving must be rejected — the
     approve-time re-check enforces the excused-only policy, not just absence-ness."""
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid, status=AttendanceRecord.Status.EXCUSED)
     rid = _request(teacher, student_id=sid, attendance_id=aid).json()["data"]["id"]
 
@@ -219,9 +226,9 @@ def test_credit_applies_to_one_invoice_then_retires(tenant_a, as_role):
     exactly once. A single-use Discount reduces the next invoice and then retires, so it
     never recurs on every future bill the way a standing scholarship would."""
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
     rid = _request(teacher, student_id=sid, attendance_id=aid, amount="45000").json()["data"]["id"]
     director.post(f"{REQ}{rid}/approve/", {}, format="json")
@@ -259,8 +266,8 @@ def test_non_dict_payload_is_a_clean_400_not_a_500(tenant_a, as_role):
 
 def test_an_absence_cannot_be_deducted_twice(tenant_a, as_role):
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
     assert _request(teacher, student_id=sid, attendance_id=aid).status_code == 201
     second = _request(teacher, student_id=sid, attendance_id=aid)
@@ -272,9 +279,9 @@ def test_rejecting_deactivates_the_credit_and_frees_the_absence(tenant_a, as_rol
     """A reversed deduction stops crediting (the Discount deactivates) and the absence
     becomes deductible again — a fresh request is no longer a duplicate."""
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
     rid = _request(teacher, student_id=sid, attendance_id=aid).json()["data"]["id"]
     director.post(f"{REQ}{rid}/approve/", {}, format="json")
@@ -297,8 +304,8 @@ def test_non_finite_amount_is_a_clean_400_not_a_500(tenant_a, as_role):
     """A non-finite Decimal in the freeform payload is unordered — a range comparison
     would raise InvalidOperation (a 500). It must be a clean 400."""
     _set_policy(tenant_a, enabled=True, excused_only=True)
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     aid = _absence(tenant_a, student_id=sid)
     r = _request(teacher, student_id=sid, attendance_id=aid, amount="NaN")
     assert r.status_code == 400, r.content

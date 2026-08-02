@@ -12,13 +12,34 @@ from apps.approvals.models import ApprovalRequest, LedgerEntry
 
 class IApprovalService(ABC):
     @abstractmethod
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[ApprovalRequest]: ...
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> QuerySet[ApprovalRequest]: ...
 
     @abstractmethod
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> ApprovalRequest | None: ...
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str | None = "approvals:read",
+        include_requested_by: bool = True,
+    ) -> ApprovalRequest | None: ...
 
     @abstractmethod
-    def create(self, *, data: dict[str, Any], requested_by) -> ApprovalRequest: ...
+    def create(
+        self,
+        *,
+        data: dict[str, Any],
+        requested_by,
+        allowed_branch_ids: set[int] | None,
+    ) -> ApprovalRequest: ...
 
     @abstractmethod
     def approve(self, *, request_id: int, actor, note: str) -> ApprovalRequest: ...

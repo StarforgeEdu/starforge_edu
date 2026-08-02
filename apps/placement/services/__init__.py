@@ -544,16 +544,26 @@ def reject_proposal(*, proposal: GroupProposal, manager, reason: str) -> GroupPr
 
 _MAX_GENERATED_QUESTIONS = 100
 _MAX_QUESTION_POINTS = 100  # sane domain cap, well under the smallint column limit
+_MAX_GENERATED_PROMPT_CHARS = 4000
+_MAX_GENERATED_OPTIONS = 20
+_MAX_GENERATED_OPTION_CHARS = 1000
+_MAX_GENERATED_MARKS = 1000
 
 
 def request_placement_generation(
-    *, test: PlacementTest, count: int, difficulty: str = "medium", topic: str = "", requested_by=None
+    *,
+    test: PlacementTest,
+    count: int,
+    difficulty: str = "medium",
+    topic: str = "",
+    requested_by=None,
+    requested_principal=None,
 ):
     """Ask the AI to draft questions for a DRAFT test. Gated by the centre's AI-
     generation toggle, budget-reserved, and enqueued on commit; the generated
     questions are applied to the draft by the task (apply_generated_questions)."""
     from apps.ai.models import AIFeature
-    from apps.ai.services import AIFeatureDisabled, active_prompt, check_and_reserve_budget
+    from apps.ai.services import AIFeatureDisabled, check_and_reserve_budget
     from core.utils import current_schema
 
     if test.status != PlacementTest.Status.DRAFT:
@@ -563,13 +573,13 @@ def request_placement_generation(
     if not get_center_settings().ai_exam_generation_enabled:
         raise AIFeatureDisabled(code="feature_disabled")
 
-    prompt = active_prompt(AIFeature.PLACEMENT_GENERATION)
     ai_request = check_and_reserve_budget(
         feature=AIFeature.PLACEMENT_GENERATION,
-        estimated_tokens=prompt.token_cost_cap,
         requested_by=requested_by,
+        requested_principal=requested_principal,
         source_app="placement",
         source_id=test.id,
+        params={"count": count, "difficulty": difficulty, "topic": topic},
     )
     if getattr(ai_request, "_should_enqueue", False):
         schema = current_schema()
@@ -634,16 +644,39 @@ def apply_generated_questions(*, test_id: int, output_text: str) -> int:
             continue
         prompt_text = item.get("prompt")
         question_type = item.get("question_type")
-        if not isinstance(prompt_text, str) or not prompt_text.strip():
+        if (
+            not isinstance(prompt_text, str)
+            or not prompt_text.strip()
+            or len(prompt_text) > _MAX_GENERATED_PROMPT_CHARS
+        ):
             continue
         if not isinstance(question_type, str) or prompt_text in seen_prompts:
             continue
         if allowed and question_type not in allowed:
             continue  # the model proposed a type this center has disabled — drop it
         options = item.get("options") or []
+        if (
+            not isinstance(options, list)
+            or len(options) > _MAX_GENERATED_OPTIONS
+            or any(
+                not isinstance(option, str) or len(option) > _MAX_GENERATED_OPTION_CHARS for option in options
+            )
+        ):
+            continue
         correct = (
             None if question_type in PlacementQuestion.HUMAN_GRADED_TYPES else item.get("correct_answer")
         )
+        if (isinstance(correct, str) and len(correct) > _MAX_GENERATED_OPTION_CHARS) or (
+            isinstance(correct, list)
+            and (
+                len(correct) > _MAX_GENERATED_OPTIONS
+                or any(
+                    not isinstance(answer, str) or len(answer) > _MAX_GENERATED_OPTION_CHARS
+                    for answer in correct
+                )
+            )
+        ):
+            continue
         # Coerce a stringified boolean the model may emit for true/false.
         if (
             question_type == _QT.TRUE_FALSE
@@ -682,11 +715,11 @@ def apply_generated_questions(*, test_id: int, output_text: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def request_writing_marking(*, attempt: PlacementAttempt, requested_by=None):
+def request_writing_marking(*, attempt: PlacementAttempt, requested_by=None, requested_principal=None):
     """Ask the AI to score the WRITING answers of a submitted attempt. Budget-reserved
     and enqueued on commit; the marks are applied + the grade recomputed by the task."""
     from apps.ai.models import AIFeature
-    from apps.ai.services import active_prompt, check_and_reserve_budget
+    from apps.ai.services import check_and_reserve_budget
     from core.utils import current_schema
 
     if attempt.status != PlacementAttempt.Status.GRADED:
@@ -696,13 +729,13 @@ def request_writing_marking(*, attempt: PlacementAttempt, requested_by=None):
         raise UnprocessableEntity(
             _("This attempt has no writing answers to mark."), code="no_writing_answers"
         )
-    prompt = active_prompt(AIFeature.WRITING_MARKING)
     ai_request = check_and_reserve_budget(
         feature=AIFeature.WRITING_MARKING,
-        estimated_tokens=prompt.token_cost_cap,
         requested_by=requested_by,
+        requested_principal=requested_principal,
         source_app="placement",
         source_id=attempt.id,
+        params={},
     )
     if getattr(ai_request, "_should_enqueue", False):
         schema = current_schema()
@@ -739,7 +772,7 @@ def apply_writing_marks(*, attempt_id: int, output_text: str) -> int:
     if not writing_answers:
         return 0
     marked = 0
-    for item in _parse_question_payload(output_text):
+    for item in _parse_question_payload(output_text)[:_MAX_GENERATED_MARKS]:
         if not isinstance(item, dict):
             continue
         qid = item.get("question_id")

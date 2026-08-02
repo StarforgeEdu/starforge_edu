@@ -7,8 +7,25 @@ from django.db.models import Count, Q, QuerySet
 
 from apps.attendance.models import AttendanceRecord
 from apps.cohorts.models import Cohort
-from core.permissions import PermissionRoleSet, Role
-from core.scoping import permission_membership_scope_q, role_membership_scope_q
+from core.permissions import PermissionRoleSet, Role, get_unambiguous_user_roles
+from core.scoping import (
+    permission_membership_is_unscoped,
+    permission_membership_scope_q,
+    permission_membership_scopes,
+    role_membership_scope_q,
+)
+
+
+def _kind_can_read_attendance(roles: set[str], kind: str, legacy_role: str) -> bool:
+    if isinstance(roles, PermissionRoleSet):
+        return bool(
+            permission_membership_scopes(
+                roles=roles,
+                permission="attendance:read",
+                account_kinds={kind},
+            )
+        )
+    return legacy_role in roles
 
 
 def _base() -> QuerySet[AttendanceRecord]:
@@ -23,8 +40,15 @@ def scoped_records(*, user, roles: set[str] | None = None) -> QuerySet[Attendanc
     if user.is_superuser:
         return qs
     if roles is None:
-        roles = {m.role for m in user.role_memberships.filter(revoked_at__isnull=True)}
-    if Role.DIRECTOR in roles:
+        roles = get_unambiguous_user_roles(user)
+    if isinstance(roles, PermissionRoleSet):
+        if permission_membership_is_unscoped(
+            roles=roles,
+            permission="attendance:read",
+            account_kinds={"staff"},
+        ):
+            return qs
+    elif Role.DIRECTOR in roles:
         return qs
 
     visible = permission_membership_scope_q(
@@ -41,11 +65,27 @@ def scoped_records(*, user, roles: set[str] | None = None) -> QuerySet[Attendanc
             branch_field="lesson__cohort__branch_id",
             department_field="lesson__cohort__department_id",
         )
-    if Role.TEACHER in roles:
-        visible |= Q(lesson__teacher__user=user)
-    if Role.PARENT in roles:
-        visible |= Q(student__guardians__parent__user=user)
-    if Role.STUDENT in roles:
+    if _kind_can_read_attendance(roles, "teacher", Role.TEACHER):
+        teacher_records = Q(lesson__teacher__user=user)
+        if isinstance(roles, PermissionRoleSet):
+            # Being assigned to a lesson is necessary but not sufficient: the
+            # exact teacher membership supplying attendance:read must also cover
+            # that lesson's branch/department. Otherwise a malformed cross-branch
+            # assignment can borrow a grant from an unrelated membership.
+            teacher_records &= permission_membership_scope_q(
+                roles=roles,
+                permission="attendance:read",
+                branch_field="lesson__cohort__branch_id",
+                department_field="lesson__cohort__department_id",
+                account_kinds={"teacher"},
+            )
+        visible |= teacher_records
+    if _kind_can_read_attendance(roles, "parent", Role.PARENT):
+        visible |= Q(
+            student__guardians__parent__user=user,
+            student__guardians__revoked_at__isnull=True,
+        )
+    if _kind_can_read_attendance(roles, "student", Role.STUDENT):
         visible |= Q(student__user=user)
     return qs.filter(visible).distinct()
 
@@ -56,8 +96,15 @@ def scoped_dashboard_cohorts(*, user, roles: set[str] | None = None) -> QuerySet
     if user.is_superuser:
         return qs
     if roles is None:
-        roles = {m.role for m in user.role_memberships.filter(revoked_at__isnull=True)}
-    if Role.DIRECTOR in roles:
+        roles = get_unambiguous_user_roles(user)
+    if isinstance(roles, PermissionRoleSet):
+        if permission_membership_is_unscoped(
+            roles=roles,
+            permission="attendance:read",
+            account_kinds={"staff"},
+        ):
+            return qs
+    elif Role.DIRECTOR in roles:
         return qs
 
     visible = permission_membership_scope_q(
@@ -74,10 +121,24 @@ def scoped_dashboard_cohorts(*, user, roles: set[str] | None = None) -> QuerySet
             branch_field="branch_id",
             department_field="department_id",
         )
-    if Role.TEACHER in roles:
+    if _kind_can_read_attendance(roles, "teacher", Role.TEACHER):
         from apps.cohorts.selectors import taught_cohorts
 
-        visible |= Q(pk__in=taught_cohorts(user=user).values("pk"))
+        taught = taught_cohorts(user=user)
+        if isinstance(roles, PermissionRoleSet):
+            # Keep the natural teaching relationship inside the scope of the
+            # permission-bearing teacher membership. Assignment alone must not
+            # turn a Branch-B teacher into a whole-class viewer in Branch A.
+            taught = taught.filter(
+                permission_membership_scope_q(
+                    roles=roles,
+                    permission="attendance:read",
+                    branch_field="branch_id",
+                    department_field="department_id",
+                    account_kinds={"teacher"},
+                )
+            )
+        visible |= Q(pk__in=taught.values("pk"))
     return qs.filter(visible).distinct()
 
 
@@ -111,8 +172,8 @@ def cohort_dashboard(*, cohort_id: int, date_from=None, date_to=None) -> dict:
         qs.values(
             "student_id",
             "student__student_id",
-            "student__user__first_name",
-            "student__user__last_name",
+            "student__first_name",
+            "student__last_name",
         )
         .annotate(
             present=Count("id", filter=Q(status=AttendanceRecord.Status.PRESENT)),
@@ -121,7 +182,7 @@ def cohort_dashboard(*, cohort_id: int, date_from=None, date_to=None) -> dict:
             excused=Count("id", filter=Q(status=AttendanceRecord.Status.EXCUSED)),
             total=Count("id"),
         )
-        .order_by("student__user__last_name", "student__user__first_name")
+        .order_by("student__last_name", "student__first_name")
     )
 
     students = []
@@ -130,7 +191,7 @@ def cohort_dashboard(*, cohort_id: int, date_from=None, date_to=None) -> dict:
         total = row["total"]
         cohort_present += row["present"]
         cohort_total += total
-        name = f"{row['student__user__first_name']} {row['student__user__last_name']}".strip()
+        name = f"{row['student__first_name']} {row['student__last_name']}".strip()
         students.append(
             {
                 "student": row["student_id"],

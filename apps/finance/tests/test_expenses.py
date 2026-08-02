@@ -21,11 +21,15 @@ def test_expense_create_approve_pay_uses_three_people_and_ledger(tenant_a, user_
     maker = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=branch)
     checker = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
     payer = user_in(tenant_a, roles=[Role.CASHIER], branch=branch)
+    owner = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
     maker_client = as_user(tenant_a, maker)
     checker_client = as_user(tenant_a, checker)
     payer_client = as_user(tenant_a, payer)
+    owner_client = as_user(tenant_a, owner)
 
-    pm = maker_client.post(PM_URL, {"name": "Cash"}, format="json")
+    # Payment methods are organization-wide configuration. A branch accountant
+    # can use one for an expense but cannot redefine the global catalog.
+    pm = owner_client.post(PM_URL, {"name": "Cash"}, format="json")
     assert pm.status_code == 201, pm.content
     assert pm.json()["data"]["slug"] == "cash"
     method_id = pm.json()["data"]["id"]

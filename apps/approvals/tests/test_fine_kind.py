@@ -24,9 +24,16 @@ pytestmark = pytest.mark.django_db
 REQ = "/api/v1/approvals/requests/"
 
 
-def _student_id(tenant) -> int:
+def _student_id(tenant, requester=None) -> int:
     with schema_context(tenant.schema_name):
-        return StudentProfileFactory.create().id
+        branch_id = (
+            requester.role_memberships.filter(revoked_at__isnull=True)
+            .values_list("branch_id", flat=True)
+            .first()
+            if requester is not None
+            else None
+        )
+        return StudentProfileFactory.create(**({"branch_id": branch_id} if branch_id else {})).id
 
 
 def _raise_fine(client, sid, *, amount="50000", reason="Repeated lateness"):
@@ -43,9 +50,9 @@ def _raise_fine(client, sid, *, amount="50000", reason="Repeated lateness"):
 
 
 def test_approving_fine_issues_a_penalty_invoice(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
 
     r = _raise_fine(teacher, sid, amount="75000")
     assert r.status_code == 201, r.content
@@ -79,9 +86,9 @@ def test_approving_fine_issues_a_penalty_invoice(tenant_a, as_role):
 def test_fine_ignores_a_standing_discount(tenant_a, as_role):
     """A scholarship must not shrink a punishment — the penalty invoice bills the
     full fine, with no discount line, even when the student has a standing discount."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     with schema_context(tenant_a.schema_name):
         from apps.finance.models import Discount
 
@@ -106,9 +113,9 @@ def test_fine_ignores_a_standing_discount(tenant_a, as_role):
 def test_fine_cannot_be_disbursed(tenant_a, as_role):
     """A fine collects money IN (a charge) — it is never paid OUT. With no amount on
     the request, disburse is refused."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)  # director also holds approvals:disburse
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     rid = _raise_fine(teacher, sid).json()["data"]["id"]
     director.post(f"{REQ}{rid}/approve/", {}, format="json")
 
@@ -134,8 +141,8 @@ def test_fine_requires_valid_student(tenant_a, as_role):
 
 
 def test_fine_requires_an_amount(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     r = teacher.post(REQ, {"kind": "fine", "title": "x", "payload": {"student_id": sid}}, format="json")
     assert r.status_code == 400
     assert r.json()["code"] == "fine_amount_required"
@@ -206,9 +213,9 @@ def test_cannot_approve_own_fine(tenant_a, as_role):
 
 
 def test_rejecting_approved_fine_voids_the_invoice(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     rid = _raise_fine(teacher, sid).json()["data"]["id"]
     inv_id = director.post(f"{REQ}{rid}/approve/", {}, format="json").json()["data"]["payload"]["invoice_id"]
 
@@ -224,9 +231,9 @@ def test_rejecting_approved_fine_voids_the_invoice(tenant_a, as_role):
 def test_cannot_reject_a_fine_the_student_already_paid(tenant_a, as_role):
     """Anti-fraud: once money has moved against the fine, you cannot silently un-bill
     it — the reject is refused (409) and rolls back, forcing the refund flow."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     rid = _raise_fine(teacher, sid).json()["data"]["id"]
     inv_id = director.post(f"{REQ}{rid}/approve/", {}, format="json").json()["data"]["payload"]["invoice_id"]
 
@@ -248,11 +255,11 @@ def test_cannot_reject_a_fine_the_student_already_paid(tenant_a, as_role):
 
 
 def test_fine_student_deleted_before_approve(tenant_a, as_role):
-    """The existence guard at approve time rolls the whole approval back (422,
+    """The target guard at approve time rolls the whole approval back (404,
     request stays pending, no orphan invoice)."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
-    sid = _student_id(tenant_a)
+    sid = _student_id(tenant_a, teacher_user)
     rid = _raise_fine(teacher, sid).json()["data"]["id"]
 
     with schema_context(tenant_a.schema_name):
@@ -261,8 +268,8 @@ def test_fine_student_deleted_before_approve(tenant_a, as_role):
         StudentProfile.objects.filter(pk=sid).delete()
 
     resp = director.post(f"{REQ}{rid}/approve/", {}, format="json")
-    assert resp.status_code == 422
-    assert resp.json()["code"] == "fine_student_missing"
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "not_found"
     with schema_context(tenant_a.schema_name):
         from apps.approvals.models import ApprovalRequest
 
@@ -281,8 +288,8 @@ def _penalty(tenant, student_id, *, points=3):
 def test_fine_can_cite_a_penalty_on_the_same_student(tenant_a, as_role):
     """F24-1: a fine may link the rule breach (a student demerit) it escalates from — the
     audit trail from discipline to money."""
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     pid = _penalty(tenant_a, sid)
     r = teacher.post(
         REQ,
@@ -299,9 +306,12 @@ def test_fine_can_cite_a_penalty_on_the_same_student(tenant_a, as_role):
 
 
 def test_fine_cannot_cite_another_students_penalty(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
-    other_pid = _penalty(tenant_a, _student_id(tenant_a))  # a penalty on a DIFFERENT student
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
+    other_pid = _penalty(
+        tenant_a,
+        _student_id(tenant_a, teacher_user),
+    )  # a penalty on a DIFFERENT student
     r = teacher.post(
         REQ,
         {
@@ -317,8 +327,8 @@ def test_fine_cannot_cite_another_students_penalty(tenant_a, as_role):
 
 
 def test_fine_with_a_nonexistent_penalty_is_rejected(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    sid = _student_id(tenant_a)
+    teacher, teacher_user = as_role(Role.TEACHER)
+    sid = _student_id(tenant_a, teacher_user)
     r = teacher.post(
         REQ,
         {

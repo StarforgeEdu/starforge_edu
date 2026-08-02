@@ -19,10 +19,10 @@ from core.interfaces import IBaseRepository
 
 
 class _ICrudRepository(IBaseRepository):
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet:
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet:
         raise NotImplementedError
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None):
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):
         raise NotImplementedError
 
     def add(self, *, data: dict[str, Any]):
@@ -60,18 +60,18 @@ class IFolderRepository(_ICrudRepository, IBaseRepository[Folder]):
 
 
 class ILessonFileRepository(IBaseRepository[LessonFile]):
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[LessonFile]:
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet[LessonFile]:
         raise NotImplementedError
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> LessonFile | None:
+    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str) -> LessonFile | None:
         raise NotImplementedError
 
 
 class ILibraryMaterialRepository(IBaseRepository[LibraryMaterial]):
-    def scoped(self, *, user: Any, roles: set[str] | None, manages: bool) -> QuerySet[LibraryMaterial]:
+    def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet[LibraryMaterial]:
         raise NotImplementedError
 
     def get_scoped(
-        self, *, pk: int, user: Any, roles: set[str] | None, manages: bool
+        self, *, pk: int, user: Any, roles: set[str] | None, permission: str
     ) -> LibraryMaterial | None:
         raise NotImplementedError

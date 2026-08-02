@@ -13,4 +13,4 @@ class BranchTransferRepository(BaseRepository[BranchTransfer], IBranchTransferRe
     model = BranchTransfer
 
     def get_queryset(self) -> QuerySet[BranchTransfer]:
-        return BranchTransfer.objects.select_related("from_branch", "to_branch", "user", "actor")
+        return BranchTransfer.objects.select_related("from_branch", "to_branch", "student")

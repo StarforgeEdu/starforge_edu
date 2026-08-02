@@ -18,6 +18,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from apps.cards.dto.card_dto import WalletAmountDTO
 from apps.cards.interfaces.services import ICardService, ICardTypeService, IWalletService
+from apps.cards.openapi_contracts import STUDENT_WALLET_CONTRACTS, WALLET_ME_CONTRACTS
 from apps.cards.presenters import (
     card_scan_to_dict,
     card_to_dict,
@@ -32,9 +33,10 @@ from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
 from core.http import bool_field, decimal_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles, has_permission_code
 from core.responses import created, error, paginated, success
-from core.scoping import is_unscoped, permission_membership_branch_ids
+from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 
 _MIN_AMOUNT = Decimal("0.01")
 
@@ -57,9 +59,10 @@ def _card_scope(request: HttpRequest, permission: str = "card:read") -> tuple[bo
     only their own."""
     req: Any = request
     roles = get_user_roles(req)
-    is_director = is_unscoped(req)
     staff_permissions = ("card:write", "card:scan") if permission == "card:read" else (permission,)
     is_card_staff = any(has_permission_code(roles, code) for code in staff_permissions)
+    visibility_permissions = {permission, *staff_permissions}
+    is_director = any(is_permission_unscoped(req, permission=code) for code in visibility_permissions)
     branch_ids: set[int] = set()
     for code in staff_permissions:
         branch_ids |= permission_membership_branch_ids(roles=roles, permission=code)
@@ -70,7 +73,7 @@ def _card_scope(request: HttpRequest, permission: str = "card:read") -> tuple[bo
 def _wallet_scope(request: HttpRequest, permission: str) -> tuple[bool, set[int]]:
     req: Any = request
     roles = get_user_roles(req)
-    is_director = is_unscoped(req)
+    is_director = is_permission_unscoped(req, permission=permission)
     branch_ids = permission_membership_branch_ids(roles=roles, permission=permission)
     return is_director, branch_ids
 
@@ -241,6 +244,10 @@ def card_scans_collection_view(request: HttpRequest) -> HttpResponse:
 
 
 # --- wallets ---------------------------------------------------------------
+@openapi_contract(
+    path="/api/v1/cards/wallets/me/",
+    operations=WALLET_ME_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def wallet_me_view(request: HttpRequest) -> HttpResponse:
@@ -252,6 +259,10 @@ def wallet_me_view(request: HttpRequest) -> HttpResponse:
     return success(wallet_payload_to_dict(_wallet_service().wallet_payload(student=profile)))
 
 
+@openapi_contract(
+    path="/api/v1/cards/wallets/{student_id}/",
+    operations=STUDENT_WALLET_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def student_wallet_view(request: HttpRequest, student_id: int) -> HttpResponse:

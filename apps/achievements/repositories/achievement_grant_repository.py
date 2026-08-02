@@ -25,7 +25,10 @@ class AchievementGrantRepository(BaseRepository[AchievementGrant], IAchievementG
             student_ids: list[int] = [student.pk]
         else:
             student_ids = list(
-                StudentProfile.objects.filter(guardians__parent__user=user).values_list("pk", flat=True)
+                StudentProfile.objects.filter(
+                    guardians__parent__user=user,
+                    guardians__revoked_at__isnull=True,
+                ).values_list("pk", flat=True)
             )
         return self.get_queryset().filter(student_id__in=student_ids).order_by("-granted_at")
 

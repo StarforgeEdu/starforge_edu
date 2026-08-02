@@ -13,6 +13,7 @@ fills ``billing.UsageSnapshot`` is a public-schema Celery task, not a model here
 
 from __future__ import annotations
 
+from django.contrib.postgres.indexes import GinIndex
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
@@ -88,6 +89,7 @@ class ReportRun(models.Model):
         indexes = [
             models.Index(fields=("report", "status"), name="reports_run_report_status_idx"),
             models.Index(fields=("status", "created_at"), name="reports_run_status_created_idx"),
+            GinIndex(fields=("params",), name="report_run_params_gin"),
         ]
         verbose_name = _("report run")
         verbose_name_plural = _("report runs")
@@ -126,6 +128,7 @@ class ReportSchedule(models.Model):
         ordering = ("-created_at",)
         indexes = [
             models.Index(fields=("is_active", "cadence"), name="reports_sched_active_cad_idx"),
+            GinIndex(fields=("params",), name="report_sched_params_gin"),
         ]
         constraints = [
             # weekly => weekday set; monthly => day_of_month set.

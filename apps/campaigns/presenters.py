@@ -4,7 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from apps.campaigns.models import Campaign, CampaignRecipient, DoNotContact, MessageTemplate
+from apps.campaigns.models import (
+    Campaign,
+    CampaignRecipient,
+    DoNotContact,
+    MessageTemplate,
+)
+
+_CAMPAIGN_ERROR_CODES = {
+    "delivery_failed",
+    "delivery_pending",
+    "queue_delivery_failed",
+}
+_RECIPIENT_ERROR_CODES = {"delivery_failed", "do_not_contact"}
+
+
+def _public_error_code(value: str, allowed: set[str], fallback: str) -> str:
+    """Never expose provider/broker exception text stored by older releases."""
+    if not value:
+        return ""
+    return value if value in allowed else fallback
 
 
 def campaign_to_dict(c: Campaign) -> dict[str, Any]:
@@ -29,7 +48,7 @@ def campaign_to_dict(c: Campaign) -> dict[str, Any]:
         "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
         "sent_at": c.sent_at.isoformat() if c.sent_at else None,
         "send_attempts": c.send_attempts,
-        "last_error": c.last_error,
+        "last_error": _public_error_code(c.last_error, _CAMPAIGN_ERROR_CODES, "delivery_failed"),
         "created_at": c.created_at.isoformat(),
     }
 
@@ -42,7 +61,7 @@ def recipient_to_dict(r: CampaignRecipient) -> dict[str, Any]:
         "student_name": r.student.get_full_name() if r.student_id else None,
         "phone": r.phone,
         "status": r.status,
-        "error": r.error,
+        "error": _public_error_code(r.error, _RECIPIENT_ERROR_CODES, "delivery_failed"),
         "sent_at": r.sent_at.isoformat() if r.sent_at else None,
     }
 

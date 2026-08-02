@@ -179,11 +179,29 @@ class RecurrenceRuleService(IRecurrenceRuleService):
     def get(self, *, pk: int) -> RecurrenceRule | None:
         return self.repository.get(pk=pk)
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[RecurrenceRule]:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[RecurrenceRule]:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> RecurrenceRule | None:
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> RecurrenceRule | None:
+        return self.repository.get_scoped(
+            pk=pk,
+            user=user,
+            roles=roles,
+            permission=permission,
+        )
 
     def _resolve_fks(self, data: dict[str, Any]) -> dict[str, Any]:
         """Replace any present FK-id value with the ORM object, raising a clean 400
@@ -218,11 +236,29 @@ class LessonService(ILessonService):
     def __init__(self, repository: ILessonRepository) -> None:
         self.repository = repository
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[Lesson]:
-        return self.repository.scoped(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[Lesson]:
+        return self.repository.scoped(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> Lesson | None:
-        return self.repository.get_scoped(pk=pk, user=user, roles=roles)
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> Lesson | None:
+        return self.repository.get_scoped(
+            pk=pk,
+            user=user,
+            roles=roles,
+            permission=permission,
+        )
 
     def cancel(self, lesson: Lesson, *, reason: str, actor) -> Lesson:
         return domain.cancel_occurrence(lesson, reason=reason, actor=actor)

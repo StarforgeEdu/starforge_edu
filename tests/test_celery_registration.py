@@ -23,6 +23,31 @@ def test_beat_tasks_registered_via_autodiscovery():
     assert "celery_tasks.cleanup_tasks.purge_expired_otps" in app.tasks
 
 
+def test_every_project_task_uses_the_durable_at_least_once_contract():
+    from celery_tasks.durability import contract_for_task, registry_fingerprint
+
+    app.loader.import_default_modules()
+    app.finalize()
+    project_tasks = {
+        name: task for name, task in app.tasks.items() if name.startswith("celery_tasks.")
+    }
+    assert project_tasks
+    for name, task in project_tasks.items():
+        assert task.acks_late is True, name
+        assert task.acks_on_failure_or_timeout is True, name
+        assert task.reject_on_worker_lost is True, name
+        contract = contract_for_task(name)
+        assert contract.invariant
+        assert contract.recovery
+
+    assert len(registry_fingerprint(list(project_tasks))) == 64
+
+    assert settings.CELERY_WORKER_PREFETCH_MULTIPLIER == 1
+    assert settings.CELERY_BROKER_TRANSPORT_OPTIONS["visibility_timeout"] > settings.CELERY_TASK_TIME_LIMIT
+    assert settings.CELERY_WORKER_CANCEL_LONG_RUNNING_TASKS_ON_CONNECTION_LOSS is False
+    assert settings.CELERY_TASK_PUBLISH_RETRY is True
+
+
 def test_report_schedule_scan_is_clock_aligned_crontab():
     """The report-schedule scan must use a clock-aligned crontab (:00), not a
     fixed interval — schedule_is_due requires an exact hour match, so a drifting

@@ -14,10 +14,10 @@ from apps.users.services import create_role_user_bridge, ensure_role_membership,
 from core.exceptions import (
     ConflictException,
     NotFoundException,
-    PermissionException,
     ValidationException,
 )
 from core.permissions import Role
+from core.role_principals import validate_role_principal
 
 # Enrollment states that still occupy capacity (mirrors Lane D's StudentProfile).
 ACTIVE_STUDENT_STATUSES_EXCLUDED = ("graduated", "withdrawn")
@@ -163,6 +163,10 @@ def validate_student_id_pattern(pattern: str, *, center_code: str = "") -> None:
 def replace_working_hours(branch: Branch, rows: list[dict[str, Any]]) -> list[BranchWorkingHours]:
     """Replace a branch's weekday rows wholesale (D1-LF-2). Validates that open
     times precede close times on non-closed days and that no weekday repeats."""
+    # Serialize replacement calls. Without a stable parent-row lock, two valid
+    # delete/bulk-create sequences can interleave and hit a duplicate constraint
+    # or leave a mixture of both requests.
+    branch = Branch.objects.select_for_update().get(pk=branch.pk)
     weekdays = [row["weekday"] for row in rows]
     if len(weekdays) != len(set(weekdays)):
         raise ValidationException(_("Each weekday may appear at most once."), code="invalid_working_hours")
@@ -170,24 +174,31 @@ def replace_working_hours(branch: Branch, rows: list[dict[str, Any]]) -> list[Br
         if not row.get("is_closed", False) and row["opens_at"] >= row["closes_at"]:
             raise ValidationException(_("opens_at must be before closes_at."), code="invalid_working_hours")
     BranchWorkingHours.objects.filter(branch=branch).delete()
-    BranchWorkingHours.objects.bulk_create(
-        [
-            BranchWorkingHours(
-                branch=branch,
-                weekday=row["weekday"],
-                opens_at=row["opens_at"],
-                closes_at=row["closes_at"],
-                is_closed=row.get("is_closed", False),
-            )
-            for row in rows
-        ]
-    )
+    # There are at most seven rows. Save individually so organization-calendar
+    # audit receivers capture each new immutable scope snapshot; bulk_create
+    # bypasses Django signals and would leave this security-sensitive policy
+    # change unattributed for negligible performance benefit.
+    for row in rows:
+        BranchWorkingHours.objects.create(
+            branch=branch,
+            weekday=row["weekday"],
+            opens_at=row["opens_at"],
+            closes_at=row["closes_at"],
+            is_closed=row.get("is_closed", False),
+        )
     return list(BranchWorkingHours.objects.filter(branch=branch).order_by("weekday"))
 
 
+@transaction.atomic
 def archive_branch(branch: Branch) -> Branch:
     """Soft-delete a branch (D1-LF-7). Refuses while it still has active
     students (no-op until Lane D's StudentProfile exists)."""
+    locked_branch = Branch.objects.select_for_update().filter(pk=branch.pk).first()
+    if locked_branch is None:
+        raise NotFoundException(code="not_found")
+    branch = locked_branch
+    if branch.archived_at is not None:
+        return branch
     StudentProfile = _student_profile_model()
     if StudentProfile is not None:
         has_active = (
@@ -210,11 +221,87 @@ def record_transfer(
     to_branch: Branch,
     reason: str = "",
     actor=None,
+    student=None,
+    actor_principal_kind: str = "",
+    actor_principal_id: int | None = None,
 ) -> BranchTransfer:
     """Append one branch-transfer audit row inside the caller's transaction."""
-    return BranchTransfer.objects.create(
-        user=user, from_branch=from_branch, to_branch=to_branch, reason=reason, actor=actor
+    reason = reason.strip()
+    if len(reason) > 64:
+        raise ValidationException(
+            _("Reason is too long."),
+            code="validation_error",
+            fields={"reason": [_("Must be at most 64 characters.")]},
+        )
+    if from_branch.pk == to_branch.pk:
+        raise ValidationException(_("Transfer branches must differ."), code="same_branch")
+    if actor is None:
+        actor_is_valid = actor_principal_kind == "" and actor_principal_id is None
+    else:
+        actor_is_valid = bool(actor_principal_kind) and actor_principal_id is not None
+    if not actor_is_valid:
+        raise ValidationException(
+            _("Actor attribution is invalid."),
+            code="validation_error",
+        )
+    if actor is not None:
+        validate_role_principal(
+            kind=actor_principal_kind,
+            principal_id=actor_principal_id,  # type: ignore[arg-type]  # checked above
+            user_id=actor.pk,
+            field="actor",
+        )
+    student_resolved = student is not None and student.user_id == user.pk
+    actor_name = _principal_display_name(
+        actor,
+        kind=actor_principal_kind,
+        principal_id=actor_principal_id,
     )
+    return BranchTransfer.objects.create(
+        user=user,
+        student=student if student_resolved else None,
+        student_public_id=student.student_id if student_resolved else "",
+        student_name=student.get_full_name() if student_resolved else "",
+        student_attribution_status=(
+            BranchTransfer.AttributionStatus.RESOLVED
+            if student_resolved
+            else BranchTransfer.AttributionStatus.UNRESOLVED
+        ),
+        from_branch=from_branch,
+        to_branch=to_branch,
+        reason=reason,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind if actor_principal_id is not None else "",
+        actor_principal_id=actor_principal_id,
+        actor_name=actor_name,
+    )
+
+
+def _principal_display_name(actor, *, kind: str, principal_id: int | None) -> str:
+    if actor is None or principal_id is None or not kind:
+        return ""
+    model_labels = {
+        "staff": "org.StaffProfile",
+        "teacher": "teachers.TeacherProfile",
+        "student": "students.StudentProfile",
+        "parent": "parents.ParentProfile",
+    }
+    model_label = model_labels.get(kind)
+    if model_label is None:
+        return ""
+    try:
+        model = django_apps.get_model(model_label)
+        principal = model.objects.filter(pk=principal_id, user_id=actor.pk).first()
+    except (LookupError, TypeError, ValueError):
+        return ""
+    if principal is None:
+        return ""
+    get_full_name = getattr(principal, "get_full_name", None)
+    display_name = get_full_name() if callable(get_full_name) else ""
+    # Keep the snapshot reproducible by the database integrity trigger. A
+    # model-specific __str__ may include mutable/internal identifiers; when both
+    # name and username are absent, an empty (unknown) display is more truthful.
+    return str(display_name or getattr(principal, "username", "") or "")[:452]
 
 
 @transaction.atomic
@@ -224,6 +311,8 @@ def transfer_student(
     to_branch_id: int,
     reason: str = "",
     actor=None,
+    actor_principal_kind: str = "",
+    actor_principal_id: int | None = None,
     allowed_branch_ids: set[int] | None = None,
 ) -> BranchTransfer:
     """Move one student between branches without leaving stale scope or cohorts.
@@ -246,7 +335,7 @@ def transfer_student(
             fields={"reason": [_("Must be at most 64 characters.")]},
         )
     if allowed_branch_ids is not None and to_branch_id not in allowed_branch_ids:
-        raise PermissionException(code="out_of_scope")
+        raise NotFoundException(code="not_found")
 
     student = (
         StudentProfile.objects.select_for_update().select_related("branch").filter(pk=student_id).first()
@@ -254,7 +343,7 @@ def transfer_student(
     if student is None:
         raise NotFoundException(_("Student not found."), code="not_found")
     if allowed_branch_ids is not None and student.branch_id not in allowed_branch_ids:
-        raise PermissionException(code="out_of_scope")
+        raise NotFoundException(code="not_found")
     if student.branch_id == to_branch_id:
         raise ValidationException(
             _("Student already belongs to that branch."),
@@ -318,6 +407,9 @@ def transfer_student(
         to_branch=to_branch,
         reason=reason,
         actor=actor,
+        student=student,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
     )
 
 

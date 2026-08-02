@@ -156,7 +156,11 @@ def drf_exception_handler(exc: Exception, context: dict[str, Any]) -> Response |
 
     if isinstance(exc, PermissionDenied):
         return Response(
-            {"success": False, "code": "forbidden", "message": str(exc) or str(_("Forbidden."))},
+            {
+                "success": False,
+                "code": "forbidden",
+                "message": str(_("You don't have permission to do that.")),
+            },
             status=status.HTTP_403_FORBIDDEN,
         )
 
@@ -201,12 +205,17 @@ def _classify(exc: Exception) -> tuple[str, dict[str, Any] | None]:
 def _detail_text(exc: Exception) -> str:
     if isinstance(exc, DRFValidationError):
         return str(_("Invalid input."))
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, (list, tuple)) and detail:
-        return str(detail[0])
-    if isinstance(detail, dict):
-        return str(_("Invalid input."))
-    return str(detail) if detail is not None else str(exc)
+    if isinstance(exc, (NotAuthenticated, AuthenticationFailed)):
+        return str(_("Authentication failed."))
+    if isinstance(exc, DRFPermissionDenied):
+        return str(_("You don't have permission to do that."))
+    if isinstance(exc, DRFNotFound):
+        return str(_("Resource not found."))
+    if isinstance(exc, DRFThrottled):
+        return str(_("Too many requests."))
+    # Do not echo arbitrary third-party APIException details. They can include
+    # internal class names, URLs, SQL fragments, or provider payloads.
+    return str(_("The request could not be processed."))
 
 
 def _as_list(value: Any) -> list[str]:

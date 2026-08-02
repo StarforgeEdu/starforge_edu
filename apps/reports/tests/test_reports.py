@@ -23,12 +23,13 @@ from apps.org.tests.factories import BranchFactory
 from apps.reports import selectors, services
 from apps.reports.generators import get_generator
 from apps.reports.models import Report, ReportRun, ReportSchedule
+from apps.reports.serializers import ReportRunReadSerializer
 from apps.schedule.models import Lesson
 from apps.schedule.tests.factories import TermFactory
 from apps.students.models import StudentProfile
 from apps.students.tests.factories import StudentProfileFactory
 from apps.teachers.tests.factories import TeacherProfileFactory
-from core.exceptions import ThrottledException, ValidationException
+from core.exceptions import TenantContextMissing, ThrottledException, ValidationException
 from core.permissions import Role
 
 pytestmark = pytest.mark.django_db
@@ -66,6 +67,37 @@ def _make_lesson(*, branch, teacher, cohort, starts_at=None):
         starts_at=starts_at,
         ends_at=starts_at + timedelta(hours=1),
     )
+
+
+def _custom_account_type(*, slug: str, grants: set[str], account_kind: str = "staff"):
+    from apps.access.models import AccountType, AccountTypePermission
+
+    account_type = AccountType.objects.create(
+        name=slug.replace("-", " ").title(),
+        slug=slug,
+        account_kind=account_kind,
+    )
+    AccountTypePermission.objects.bulk_create(
+        [
+            AccountTypePermission(account_type=account_type, permission=permission)
+            for permission in sorted(grants)
+        ]
+    )
+    return account_type
+
+
+def _assign_account_type(*, user, branch, account_type, department=None):
+    from apps.users.models import RoleMembership
+
+    membership = RoleMembership.objects.create(
+        user=user,
+        branch=branch,
+        department=department,
+        account_type=account_type,
+        role=account_type.compatibility_role,
+    )
+    user.refresh_from_db()
+    return membership
 
 
 # --------------------------------------------------------------------------- #
@@ -157,6 +189,7 @@ def test_finance_generator_totals(tenant_a, user_in):
     from decimal import Decimal
 
     from apps.finance.models import Invoice
+    from core.historical_scope import ScopeAttributionStatus
 
     with schema_context(tenant_a.schema_name):
         accountant = user_in(tenant_a, roles=[Role.ACCOUNTANT])
@@ -165,6 +198,8 @@ def test_finance_generator_totals(tenant_a, user_in):
         Invoice.objects.create(
             number="INV-2026-000001",
             student=student,
+            branch_at_issue_id=branch_id,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
             status=Invoice.Status.ISSUED,
             total_uzs=Decimal("100000.00"),
             issue_date=date(2026, 6, 1),
@@ -172,6 +207,8 @@ def test_finance_generator_totals(tenant_a, user_in):
         Invoice.objects.create(
             number="INV-2026-000002",
             student=student,
+            branch_at_issue_id=branch_id,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
             status=Invoice.Status.PAID,
             total_uzs=Decimal("50000.00"),
             issue_date=date(2026, 6, 1),
@@ -195,12 +232,24 @@ def test_ai_usage_generator_consumes_lane_a_selector(tenant_a, user_in, monkeypa
     assert data["month"] == "2026-06"
 
 
-def test_ai_usage_tolerates_missing_selector(tenant_a, user_in):
-    # With Lane A not merged the helper must degrade to 0 (no import error).
+def test_ai_usage_returns_authoritative_integer(tenant_a, user_in):
     with schema_context(tenant_a.schema_name):
         director = user_in(tenant_a, roles=[Role.DIRECTOR])
         data = get_generator("ai_usage").collect({}, user=director, roles={Role.DIRECTOR})
     assert isinstance(data["tokens_consumed"], int)
+
+
+def test_ai_usage_selector_failure_is_not_reported_as_zero(tenant_a, user_in, monkeypatch):
+    import apps.reports.generators.ai_usage as ai_mod
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("usage source unavailable")
+
+    monkeypatch.setattr(ai_mod, "_tokens_consumed", unavailable)
+    with schema_context(tenant_a.schema_name):
+        director = user_in(tenant_a, roles=[Role.DIRECTOR])
+        with pytest.raises(RuntimeError, match="usage source unavailable"):
+            get_generator("ai_usage").collect({}, user=director, roles={Role.DIRECTOR})
 
 
 def test_storage_usage_generator_sums_clean_bytes(tenant_a, user_in):
@@ -245,8 +294,8 @@ def test_storage_usage_generator_sums_clean_bytes(tenant_a, user_in):
 # --------------------------------------------------------------------------- #
 def test_teacher_attendance_scoped_to_own_cohorts(tenant_a, user_in):
     with schema_context(tenant_a.schema_name):
-        teacher_user = user_in(tenant_a, roles=[Role.TEACHER])
         branch = BranchFactory()
+        teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
         teacher = TeacherProfileFactory(user=teacher_user, branch=branch)
         # Own cohort (teacher is primary).
         own = CohortFactory(branch=branch, name="Own", primary_teacher=teacher)
@@ -268,8 +317,8 @@ def test_teacher_attendance_scoped_to_own_cohorts(tenant_a, user_in):
 
 def test_teacher_enrollment_scoped_to_own_cohorts(tenant_a, user_in):
     with schema_context(tenant_a.schema_name):
-        teacher_user = user_in(tenant_a, roles=[Role.TEACHER])
         branch = BranchFactory()
+        teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
         teacher = TeacherProfileFactory(user=teacher_user, branch=branch)
         own = CohortFactory(branch=branch, name="Own", primary_teacher=teacher)
         s1: Any = StudentProfileFactory(branch=branch, status=StudentProfile.Status.ACTIVE)
@@ -307,6 +356,336 @@ def test_library_visibility_by_role(tenant_a, user_in):
     assert dir_keys == {"enrollment", "attendance", "grades", "finance", "ai_usage", "storage_usage"}
     assert acc_keys == {"finance"}
     assert tea_keys == {"enrollment", "attendance", "grades"}
+
+
+def test_stale_director_role_cannot_globalize_local_compound_report_grant(tenant_a, user_in):
+    """A malformed compatibility role is neither a grant nor a scope boundary."""
+    from apps.reports.authorization import snapshot_from_params
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        local = BranchFactory(name="Report Local", slug="report-local")
+        remote = BranchFactory(name="Report Remote", slug="report-remote")
+        local_type = _custom_account_type(
+            slug="local-report-students",
+            grants={"reports:read", "reports:write", "students:read"},
+        )
+        empty_type = _custom_account_type(slug="empty-report-role", grants=set())
+        actor = user_in(tenant_a)
+        _assign_account_type(user=actor, branch=local, account_type=local_type)
+        stale = _assign_account_type(user=actor, branch=remote, account_type=empty_type)
+        RoleMembership.objects.filter(pk=stale.pk).update(role=Role.DIRECTOR)
+        actor.refresh_from_db()
+
+        roles = services._live_roles(actor)
+        keys = set(selectors.scoped_reports(user=actor, roles=roles).values_list("key", flat=True))
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={},
+            requested_by=actor,
+            roles=roles,
+        )
+        scope = snapshot_from_params(run.params)
+
+    assert keys == {"enrollment"}
+    assert scope is not None
+    assert scope.organization is False
+    assert scope.branch_ids == (local.pk,)
+
+
+def test_split_report_and_domain_grants_cannot_be_composed_across_departments(tenant_a, user_in):
+    from apps.org.tests.factories import DepartmentFactory
+    from core.exceptions import PermissionException
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Split Reports", slug="split-reports")
+        reports_department = DepartmentFactory(
+            branch=branch, name="Reports Department", slug="reports-department"
+        )
+        domain_department = DepartmentFactory(
+            branch=branch, name="Domain Department", slug="domain-department"
+        )
+        reports_type = _custom_account_type(
+            slug="reports-only",
+            grants={"reports:read", "reports:write"},
+        )
+        domain_type = _custom_account_type(
+            slug="students-only",
+            grants={"students:read"},
+        )
+        actor = user_in(tenant_a)
+        _assign_account_type(
+            user=actor,
+            branch=branch,
+            department=reports_department,
+            account_type=reports_type,
+        )
+        _assign_account_type(
+            user=actor,
+            branch=branch,
+            department=domain_department,
+            account_type=domain_type,
+        )
+        roles = services._live_roles(actor)
+
+        assert not selectors.scoped_reports(user=actor, roles=roles).filter(key="enrollment").exists()
+        with pytest.raises(PermissionException) as exc:
+            services.create_report_run(
+                report_key="enrollment",
+                fmt="pdf",
+                params={},
+                requested_by=actor,
+                roles=roles,
+            )
+    assert exc.value.code == "report_forbidden"
+
+
+def test_split_grants_at_same_exact_department_remain_additive(tenant_a, user_in):
+    from apps.org.tests.factories import DepartmentFactory
+    from apps.reports.authorization import snapshot_from_params
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Additive Reports", slug="additive-reports")
+        department = DepartmentFactory(branch=branch, name="Additive Department", slug="additive-department")
+        reports_type = _custom_account_type(
+            slug="additive-reports-only",
+            grants={"reports:read", "reports:write"},
+        )
+        domain_type = _custom_account_type(
+            slug="additive-students-only",
+            grants={"students:read"},
+        )
+        actor = user_in(tenant_a)
+        for account_type in (reports_type, domain_type):
+            _assign_account_type(
+                user=actor,
+                branch=branch,
+                department=department,
+                account_type=account_type,
+            )
+        roles = services._live_roles(actor)
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={},
+            requested_by=actor,
+            roles=roles,
+        )
+        scope = snapshot_from_params(run.params)
+
+    assert scope is not None
+    assert scope.department_keys == (f"{branch.pk}:{department.pk}",)
+
+
+def test_canonical_teacher_without_cohort_param_never_receives_branch_wide_rows(tenant_a, user_in):
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Teacher Report Branch", slug="teacher-report-branch")
+        teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+        teacher = TeacherProfileFactory(user=teacher_user, branch=branch)
+        own = CohortFactory(branch=branch, name="Canonical Own", primary_teacher=teacher)
+        own_lesson = _make_lesson(branch=branch, teacher=teacher, cohort=own)
+        AttendanceRecord.objects.create(
+            student=StudentProfileFactory(branch=branch),
+            lesson=own_lesson,
+            status="present",
+        )
+        other_teacher = TeacherProfileFactory(branch=branch)
+        foreign = CohortFactory(branch=branch, name="Canonical Foreign", primary_teacher=other_teacher)
+        foreign_lesson = _make_lesson(branch=branch, teacher=other_teacher, cohort=foreign)
+        AttendanceRecord.objects.create(
+            student=StudentProfileFactory(branch=branch),
+            lesson=foreign_lesson,
+            status="absent",
+        )
+
+        roles = services._live_roles(teacher_user)
+        data = get_generator("attendance").collect({}, user=teacher_user, roles=roles)
+        run = services.create_report_run(
+            report_key="attendance",
+            fmt="pdf",
+            params={},
+            requested_by=teacher_user,
+            roles=roles,
+        )
+
+    assert data["total"] == 1
+    assert data["rows"][0]["cohort"] == "Canonical Own"
+    assert run.params["_scope_branch_ids"] == []
+    assert run.params["_scope_teacher_keys"]
+    assert run.params["_scope_teacher_cohort_ids"] == [own.pk]
+
+
+def test_revocation_after_queue_blocks_worker_before_render(tenant_a, user_in, monkeypatch):
+    from apps.reports.generators.base import ReportGenerator
+    from core.exceptions import PermissionException
+
+    rendered = False
+
+    def render(*args, **kwargs):
+        nonlocal rendered
+        rendered = True
+        return b"must-not-render"
+
+    monkeypatch.setattr(ReportGenerator, "render", render)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Revoked Reports", slug="revoked-reports")
+        report_type = _custom_account_type(
+            slug="revocable-reports",
+            grants={"reports:read", "reports:write", "students:read"},
+        )
+        actor = user_in(tenant_a)
+        membership = _assign_account_type(user=actor, branch=branch, account_type=report_type)
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={},
+            requested_by=actor,
+            roles=services._live_roles(actor),
+        )
+        membership.revoked_at = timezone.now()
+        membership.save(update_fields=["revoked_at"])
+
+        with pytest.raises(PermissionException) as exc:
+            services.build_report_run(run.pk)
+
+    assert exc.value.code == "report_forbidden"
+    assert rendered is False
+
+
+def test_teacher_assignment_removal_hides_run_and_blocks_queued_worker(tenant_a, user_in):
+    from core.exceptions import PermissionException
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Teacher Revocation", slug="teacher-revocation")
+        teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+        teacher = TeacherProfileFactory(user=teacher_user, branch=branch)
+        cohort = CohortFactory(branch=branch, name="Former Teacher Cohort", primary_teacher=teacher)
+        roles = services._live_roles(teacher_user)
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={},
+            requested_by=teacher_user,
+            roles=roles,
+        )
+        assert selectors.scoped_runs(user=teacher_user, roles=roles).filter(pk=run.pk).exists()
+
+        cohort.primary_teacher = None
+        cohort.save(update_fields=["primary_teacher"])
+        current_roles = services._live_roles(teacher_user)
+        assert not selectors.scoped_runs(user=teacher_user, roles=current_roles).filter(pk=run.pk).exists()
+        with pytest.raises(PermissionException) as exc:
+            services.build_report_run(run.pk)
+
+    assert exc.value.code == "report_forbidden"
+
+
+def test_multi_scope_run_and_schedule_disappear_when_one_scope_is_revoked(tenant_a, user_in):
+    with schema_context(tenant_a.schema_name):
+        first = BranchFactory(name="Report Union A", slug="report-union-a")
+        second = BranchFactory(name="Report Union B", slug="report-union-b")
+        report_type = _custom_account_type(
+            slug="union-report-type",
+            grants={"reports:read", "reports:write", "students:read"},
+        )
+        actor = user_in(tenant_a)
+        _assign_account_type(user=actor, branch=first, account_type=report_type)
+        second_membership = _assign_account_type(user=actor, branch=second, account_type=report_type)
+        roles = services._live_roles(actor)
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={},
+            requested_by=actor,
+            roles=roles,
+        )
+        schedule = services.create_schedule(
+            report_key="enrollment",
+            created_by=actor,
+            roles=roles,
+            cadence=ReportSchedule.Cadence.WEEKLY,
+            weekday=0,
+        )
+        assert selectors.scoped_runs(user=actor, roles=roles).filter(pk=run.pk).exists()
+        assert selectors.scoped_schedules(user=actor, roles=roles).filter(pk=schedule.pk).exists()
+
+        second_membership.revoked_at = timezone.now()
+        second_membership.save(update_fields=["revoked_at"])
+        current_roles = services._live_roles(actor)
+
+        assert not selectors.scoped_runs(user=actor, roles=current_roles).filter(pk=run.pk).exists()
+        assert not selectors.scoped_schedules(user=actor, roles=current_roles).filter(pk=schedule.pk).exists()
+
+
+def test_cross_scope_run_and_schedule_detail_ids_return_not_found(tenant_a, user_in, as_user):
+    with schema_context(tenant_a.schema_name):
+        local = BranchFactory(name="Run Scope Local", slug="run-scope-local")
+        remote = BranchFactory(name="Run Scope Remote", slug="run-scope-remote")
+        report_type = _custom_account_type(
+            slug="detail-report-type",
+            grants={"reports:read", "reports:write", "students:read"},
+        )
+        creator = user_in(tenant_a)
+        _assign_account_type(user=creator, branch=local, account_type=report_type)
+        outsider = user_in(tenant_a)
+        _assign_account_type(user=outsider, branch=remote, account_type=report_type)
+        roles = services._live_roles(creator)
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={"branch_id": local.pk},
+            requested_by=creator,
+            roles=roles,
+        )
+        schedule = services.create_schedule(
+            report_key="enrollment",
+            created_by=creator,
+            roles=roles,
+            cadence=ReportSchedule.Cadence.WEEKLY,
+            weekday=0,
+            params={"branch_id": local.pk},
+        )
+
+    client = as_user(tenant_a, outsider)
+    assert client.get(f"/api/v1/reports/runs/{run.pk}/").status_code == 404
+    assert client.get(f"/api/v1/reports/schedules/{schedule.pk}/").status_code == 404
+
+
+def test_schedule_update_cannot_borrow_write_grant_from_another_branch(tenant_a, user_in, as_user):
+    with schema_context(tenant_a.schema_name):
+        local = BranchFactory(name="Schedule Read Local", slug="schedule-read-local")
+        remote = BranchFactory(name="Schedule Write Remote", slug="schedule-write-remote")
+        local_reader = _custom_account_type(
+            slug="local-schedule-reader",
+            grants={"reports:read", "students:read"},
+        )
+        remote_writer = _custom_account_type(
+            slug="remote-schedule-writer",
+            grants={"reports:write", "students:read"},
+        )
+        actor = user_in(tenant_a)
+        _assign_account_type(user=actor, branch=local, account_type=local_reader)
+        _assign_account_type(user=actor, branch=remote, account_type=remote_writer)
+
+        director = user_in(tenant_a, roles=[Role.DIRECTOR], branch=local)
+        schedule = services.create_schedule(
+            report_key="enrollment",
+            created_by=director,
+            roles=services._live_roles(director),
+            cadence=ReportSchedule.Cadence.WEEKLY,
+            weekday=0,
+            params={"branch_id": local.pk},
+        )
+
+    client = as_user(tenant_a, actor)
+    assert client.get(f"/api/v1/reports/schedules/{schedule.pk}/").status_code == 200
+    response = client.patch(
+        f"/api/v1/reports/schedules/{schedule.pk}/",
+        {"params": {"branch_id": remote.pk}},
+        format="json",
+    )
+    assert response.status_code == 403
 
 
 def test_accountant_cannot_run_grades(tenant_a, user_in):
@@ -404,7 +783,89 @@ def test_schedule_recipients_must_be_active_and_in_branch_scope(tenant_a, user_i
                 weekday=0,
                 recipient_ids=[outsider.pk],
             )
-        assert exc.value.code == "invalid_recipients"
+    assert exc.value.code == "invalid_recipients"
+
+
+def test_schedule_recipient_must_cover_complete_exact_department_scope(tenant_a, user_in):
+    from apps.org.tests.factories import DepartmentFactory
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Recipient Branch", slug="recipient-branch")
+        allowed_department = DepartmentFactory(
+            branch=branch, name="Allowed Recipient Department", slug="allowed-recipient"
+        )
+        other_department = DepartmentFactory(
+            branch=branch, name="Other Recipient Department", slug="other-recipient"
+        )
+        writer_type = _custom_account_type(
+            slug="department-report-writer",
+            grants={"reports:read", "reports:write", "students:read"},
+        )
+        reader_type = _custom_account_type(
+            slug="department-report-reader",
+            grants={"reports:read", "students:read"},
+        )
+        creator = user_in(tenant_a)
+        _assign_account_type(
+            user=creator,
+            branch=branch,
+            department=allowed_department,
+            account_type=writer_type,
+        )
+        allowed = user_in(tenant_a)
+        _assign_account_type(
+            user=allowed,
+            branch=branch,
+            department=allowed_department,
+            account_type=reader_type,
+        )
+        outside = user_in(tenant_a)
+        _assign_account_type(
+            user=outside,
+            branch=branch,
+            department=other_department,
+            account_type=reader_type,
+        )
+        roles = services._live_roles(creator)
+
+        schedule = services.create_schedule(
+            report_key="enrollment",
+            created_by=creator,
+            roles=roles,
+            cadence=ReportSchedule.Cadence.WEEKLY,
+            weekday=0,
+            recipient_ids=[allowed.pk],
+        )
+        assert schedule.recipient_ids == [allowed.pk]
+
+        with pytest.raises(ValidationException) as exc:
+            services.create_schedule(
+                report_key="enrollment",
+                created_by=creator,
+                roles=roles,
+                cadence=ReportSchedule.Cadence.WEEKLY,
+                weekday=0,
+                recipient_ids=[outside.pk],
+            )
+    assert exc.value.code == "invalid_recipients"
+
+
+def test_tenant_wide_schedule_cannot_send_download_to_branch_only_recipient(tenant_a, user_in):
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Organization Report", slug="organization-report")
+        director = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
+        branch_manager = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
+
+        with pytest.raises(ValidationException) as exc:
+            services.create_schedule(
+                report_key="enrollment",
+                created_by=director,
+                roles=services._live_roles(director),
+                cadence=ReportSchedule.Cadence.WEEKLY,
+                weekday=0,
+                recipient_ids=[branch_manager.pk],
+            )
+    assert exc.value.code == "invalid_recipients"
 
 
 # --------------------------------------------------------------------------- #
@@ -503,8 +964,42 @@ def test_build_report_idempotent_skips_done(tenant_a, user_in, monkeypatch):
             s3_key="already/done.pdf",
         )
         result = svc.build_report_run(run.pk)
-    # A run not in `queued` is a no-op: returns the existing key, never re-renders.
-    assert result == "already/done.pdf"
+    # A terminal row never re-renders, but a non-server-derived legacy key is
+    # not trusted or returned as a downloadable object reference.
+    assert result is None
+
+
+def test_presign_run_rejects_forged_cross_tenant_or_cross_report_key(tenant_a, user_in, monkeypatch):
+    from infrastructure.storage import s3_client
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        s3_client,
+        "presign_download",
+        lambda key, *, expires_in=600: seen.append(key) or f"memory://{key}",
+    )
+    with schema_context(tenant_a.schema_name):
+        director = user_in(tenant_a, roles=[Role.DIRECTOR])
+        run = ReportRun.objects.create(
+            report=Report.objects.get(key="enrollment"),
+            requested_by=director,
+            format="pdf",
+            status=ReportRun.Status.DONE,
+        )
+        expected = f"{tenant_a.schema_name}/reports/{run.pk}.pdf"
+        run.s3_key = expected
+        assert services.presign_run(run) == f"memory://{expected}"
+
+        for forged in (
+            f"other_tenant/reports/{run.pk}.pdf",
+            f"{tenant_a.schema_name}/reports/{run.pk + 1}.pdf",
+            f"{tenant_a.schema_name}/transcripts/{run.pk}.pdf",
+            f"{tenant_a.schema_name}/reports/{run.pk}.xlsx",
+        ):
+            run.s3_key = forged
+            assert services.presign_run(run) is None
+
+    assert seen == [expected]
 
 
 def test_build_report_marks_failed(tenant_a, user_in, monkeypatch):
@@ -528,8 +1023,19 @@ def test_build_report_marks_failed(tenant_a, user_in, monkeypatch):
             svc.build_report_run(run.pk)
         svc.mark_run_failed(run.pk, RuntimeError("render exploded"))
         run.refresh_from_db()
-    assert run.status == ReportRun.Status.FAILED
-    assert "render exploded" in run.error
+        assert run.status == ReportRun.Status.FAILED
+        assert run.error == "report_generation_failed"
+        serialized = ReportRunReadSerializer(run).data
+        assert serialized["error"] == "report_generation_failed"
+        assert "render exploded" not in str(serialized)
+
+        run.error = "s3://operator:secret@private/report.pdf"
+        assert ReportRunReadSerializer(run).data["error"] == "report_generation_failed"
+
+    # A detached tenant model must not lazy-load ``report.key`` from the public
+    # schema.  The serializer fails closed before it can issue that query.
+    with pytest.raises(TenantContextMissing):
+        _ = ReportRunReadSerializer(run).data
 
 
 # --------------------------------------------------------------------------- #
@@ -627,10 +1133,12 @@ def test_scheduled_run_carries_and_delivers_to_recipients(tenant_a, user_in, mon
         delivered.append(kwargs["recipient_id"])
 
     monkeypatch.setattr("apps.notifications.services.dispatch", _capture)
+    _patch_s3(monkeypatch)
 
     with schema_context(tenant_a.schema_name):
-        creator = user_in(tenant_a, roles=[Role.DIRECTOR])
-        extra = user_in(tenant_a, roles=[Role.TEACHER])
+        branch = BranchFactory(name="Scheduled Delivery", slug="scheduled-delivery")
+        creator = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
+        extra = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
         now = timezone.localtime(timezone.now())
         sched = ReportSchedule.objects.create(
             report=Report.objects.get(key="enrollment"),
@@ -640,13 +1148,15 @@ def test_scheduled_run_carries_and_delivers_to_recipients(tenant_a, user_in, mon
             hour=now.hour,
             format="pdf",
             recipient_ids=[extra.pk],
+            params={"branch_id": branch.pk},
         )
         run = services.fire_schedule(sched, now=now)
         assert run.recipient_ids == [extra.pk]  # copied from the schedule
 
         # _notify_ready (called by the build task) delivers to requester + recipients.
         run.status = ReportRun.Status.DONE
-        run.save(update_fields=["status"])
+        run.s3_key = f"{tenant_a.schema_name}/reports/{run.pk}.pdf"
+        run.save(update_fields=["status", "s3_key"])
         services._notify_ready(run)
 
     assert set(delivered) == {creator.pk, extra.pk}

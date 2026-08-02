@@ -27,6 +27,7 @@ from core.http import decimal_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
 from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import request_role_principal
 
 _RESOURCE = "assignments"
 
@@ -44,15 +45,25 @@ def _roles(request: HttpRequest) -> set[str]:
     return get_user_roles(req)
 
 
-def _get_assignment(request: HttpRequest, pk: int):
-    assignment = _assignment_service().get_visible(user=request.user, roles=_roles(request), pk=pk)
+def _get_assignment(request: HttpRequest, pk: int, *, permission: str = "assignments:read"):
+    assignment = _assignment_service().get_visible(
+        user=request.user,
+        roles=_roles(request),
+        pk=pk,
+        permission=permission,
+    )
     if assignment is None:
         raise NotFoundException(code="not_found")  # scoped out -> 404, no existence leak
     return assignment
 
 
-def _get_submission(request: HttpRequest, pk: int):
-    submission = _submission_service().get_visible(user=request.user, roles=_roles(request), pk=pk)
+def _get_submission(request: HttpRequest, pk: int, *, permission: str = "assignments:read"):
+    submission = _submission_service().get_visible(
+        user=request.user,
+        roles=_roles(request),
+        pk=pk,
+        permission=permission,
+    )
     if submission is None:
         raise NotFoundException(code="not_found")
     return submission
@@ -85,7 +96,8 @@ def assignments_collection_view(request: HttpRequest) -> HttpResponse:
 def assignment_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
     check_perm(request, f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write")
-    assignment = _get_assignment(request, pk)
+    permission = f"{_RESOURCE}:read" if read else f"{_RESOURCE}:write"
+    assignment = _get_assignment(request, pk, permission=permission)
     if read:
         return success(assignment_to_dict(assignment))
     if request.method in ("PUT", "PATCH"):
@@ -97,7 +109,7 @@ def assignment_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         )
         return success(assignment_to_dict(result))
     if request.method == "DELETE":
-        _assignment_service().delete(assignment)
+        _assignment_service().delete(assignment, user=request.user, roles=_roles(request))
         return no_content()
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
@@ -108,7 +120,7 @@ def assignment_publish_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    assignment = _get_assignment(request, pk)
+    assignment = _get_assignment(request, pk, permission=f"{_RESOURCE}:write")
     return success(assignment_to_dict(_assignment_service().publish(assignment, actor=request.user)))
 
 
@@ -118,7 +130,7 @@ def assignment_close_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    assignment = _get_assignment(request, pk)
+    assignment = _get_assignment(request, pk, permission=f"{_RESOURCE}:write")
     return success(assignment_to_dict(_assignment_service().close(assignment, actor=request.user)))
 
 
@@ -127,8 +139,13 @@ def assignment_close_view(request: HttpRequest, pk: int) -> HttpResponse:
 def assignment_submissions_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:write")  # teacher list
-        assignment = _get_assignment(request, pk)
-        rows = _assignment_service().submissions_of(assignment, user=request.user, roles=_roles(request))
+        assignment = _get_assignment(request, pk, permission=f"{_RESOURCE}:write")
+        rows = _assignment_service().submissions_of(
+            assignment,
+            user=request.user,
+            roles=_roles(request),
+            permission=f"{_RESOURCE}:write",
+        )
         items, total, page, size = paginate(request, rows)
         return paginated(
             [submission_to_dict(s) for s in items],
@@ -138,7 +155,7 @@ def assignment_submissions_view(request: HttpRequest, pk: int) -> HttpResponse:
         )
     if request.method == "POST":
         check_perm(request, f"{_RESOURCE}:submit")  # student submit
-        assignment = _get_assignment(request, pk)
+        assignment = _get_assignment(request, pk, permission=f"{_RESOURCE}:submit")
         actor: Any = request.user  # a real User post-@require_auth (typed User|AnonymousUser)
         student = StudentProfile.objects.filter(user=actor).first()
         if student is None:
@@ -163,7 +180,7 @@ def assignment_upload_url_view(request: HttpRequest) -> HttpResponse:
     check_perm(request, f"{_RESOURCE}:write", f"{_RESOURCE}:submit")  # either may presign
     body = read_json(request)
     filename = str_field(body, "filename", max_length=255)
-    if not filename:
+    if not filename.strip():
         raise ValidationException(
             "filename is required.", code="validation_error", fields={"filename": ["Required."]}
         )
@@ -211,7 +228,7 @@ def submission_grade_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    submission = _get_submission(request, pk)
+    submission = _get_submission(request, pk, permission=f"{_RESOURCE}:write")
     body = read_json(request)
     score = decimal_field(body, "score", max_digits=6)
     if score is None:
@@ -251,7 +268,7 @@ def submission_return_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    submission = _get_submission(request, pk)
+    submission = _get_submission(request, pk, permission=f"{_RESOURCE}:write")
     returned = _submission_service().return_for_revision(submission, actor=request.user)
     return success(submission_to_dict(returned))
 
@@ -262,7 +279,9 @@ def submission_plagiarism_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    result = _submission_service().check_plagiarism(_get_submission(request, pk))
+    result = _submission_service().check_plagiarism(
+        _get_submission(request, pk, permission=f"{_RESOURCE}:write")
+    )
     return success(
         {
             "status": result.status,
@@ -278,8 +297,16 @@ def submission_ai_feedback_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    submission = _get_submission(request, pk)
-    _submission_service().request_ai_feedback(submission, requested_by=request.user)
+    submission = _get_submission(request, pk, permission=f"{_RESOURCE}:write")
+    _submission_service().request_ai_feedback(
+        submission,
+        requested_by=request.user,
+        requested_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff", "teacher"},
+            error_code="ai_principal_unavailable",
+        ),
+    )
     return success({"status": "queued"}, status=202)
 
 
@@ -376,11 +403,11 @@ def _attachment_keys(body: dict[str, Any]) -> list:
             fields={"attachment_keys": ["At most 20 keys."]},
         )
     for k in keys:
-        if not isinstance(k, str) or len(k) > 1024:
+        if not isinstance(k, str) or not k or len(k) > 512:
             raise ValidationException(
                 "Invalid attachment key.",
                 code="validation_error",
-                fields={"attachment_keys": ["Each key must be a string of at most 1024 chars."]},
+                fields={"attachment_keys": ["Each key must be non-empty text of at most 512 chars."]},
             )
     return keys
 

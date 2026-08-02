@@ -24,6 +24,21 @@ class AIPromptAdmin(admin.ModelAdmin):
     list_filter = ("feature", "is_active")
     search_fields = ("feature",)
 
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None:
+            return ()
+        return (
+            "feature",
+            "version",
+            "system_prompt",
+            "user_template",
+            "max_output_tokens",
+            "effort",
+            "token_cost_cap",
+            "created_at",
+            "updated_at",
+        )
+
 
 @admin.register(AIRequest)
 class AIRequestAdmin(ReadOnlyAdmin):
@@ -49,6 +64,6 @@ class AIRequestAdmin(ReadOnlyAdmin):
     # and output_text can carry un-redacted model output. readonly_fields still
     # RENDERS them on the change page, so exclude them from the form entirely; they
     # remain on the model only for programmatic restore().
-    exclude = ("redaction_map", "output_text")
+    exclude = ("redaction_map", "output_ciphertext", "output_text")
     readonly_fields = ("idempotency_key", "celery_task_id")
     date_hierarchy = "created_at"

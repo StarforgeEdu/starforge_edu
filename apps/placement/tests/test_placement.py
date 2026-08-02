@@ -89,6 +89,66 @@ def test_teacher_cannot_approve(tenant_a, user_in, as_user):
     assert s["teacher"].post(f"{TESTS}{tid}/approve/", {}, format="json").status_code == 403
 
 
+def test_placement_grant_cannot_borrow_an_unrelated_branch_membership(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.org.tests.factories import BranchFactory
+    from apps.placement.models import PlacementTest
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        local = BranchFactory(name="Placement grant branch", slug="placement-grant-branch")
+        remote = BranchFactory(name="Unrelated branch", slug="placement-unrelated-branch")
+        granting_type = AccountType.objects.create(
+            name="Scoped placement manager",
+            slug="scoped-placement-manager",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.bulk_create(
+            [
+                AccountTypePermission(account_type=granting_type, permission=permission)
+                for permission in ("placement:read", "placement:write", "placement:approve")
+            ]
+        )
+        unrelated_type = AccountType.objects.create(
+            name="Unrelated placement membership",
+            slug="unrelated-placement-membership",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=local,
+            account_type=granting_type,
+            role=granting_type.compatibility_role,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=remote,
+            account_type=unrelated_type,
+            role=unrelated_type.compatibility_role,
+        )
+        actor.refresh_from_db()
+        local_test = PlacementTest.objects.create(title="Local", branch=local, created_by=actor)
+        remote_test = PlacementTest.objects.create(
+            title="Remote",
+            branch=remote,
+            status=PlacementTest.Status.PENDING,
+            created_by=user_in(tenant_a),
+        )
+
+    client = as_user(tenant_a, actor)
+    listing = client.get(TESTS)
+    assert listing.status_code == 200, listing.content
+    assert {row["id"] for row in listing.json()["data"]} == {local_test.pk}
+    assert client.get(f"{TESTS}{remote_test.pk}/").status_code == 404
+    assert client.patch(f"{TESTS}{remote_test.pk}/", {"title": "stolen"}, format="json").status_code == 404
+    assert client.post(f"{TESTS}{remote_test.pk}/approve/", {}, format="json").status_code == 404
+
+
 def test_cannot_approve_a_draft(tenant_a, user_in, as_user):
     s = _setup(tenant_a, user_in, as_user)
     tid = (

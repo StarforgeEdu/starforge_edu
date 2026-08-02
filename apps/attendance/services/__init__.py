@@ -27,36 +27,60 @@ from apps.cohorts.models import CohortMembership
 from apps.org.selectors import get_center_settings
 from apps.schedule.models import Lesson
 from core.exceptions import PermissionException, UnprocessableEntity
-from core.permissions import Role, role_memberships_with_permission
+from core.permissions import get_unambiguous_user_roles
+from core.scoping import permission_membership_scopes
 from core.utils import current_schema
 
 
-def _is_owner(user) -> bool:
-    return (
-        user.role_memberships.filter(revoked_at__isnull=True)
-        .filter(
-            Q(account_type__is_active=True, account_type__is_system=True, account_type__slug=Role.DIRECTOR)
-            | Q(account_type__isnull=True, role=Role.DIRECTOR)
-        )
-        .exists()
+def _attendance_write_scopes(actor):
+    return permission_membership_scopes(
+        roles=get_unambiguous_user_roles(actor),
+        permission="attendance:write",
     )
 
 
-def _assert_can_mark(lesson: Lesson, actor) -> None:
+def _permission_scope_allows_lesson(*, scopes, lesson: Lesson, account_kind: str) -> bool:
+    """Whether one exact attendance-write membership covers ``lesson``.
+
+    The aggregate permission union is intentionally insufficient: a teacher or
+    manager grant in Branch A cannot be paired with a teaching assignment or an
+    unrelated membership in Branch B.
+    """
+    department_id = lesson.cohort.department_id
+    for membership in scopes:
+        if membership.account_kind != account_kind:
+            continue
+        if membership.is_organization_wide:
+            return True
+        if membership.branch_id != lesson.cohort.branch_id:
+            continue
+        if membership.department_id is None or membership.department_id == department_id:
+            return True
+    return False
+
+
+def _can_override_correction_window(scopes) -> bool:
+    """Only an owner membership that itself grants attendance writes may override."""
+    return any(
+        membership.account_kind == "staff" and membership.is_organization_wide for membership in scopes
+    )
+
+
+def _assert_can_mark(lesson: Lesson, actor, *, write_scopes) -> None:
     """Actor must teach the lesson or manage its exact branch/department scope."""
-    if actor.is_superuser or _is_owner(actor):
+    if actor.is_superuser or _can_override_correction_window(write_scopes):
         return
-    if lesson.teacher.user_id == actor.id:
+    if lesson.teacher.user_id == actor.id and _permission_scope_allows_lesson(
+        scopes=write_scopes,
+        lesson=lesson,
+        account_kind="teacher",
+    ):
         return
-    permission_scope = (
-        role_memberships_with_permission("attendance:write")
-        .filter(
-            user=actor,
-            branch_id=lesson.cohort.branch_id,
-        )
-        .filter(Q(department__isnull=True) | Q(department_id=lesson.cohort.department_id))
-    )
-    if permission_scope.exists():
+    if _permission_scope_allows_lesson(
+        scopes=write_scopes,
+        lesson=lesson,
+        account_kind="staff",
+    ):
         return
     raise PermissionException(
         _("Only the lesson's teacher can mark its attendance."), code="not_lesson_teacher"
@@ -128,10 +152,10 @@ def mark_present_from_scan(*, student, at=None, marked_by=None) -> AttendanceRec
         return None  # a concurrent mark won the (student, lesson) unique race
 
 
-def _assert_within_correction_window(lesson: Lesson, actor, settings) -> None:
+def _assert_within_correction_window(lesson: Lesson, actor, settings, *, write_scopes) -> None:
     """Edits past `attendance_correction_window_hours` after the lesson ends are
     rejected — only a director may correct beyond the window (D2-B-3)."""
-    if actor.is_superuser or _is_owner(actor):
+    if actor.is_superuser or _can_override_correction_window(write_scopes):
         return
     window = dt.timedelta(hours=settings.attendance_correction_window_hours)
     if timezone.now() > lesson.ends_at + window:
@@ -202,8 +226,9 @@ def mark_attendance(*, lesson: Lesson, entries: list[dict], actor) -> dict:
             code="lesson_not_started",
         )
     settings = get_center_settings()
-    _assert_can_mark(lesson, actor)
-    _assert_within_correction_window(lesson, actor, settings)
+    write_scopes = () if actor.is_superuser else _attendance_write_scopes(actor)
+    _assert_can_mark(lesson, actor, write_scopes=write_scopes)
+    _assert_within_correction_window(lesson, actor, settings, write_scopes=write_scopes)
 
     student_ids = [e["student"].pk for e in entries]
     # F2-6: membership is checked AS OF THE LESSON DATE, not "right now". A student

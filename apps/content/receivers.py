@@ -15,6 +15,7 @@ from django.db.models.signals import post_delete
 from django.dispatch import receiver
 
 from apps.content.models import LessonFile
+from apps.content.storage_keys import trusted_file_keys
 from core.utils import current_schema
 
 logger = logging.getLogger(__name__)
@@ -25,15 +26,10 @@ def delete_lesson_file_objects_after_commit(sender, instance: LessonFile, **_kwa
     """Queue deletion of a file's primary object and thumbnail after commit."""
 
     schema = current_schema()
-    prefix = f"{schema}/"
-    keys = tuple(
-        key
-        for key in (instance.s3_key, instance.thumbnail_key)
-        if isinstance(key, str) and key.startswith(prefix)
-    )
+    keys = trusted_file_keys(instance, schema=schema)
     if not keys:
         if instance.s3_key or instance.thumbnail_key:
-            logger.warning("Skipped content cleanup for keys outside tenant prefix schema=%s", schema)
+            logger.warning("Skipped content cleanup for untrusted object references schema=%s", schema)
         return
 
     def enqueue() -> None:

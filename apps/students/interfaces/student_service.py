@@ -7,7 +7,12 @@ from typing import Any
 
 from django.db.models import QuerySet
 
-from apps.students.dto.student_dto import StudentCreateDTO, TransitionDTO
+from apps.students.dto.student_dto import (
+    LeadershipProfileAccessDTO,
+    LeadershipProfileWindowDTO,
+    StudentCreateDTO,
+    TransitionDTO,
+)
 from apps.students.models import EnrollmentEvent, EnrollmentReason, StudentProfile
 
 
@@ -46,7 +51,7 @@ class IStudentService(ABC):
     def update(self, student: StudentProfile, changes: dict[str, Any]) -> StudentProfile: ...
 
     @abstractmethod
-    def delete(self, student: StudentProfile) -> None: ...
+    def deactivate(self, student: StudentProfile, *, actor) -> StudentProfile: ...
 
     # --- detail actions ----------------------------------------------------
     @abstractmethod
@@ -78,6 +83,17 @@ class IStudentService(ABC):
 
     @abstractmethod
     def comparison(self, *, user, roles, metric: str, unit: str) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def leadership_profile(
+        self,
+        *,
+        student: StudentProfile,
+        user,
+        roles,
+        window: LeadershipProfileWindowDTO,
+        access: LeadershipProfileAccessDTO,
+    ) -> dict[str, Any]: ...
 
     # --- self-service ------------------------------------------------------
     @abstractmethod

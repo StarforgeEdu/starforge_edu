@@ -31,7 +31,7 @@ from core.permissions import (
 from core.responses import created, error, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_branch_ids,
 )
 
@@ -43,19 +43,27 @@ def _service() -> ICoverService:
     return container.resolve(ICoverService)  # type: ignore[type-abstract]
 
 
-def _scope(request: HttpRequest) -> tuple[bool, bool, set[int], set[int]]:
+def _scope(request: HttpRequest, *, permission: str) -> tuple[bool, bool, set[int], set[int]]:
     """Permission-paired manager and teacher branch scopes for the caller."""
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     roles = get_user_roles(req)
-    unscoped = is_unscoped(req)
+    unscoped = is_permission_unscoped(req, permission=permission)
     is_manager = has_permission_code(roles, f"{_RESOURCE}:approve", _request_overrides(req))
     manager_branch_ids = permission_membership_branch_ids(roles=roles, permission=f"{_RESOURCE}:approve")
     teacher_branch_ids = permission_membership_branch_ids(roles=roles, permission=f"{_RESOURCE}:write")
     return unscoped, is_manager, manager_branch_ids, teacher_branch_ids
 
 
-def _get_visible(request: HttpRequest, pk: int) -> CoverRequest:
-    unscoped, is_manager, manager_branch_ids, teacher_branch_ids = _scope(request)
+def _get_visible(
+    request: HttpRequest,
+    pk: int,
+    *,
+    permission: str = "cover:read",
+) -> CoverRequest:
+    unscoped, is_manager, manager_branch_ids, teacher_branch_ids = _scope(
+        request,
+        permission=permission,
+    )
     cover = _service().get_visible(
         user=request.user,
         is_unscoped=unscoped,
@@ -74,7 +82,10 @@ def _get_visible(request: HttpRequest, pk: int) -> CoverRequest:
 def covers_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:read")
-        unscoped, is_manager, manager_branch_ids, teacher_branch_ids = _scope(request)
+        unscoped, is_manager, manager_branch_ids, teacher_branch_ids = _scope(
+            request,
+            permission=f"{_RESOURCE}:read",
+        )
         qs = _service().scoped_list(
             user=request.user,
             is_unscoped=unscoped,
@@ -98,7 +109,10 @@ def covers_collection_view(request: HttpRequest) -> HttpResponse:
             lesson_id=int_field(body, "lesson", required=True),  # type: ignore[arg-type]
             reason=str_field(body, "reason", max_length=255),
         )
-        unscoped, _is_manager, _manager_branch_ids, teacher_branch_ids = _scope(request)
+        unscoped, _is_manager, _manager_branch_ids, teacher_branch_ids = _scope(
+            request,
+            permission=f"{_RESOURCE}:write",
+        )
         return created(
             cover_to_dict(
                 _service().create(
@@ -129,7 +143,10 @@ def cover_pool_view(request: HttpRequest) -> HttpResponse:
     check_perm(request, f"{_RESOURCE}:read")
     # The claimable cover board (F18-2): open requests a manager has opened to the pool,
     # scoped to the caller's branch(es) — what a teacher can claim right now.
-    unscoped, is_manager, manager_branch_ids, teacher_branch_ids = _scope(request)
+    unscoped, is_manager, manager_branch_ids, teacher_branch_ids = _scope(
+        request,
+        permission=f"{_RESOURCE}:read",
+    )
     qs = _service().scoped_list(
         user=request.user,
         is_unscoped=unscoped,
@@ -155,7 +172,7 @@ def cover_assign_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:approve")
-    cover = _get_visible(request, pk)
+    cover = _get_visible(request, pk, permission=f"{_RESOURCE}:approve")
     _assert_cover_permission_scope(request, cover, f"{_RESOURCE}:approve")
     cover_teacher_id = int_field(read_json(request), "cover_teacher", required=True)
     result = _service().assign(cover_id=cover.pk, cover_teacher_id=cover_teacher_id, actor=request.user)  # type: ignore[arg-type]
@@ -168,7 +185,7 @@ def cover_open_pool_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:approve")
-    cover = _get_visible(request, pk)
+    cover = _get_visible(request, pk, permission=f"{_RESOURCE}:approve")
     _assert_cover_permission_scope(request, cover, f"{_RESOURCE}:approve")
     return success(cover_to_dict(_service().open_pool(cover_id=cover.pk, actor=request.user)))
 
@@ -179,7 +196,7 @@ def cover_claim_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    cover = _get_visible(request, pk)
+    cover = _get_visible(request, pk, permission=f"{_RESOURCE}:write")
     _assert_cover_permission_scope(request, cover, f"{_RESOURCE}:write")
     return success(
         cover_to_dict(_service().claim(cover_id=cover.pk, claimer_user=request.user, actor=request.user))
@@ -192,7 +209,7 @@ def cover_cancel_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    cover = _get_visible(request, pk)
+    cover = _get_visible(request, pk, permission=f"{_RESOURCE}:write")
     # Only the requester may withdraw their own request.
     if not getattr(request.user, "is_superuser", False) and cover.requester_id != request.user.id:
         raise PermissionException(_("You can only cancel your own request."), code="not_requester")
@@ -205,7 +222,7 @@ def cover_reject_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:approve")
-    cover = _get_visible(request, pk)
+    cover = _get_visible(request, pk, permission=f"{_RESOURCE}:approve")
     _assert_cover_permission_scope(request, cover, f"{_RESOURCE}:approve")
     return success(cover_to_dict(_service().reject(cover_id=cover.pk, actor=request.user)))
 

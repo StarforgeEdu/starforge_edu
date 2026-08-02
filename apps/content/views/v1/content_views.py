@@ -13,6 +13,7 @@ from typing import Any
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
+from apps.content import selectors
 from apps.content.interfaces.services import (
     IContentLessonService,
     IContentLibraryService,
@@ -38,8 +39,9 @@ from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
 from core.http import bool_field, parse_bool, read_json
 from core.listing import apply_filters, paginate
-from core.permissions import get_user_roles, has_permission_code
+from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import request_role_principal
 
 # --- service accessors -----------------------------------------------------
 
@@ -78,13 +80,6 @@ def _method_not_allowed() -> HttpResponse:
 
 def _roles(request: HttpRequest) -> set[str]:
     return get_user_roles(request)
-
-
-def _manages_content(request: HttpRequest) -> bool:
-    if request.user.is_superuser:
-        return True
-    roles = _roles(request)
-    return any(has_permission_code(roles, c) for c in ("content:write", "content:approve", "content:publish"))
 
 
 # --- value validators (never-500) ------------------------------------------
@@ -162,7 +157,11 @@ def _crud_collection(
         check_perm(request, "content:read")
         qs = apply_filters(
             request,
-            service.scoped(user=request.user, roles=_roles(request)),
+            service.scoped(
+                user=request.user,
+                roles=_roles(request),
+                permission="content:read",
+            ),
             filter_fields=filter_fields,
             search_fields=search_fields,
             default_ordering=default_ordering,
@@ -181,7 +180,13 @@ def _crud_collection(
 def _crud_detail(request, pk, service, presenter, *, create_data_fn, changes_fn):
     read = request.method in ("GET", "HEAD")
     check_perm(request, "content:read" if read else "content:write")
-    obj = service.get_scoped(pk=pk, user=request.user, roles=_roles(request))
+    permission = "content:read" if read else "content:write"
+    obj = service.get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=_roles(request),
+        permission=permission,
+    )
     if obj is None:
         raise NotFoundException(code="not_found")
     if read:
@@ -493,7 +498,11 @@ def files_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "content:read")
         qs = apply_filters(
             request,
-            _file_service().scoped(user=request.user, roles=_roles(request)),
+            _file_service().scoped(
+                user=request.user,
+                roles=_roles(request),
+                permission="content:read",
+            ),
             filter_fields=("status", "lesson", "folder"),
             default_ordering="-created_at",
         )
@@ -506,8 +515,13 @@ def files_collection_view(request: HttpRequest) -> HttpResponse:
     return _method_not_allowed()
 
 
-def _get_file_in_scope(request: HttpRequest, pk: int):
-    f = _file_service().get_scoped(pk=pk, user=request.user, roles=_roles(request))
+def _get_file_in_scope(request: HttpRequest, pk: int, *, permission: str):
+    f = _file_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=_roles(request),
+        permission=permission,
+    )
     if f is None:
         raise NotFoundException(code="not_found")
     return f
@@ -519,7 +533,7 @@ def file_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
     check_perm(request, "content:read")
-    return success(lesson_file_to_dict(_get_file_in_scope(request, pk)))
+    return success(lesson_file_to_dict(_get_file_in_scope(request, pk, permission="content:read")))
 
 
 @csrf_exempt
@@ -528,7 +542,15 @@ def file_confirm_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:write")
-    _file_service().confirm(file=_get_file_in_scope(request, pk))
+    _file_service().confirm(
+        file=_get_file_in_scope(request, pk, permission="content:write"),
+        requested_by=request.user,
+        requested_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff", "teacher"},
+            error_code="ai_principal_unavailable",
+        ),
+    )
     return success({"status": "pending"}, status=202)
 
 
@@ -540,8 +562,16 @@ def file_download_url_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "GET":
         return _method_not_allowed()
     check_perm(request, "content:read")
-    file = _get_file_in_scope(request, pk)
-    is_staff = request.user.is_superuser or _manages_content(request)
+    file = _get_file_in_scope(request, pk, permission="content:read")
+    is_staff = (
+        request.user.is_superuser
+        or selectors.managed_files(
+            user=request.user,
+            roles=_roles(request),
+        )
+        .filter(pk=file.pk)
+        .exists()
+    )
     return success(_file_service().download_url(file=file, user=request.user, actor_is_staff=is_staff))
 
 
@@ -551,7 +581,10 @@ def file_track_view_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:read")
-    _file_service().track_view(file=_get_file_in_scope(request, pk), user=request.user)
+    _file_service().track_view(
+        file=_get_file_in_scope(request, pk, permission="content:read"),
+        user=request.user,
+    )
     return no_content()
 
 
@@ -570,7 +603,7 @@ def file_new_version_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:write")
-    previous = _get_file_in_scope(request, pk)
+    previous = _get_file_in_scope(request, pk, permission="content:write")
     data = read_json(request)
     payload = {
         "filename": _sanitize_filename(_require(data, "filename")),
@@ -587,7 +620,10 @@ def file_approve_teacher_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:approve")
-    file = _file_service().approve_teacher(file=_get_file_in_scope(request, pk), actor=request.user)
+    file = _file_service().approve_teacher(
+        file=_get_file_in_scope(request, pk, permission="content:approve"),
+        actor=request.user,
+    )
     return success(lesson_file_to_dict(file))
 
 
@@ -597,7 +633,7 @@ def file_approve_manager_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:publish")
-    file = _get_file_in_scope(request, pk)
+    file = _get_file_in_scope(request, pk, permission="content:publish")
     data = read_json(request)
     is_downloadable = (
         None if "is_downloadable" not in data else parse_bool(data["is_downloadable"], "is_downloadable")
@@ -621,7 +657,11 @@ def content_upload_url_view(request: HttpRequest) -> HttpResponse:
     title = _str_value(data.get("title", ""), "title", max_length=255, allow_blank=True)
     # Writes are scoped like reads: a writer may only attach into a lesson/folder whose
     # library they can see (an out-of-scope pk -> 400, closing the read/write asymmetry).
-    libs = scoped_libraries(user=request.user, roles=_roles(request))
+    libs = scoped_libraries(
+        user=request.user,
+        roles=_roles(request),
+        permission="content:write",
+    )
     lesson = folder = None
     if data.get("lesson") is not None:
         lesson = ContentLesson.objects.filter(
@@ -658,7 +698,9 @@ def materials_collection_view(request: HttpRequest) -> HttpResponse:
         qs = apply_filters(
             request,
             _material_service().scoped(
-                user=request.user, roles=_roles(request), manages=_manages_content(request)
+                user=request.user,
+                roles=_roles(request),
+                permission="content:read",
             ),
             filter_fields=("library", "status"),
             search_fields=("title",),
@@ -672,8 +714,6 @@ def materials_collection_view(request: HttpRequest) -> HttpResponse:
         library_id = _int_value(_require(data, "library"), "library")
         title = _str_value(_require(data, "title"), "title", max_length=200)
         topic = _str_value(data.get("topic", ""), "topic", max_length=500, allow_blank=True)
-        if not ContentLibrary.objects.filter(pk=library_id).exists():
-            raise _reject("library", "library does not exist.")
         if not _material_service().is_writable_library(
             library_id=library_id, user=request.user, roles=_roles(request)
         ):
@@ -687,9 +727,12 @@ def materials_collection_view(request: HttpRequest) -> HttpResponse:
     return _method_not_allowed()
 
 
-def _get_material_in_scope(request: HttpRequest, pk: int, *, manages: bool) -> LibraryMaterial:
+def _get_material_in_scope(request: HttpRequest, pk: int, *, permission: str) -> LibraryMaterial:
     material = _material_service().get_scoped(
-        pk=pk, user=request.user, roles=_roles(request), manages=manages
+        pk=pk,
+        user=request.user,
+        roles=_roles(request),
+        permission=permission,
     )
     if material is None:
         raise NotFoundException(code="not_found")
@@ -701,11 +744,11 @@ def _get_material_in_scope(request: HttpRequest, pk: int, *, manages: bool) -> L
 def material_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, "content:read")
-        material = _get_material_in_scope(request, pk, manages=_manages_content(request))
+        material = _get_material_in_scope(request, pk, permission="content:read")
         return success(material_to_dict(material))
     if request.method == "PATCH":
         check_perm(request, "content:write")
-        material = _get_material_in_scope(request, pk, manages=True)
+        material = _get_material_in_scope(request, pk, permission="content:write")
         data = read_json(request)
         fields: dict[str, Any] = {}
         if "title" in data:
@@ -725,8 +768,16 @@ def material_generate_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:write")
-    material = _get_material_in_scope(request, pk, manages=True)
-    ai_request = _material_service().generate(material=material, requested_by=request.user)
+    material = _get_material_in_scope(request, pk, permission="content:write")
+    ai_request = _material_service().generate(
+        material=material,
+        requested_by=request.user,
+        requested_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff", "teacher"},
+            error_code="ai_principal_unavailable",
+        ),
+    )
     return success({"request_id": ai_request.pk, "status": ai_request.status}, status=202)
 
 
@@ -736,5 +787,5 @@ def material_publish_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:publish")
-    material = _get_material_in_scope(request, pk, manages=True)
+    material = _get_material_in_scope(request, pk, permission="content:publish")
     return success(material_to_dict(_material_service().publish(material=material)))

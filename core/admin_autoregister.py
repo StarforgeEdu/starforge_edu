@@ -25,6 +25,7 @@ from typing import Any
 
 from django.apps import apps
 from django.contrib import admin
+from django.contrib.admin.exceptions import AlreadyRegistered
 from django.db import models
 
 _TEXT_FIELDS = (models.CharField, models.TextField, models.EmailField, models.SlugField)
@@ -82,9 +83,12 @@ def autoregister_all() -> int:
             continue  # already registered, or an auto-created m2m through table (unregisterable)
         try:
             admin.site.register(model, _generic_admin(model))
-            generic_models.append(model)
-            added += 1
-        except Exception:
-            pass
+        except AlreadyRegistered:
+            # A third-party AppConfig may register a model after the registry
+            # snapshot above. That race is harmless; every other failure must
+            # abort startup instead of silently removing an admin surface.
+            continue
+        generic_models.append(model)
+        added += 1
     _promote_autocomplete(generic_models)
     return added

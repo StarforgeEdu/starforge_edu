@@ -12,15 +12,28 @@ from core.interfaces import IBaseRepository
 
 class IMeetingRepository(IBaseRepository[StaffMeeting]):
     def scoped(
-        self, *, user, is_unscoped: bool, is_manager: bool, branch_ids: set[int]
+        self,
+        *,
+        is_unscoped: bool,
+        is_manager: bool,
+        branch_ids: set[int],
+        principal_kind: str,
+        principal_id: int,
     ) -> QuerySet[StaffMeeting]:
         raise NotImplementedError
 
     def get_scoped(
-        self, *, user, is_unscoped: bool, is_manager: bool, branch_ids: set[int], pk: int
+        self,
+        *,
+        is_unscoped: bool,
+        is_manager: bool,
+        branch_ids: set[int],
+        principal_kind: str,
+        principal_id: int,
+        pk: int,
     ) -> StaffMeeting | None:
         raise NotImplementedError
 
-    def upcoming_for(self, user) -> QuerySet[StaffMeeting]:
+    def upcoming_for(self, *, principal_kind: str, principal_id: int) -> QuerySet[StaffMeeting]:
         """The user's upcoming scheduled meetings (as an invitee)."""
         raise NotImplementedError

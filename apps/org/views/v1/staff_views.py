@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.db.models import Prefetch
+from django.db import transaction
+from django.db.models import Exists, OuterRef, Prefetch, Q
 from django.http import HttpRequest, HttpResponse
 from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.access.models import AccountType
 from apps.org.models import Branch, Department, StaffProfile
-from apps.org.presenters import staff_to_dict
+from apps.org.presenters import staff_directory_row_to_dict, staff_to_dict
 from apps.org.services import STAFF_ROLES, create_staff_account, deactivate_staff_account
 from apps.users.models import RoleMembership
 from core.api_auth import check_perm, require_auth
@@ -22,30 +23,134 @@ from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
-    permission_membership_branch_ids,
+    assert_permission_organization_scope,
+    is_permission_unscoped,
+    permission_membership_scope_q,
+    request_permission_membership_allows,
 )
 
 _SEARCH = ("username", "first_name", "last_name", "phone", "email")
 _ORDERING = ("created_at", "last_name", "first_name", "username")
+_CREATE_FIELDS = frozenset(
+    {
+        "account_type",
+        "birthdate",
+        "branch",
+        "department",
+        "email",
+        "first_name",
+        "gender",
+        "last_name",
+        "middle_name",
+        "phone",
+        "role",
+        "username",
+    }
+)
+_UPDATE_FIELDS = frozenset(
+    {
+        "account_type",
+        "assignment",
+        "birthdate",
+        "branch",
+        "department",
+        "email",
+        "first_name",
+        "gender",
+        "is_active",
+        "last_name",
+        "middle_name",
+        "phone",
+        "role",
+    }
+)
+
+
+def _active_staff_memberships():
+    return RoleMembership.objects.filter(revoked_at__isnull=True).filter(
+        Q(
+            account_type__account_kind=AccountType.AccountKind.STAFF,
+            account_type__is_active=True,
+        )
+        | Q(account_type__isnull=True, role__in=STAFF_ROLES)
+    )
+
+
+def _visible_staff_memberships(request: HttpRequest, permission: str):
+    memberships = _active_staff_memberships()
+    if not is_permission_unscoped(
+        request,
+        permission=permission,
+        account_kinds={AccountType.AccountKind.STAFF},
+    ):
+        memberships = memberships.filter(
+            permission_membership_scope_q(
+                roles=get_user_roles(request),
+                permission=permission,
+                branch_field="branch_id",
+                department_field="department_id",
+                account_kinds={AccountType.AccountKind.STAFF},
+            )
+        )
+    return memberships.select_related("account_type", "branch", "department").order_by("id")
 
 
 def _query(request: HttpRequest, permission: str):
+    visible_memberships = _visible_staff_memberships(request, permission)
     qs = StaffProfile.objects.select_related("user").prefetch_related(
         Prefetch(
             "user__role_memberships",
-            queryset=RoleMembership.objects.select_related("account_type"),
+            queryset=visible_memberships,
+            to_attr="_visible_staff_memberships",
         )
     )
-    if not is_unscoped(request):
-        scoped_branch_ids = permission_membership_branch_ids(
-            roles=get_user_roles(request), permission=permission
-        )
-        qs = qs.filter(
-            user__role_memberships__branch_id__in=scoped_branch_ids,
-            user__role_memberships__revoked_at__isnull=True,
-        )
-    return qs.distinct()
+    if not is_permission_unscoped(
+        request,
+        permission=permission,
+        account_kinds={AccountType.AccountKind.STAFF},
+    ):
+        qs = qs.annotate(
+            _has_visible_staff_membership=Exists(visible_memberships.filter(user_id=OuterRef("user_id")))
+        ).filter(_has_visible_staff_membership=True)
+    return qs
+
+
+def _filter_by_visible_membership(
+    queryset,
+    request: HttpRequest,
+    permission: str,
+    **membership_filters: Any,
+):
+    matches = _visible_staff_memberships(request, permission).filter(
+        user_id=OuterRef("user_id"),
+        **membership_filters,
+    )
+    return queryset.annotate(_matches_staff_membership=Exists(matches)).filter(_matches_staff_membership=True)
+
+
+def _assert_can_manage_entire_staff_account(
+    request: HttpRequest,
+    staff: StaffProfile,
+    *,
+    permission: str,
+) -> None:
+    """Require authority over every assignment before changing global identity."""
+    if is_permission_unscoped(
+        request,
+        permission=permission,
+        account_kinds={AccountType.AccountKind.STAFF},
+    ):
+        return
+    for membership in _active_staff_memberships().filter(user_id=staff.user_id):
+        if not request_permission_membership_allows(
+            request,
+            permission=permission,
+            branch_id=membership.branch_id,
+            department_id=membership.department_id,
+            account_kinds={AccountType.AccountKind.STAFF},
+        ):
+            # Hide a responsibility outside the caller's scope.
+            raise NotFoundException(code="not_found")
 
 
 def _get(request: HttpRequest, pk: int, permission: str) -> StaffProfile:
@@ -53,6 +158,16 @@ def _get(request: HttpRequest, pk: int, permission: str) -> StaffProfile:
     if staff is None:
         raise NotFoundException(code="not_found")
     return staff
+
+
+def _reject_unknown_fields(body: dict[str, Any], *, allowed: frozenset[str]) -> None:
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise ValidationException(
+            "Unsupported staff-account field.",
+            code="validation_error",
+            fields={field: ["This field is not supported."] for field in unknown},
+        )
 
 
 def _date(body: dict[str, Any], name: str):
@@ -173,10 +288,12 @@ def staff_collection_view(request: HttpRequest) -> HttpResponse:
                     code="invalid_query_param",
                     fields={"account_type": ["Must be an integer."]},
                 ) from None
-            qs = qs.filter(
-                user__role_memberships__account_type_id=account_type_id,
-                user__role_memberships__revoked_at__isnull=True,
-            ).distinct()
+            qs = _filter_by_visible_membership(
+                qs,
+                request,
+                "users:read",
+                account_type_id=account_type_id,
+            )
         else:
             role = request.GET.get("role", "").strip()
             if role:
@@ -184,21 +301,33 @@ def staff_collection_view(request: HttpRequest) -> HttpResponse:
                     raise ValidationException(
                         "Invalid role.", code="validation_error", fields={"role": ["Not a staff role."]}
                     )
-                qs = qs.filter(
-                    user__role_memberships__account_type__is_system=True,
-                    user__role_memberships__account_type__slug=role,
-                    user__role_memberships__revoked_at__isnull=True,
-                ).distinct()
+                qs = _filter_by_visible_membership(
+                    qs,
+                    request,
+                    "users:read",
+                    account_type__is_system=True,
+                    account_type__slug=role,
+                )
         items, total, page, size = paginate(request, qs)
         return paginated(
-            [staff_to_dict(staff) for staff in items],
+            [staff_directory_row_to_dict(staff) for staff in items],
             total=total,
             page=page,
             page_size=size,
         )
     if request.method == "POST":
         check_perm(request, "users:write")
+        # Creating a staff account also creates an authorization assignment.
+        # Prevent a scoped directory editor from minting an owner or other
+        # privileged account type.
+        check_perm(request, "access:write")
+        assert_permission_organization_scope(
+            request,
+            permission="access:write",
+            account_kinds={AccountType.AccountKind.STAFF},
+        )
         body = read_json(request)
+        _reject_unknown_fields(body, allowed=_CREATE_FIELDS)
         phone, email = str_field(body, "phone"), str_field(body, "email")
         if not phone and not email:
             raise ValidationException(
@@ -233,6 +362,7 @@ def staff_collection_view(request: HttpRequest) -> HttpResponse:
 
 @csrf_exempt
 @require_auth
+@transaction.atomic
 def staff_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
     check_perm(request, "users:read" if read else "users:write")
@@ -242,6 +372,26 @@ def staff_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         return success(staff_to_dict(staff))
     if request.method in ("PUT", "PATCH"):
         body = read_json(request)
+        _reject_unknown_fields(body, allowed=_UPDATE_FIELDS)
+        responsibility_fields = {
+            "account_type",
+            "assignment",
+            "branch",
+            "department",
+            "role",
+        }.intersection(body)
+        if responsibility_fields:
+            # Responsibilities have their own audited create/revoke API. This
+            # profile endpoint cannot guess which assignment a multi-scope
+            # staff account intended to replace.
+            raise ValidationException(
+                "Manage responsibilities through account-type assignments.",
+                code="use_account_type_assignments",
+                fields={
+                    field: ["This field is managed by the responsibilities workflow."]
+                    for field in sorted(responsibility_fields)
+                },
+            )
         changes: dict[str, Any] = {
             field: str_field(body, field)
             for field in ("first_name", "last_name", "middle_name", "phone", "email")
@@ -254,52 +404,22 @@ def staff_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         if "is_active" in body:
             changes["is_active"] = bool_field(body, "is_active")
         if changes:
+            _assert_can_manage_entire_staff_account(
+                request,
+                staff,
+                permission="users:write",
+            )
             from apps.users.services import update_role_identity
 
             update_role_identity(staff, changes)
-        if any(field in body for field in ("account_type", "role", "branch", "department")):
-            membership = (
-                staff.user.role_memberships.filter(
-                    revoked_at__isnull=True,
-                    account_type__account_kind=AccountType.AccountKind.STAFF,
-                )
-                .select_related("account_type", "branch", "department")
-                .order_by("-account_type__is_system", "id")
-                .first()
-            )
-            if membership is None:
-                raise ValidationException(
-                    "Staff account has no active account type.",
-                    code="missing_account_type",
-                )
-            account_type = _staff_account_type(body, required=False) or membership.account_type
-            branch_id = int_field(body, "branch", required=True) if "branch" in body else membership.branch_id
-            assert_permission_membership_scope(
-                request,
-                permission="users:write",
-                branch_id=branch_id,
-                enforce_department=False,
-            )
-            branch = _branch(branch_id)
-            department = (
-                _department(int_field(body, "department")) if "department" in body else membership.department
-            )
-            if department is not None and department.branch_id != branch.pk:
-                raise ValidationException(
-                    "Department must belong to the selected branch.",
-                    code="department_branch_mismatch",
-                )
-            from apps.users.services import ensure_role_membership
-
-            ensure_role_membership(
-                staff,
-                account_type=account_type,
-                branch=branch,
-                department=department,
-            )
         refreshed = _query(request, "users:write").get(pk=staff.pk)
         return success(staff_to_dict(refreshed))
     if request.method == "DELETE":
+        _assert_can_manage_entire_staff_account(
+            request,
+            staff,
+            permission="users:write",
+        )
         deactivate_staff_account(staff)
         return no_content()
     return error("Method not allowed.", code="method_not_allowed", status=405)
@@ -312,6 +432,11 @@ def staff_credentials_view(request: HttpRequest, pk: int) -> HttpResponse:
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "users:write")
     staff = _get(request, pk, "users:write")
+    _assert_can_manage_entire_staff_account(
+        request,
+        staff,
+        permission="users:write",
+    )
     from apps.users.services import issue_role_credentials
 
     return success(

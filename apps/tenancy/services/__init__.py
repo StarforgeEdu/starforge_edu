@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import re
 import secrets
 import shlex
 from datetime import timedelta
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from django.conf import settings
 from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_tenants.utils import get_public_schema_name, schema_context
+from psycopg import sql
 
 from apps.tenancy.models import Center, Domain, DomainClaim, PlatformEvent
 from core.exceptions import NotFoundException, ValidationException
@@ -30,6 +30,22 @@ DOMAIN_CHALLENGE_LABEL = "_starforge-verification"
 DOMAIN_CHALLENGE_PREFIX = "starforge-domain-verification="
 _DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _MAX_DNS_RESPONSE_BYTES = 64 * 1024
+
+
+class _NoDNSRedirects(HTTPRedirectHandler):
+    """DoH ownership checks never follow an HTTP redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_DNS_OPENER = build_opener(_NoDNSRedirects())
+
+
+def urlopen(request: Request, *, timeout: float):
+    """Injectable no-redirect opener retained for focused tests."""
+
+    return _DNS_OPENER.open(request, timeout=timeout)
 
 
 def _validate_slug(slug: str) -> str:
@@ -149,10 +165,16 @@ def archive_center(center: Center) -> Center:
     # Postgres identifiers max out at 63 bytes; truncate the slug portion so the
     # rename target and the varchar(63) schema_name column stay in sync.
     new_schema = f"{prefix}{old_schema[: 63 - len(prefix) - len(suffix)]}{suffix}"
-    assert len(new_schema) <= 63
+    if len(new_schema) > 63:  # defensive backstop if the naming recipe changes
+        raise RuntimeError("Archived schema name exceeds PostgreSQL's identifier limit.")
     with transaction.atomic():
         with connection.cursor() as cursor:
-            cursor.execute(f'ALTER SCHEMA "{old_schema}" RENAME TO "{new_schema}"')
+            cursor.execute(
+                sql.SQL("ALTER SCHEMA {} RENAME TO {}").format(
+                    sql.Identifier(old_schema),
+                    sql.Identifier(new_schema),
+                )
+            )
         center.schema_name = new_schema
         center.is_active = False
         center.archived_at = now
@@ -220,7 +242,8 @@ def add_domain(
         # Unique race: a concurrent insert won between the pre-check and ours.
         raise ValidationException(_("That domain is already registered."), code="domain_taken") from exc
     if is_primary and trusted:
-        assert isinstance(row, Domain)
+        if not isinstance(row, Domain):  # pragma: no cover - guarded by ``trusted``
+            raise RuntimeError("Trusted domain creation returned an invalid record type.")
         set_primary_domain(center, row.pk, actor=actor)
         row.refresh_from_db()
     record_platform_event(
@@ -249,14 +272,57 @@ def verify_domain_txt(domain: str, token: str) -> bool:
     return expected in _lookup_txt_records(name)
 
 
+def _validated_dns_endpoint(endpoint: str, *, allow_query: bool = False) -> str | None:
+    """Return an exact allowlisted HTTPS DoH endpoint or fail closed."""
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint
+        or len(endpoint) > 2048
+        or "\\" in endpoint
+        or any(ord(character) <= 32 or ord(character) == 127 for character in endpoint)
+    ):
+        return None
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    allowed_hosts = {
+        str(value).strip().lower().rstrip(".")
+        for value in getattr(settings, "DOMAIN_VERIFICATION_DNS_ALLOWED_HOSTS", ())
+        if str(value).strip()
+    }
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or hostname not in allowed_hosts
+        or parsed.username is not None
+        or parsed.password is not None
+        or (parsed.query and not allow_query)
+        or parsed.fragment
+        or port not in (None, 443)
+    ):
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return endpoint
+    return None
+
+
 def _lookup_txt_records(name: str) -> tuple[str, ...]:
-    endpoint = str(
-        getattr(
-            settings,
-            "DOMAIN_VERIFICATION_DNS_URL",
-            "https://cloudflare-dns.com/dns-query",
+    endpoint = _validated_dns_endpoint(
+        str(
+            getattr(
+                settings,
+                "DOMAIN_VERIFICATION_DNS_URL",
+                "https://cloudflare-dns.com/dns-query",
+            )
         )
     )
+    if endpoint is None:
+        return ()
     timeout = float(getattr(settings, "DOMAIN_VERIFICATION_TIMEOUT_SECONDS", 3.0))
     separator = "&" if "?" in endpoint else "?"
     request = Request(
@@ -264,17 +330,40 @@ def _lookup_txt_records(name: str) -> tuple[str, ...]:
         headers={"Accept": "application/dns-json", "User-Agent": "Starforge-Domain-Verification/1"},
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        # URL scheme and hostname are exact-allowlisted above; the TXT name is
+        # encoded only as a query value and cannot select another destination.
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
+            if getattr(response, "status", 200) != 200:
+                return ()
+            final_url = response.geturl()
+            if _validated_dns_endpoint(final_url, allow_query=True) is None:
+                return ()
+            raw_length = response.headers.get("Content-Length")
+            if raw_length:
+                try:
+                    content_length = int(raw_length)
+                except (TypeError, ValueError):
+                    return ()
+                if content_length < 0 or content_length > _MAX_DNS_RESPONSE_BYTES:
+                    return ()
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            if content_type not in {"application/dns-json", "application/json"}:
+                return ()
             raw = response.read(_MAX_DNS_RESPONSE_BYTES + 1)
         if len(raw) > _MAX_DNS_RESPONSE_BYTES:
             return ()
-        payload = json.loads(raw.decode("utf-8"))
+        from infrastructure.http_client import strict_json_loads
+
+        payload = strict_json_loads(raw)
     except (OSError, UnicodeError, ValueError):
         return ()
     if not isinstance(payload, dict) or payload.get("Status") != 0:
         return ()
     records: list[str] = []
-    for answer in payload.get("Answer") or ():
+    answers = payload.get("Answer") or ()
+    if not isinstance(answers, list) or len(answers) > 256:
+        return ()
+    for answer in answers:
         if not isinstance(answer, dict) or answer.get("type") != 16:
             continue
         data = answer.get("data")
@@ -296,8 +385,10 @@ def verify_domain(center: Center, *, claim_id, actor=None) -> Domain:
     if claim is None:
         raise NotFoundException(_("Domain claim does not belong to this center."))
     if claim.domain_record_id is not None:
-        assert claim.domain_record is not None
-        return claim.domain_record
+        domain_record = Domain.objects.filter(pk=claim.domain_record_id).first()
+        if domain_record is None:  # pragma: no cover - FK integrity backstop
+            raise RuntimeError("Verified domain claim references a missing domain record.")
+        return domain_record
     if not verify_domain_txt(claim.domain, claim.verification_token):
         raise ValidationException(
             _("DNS verification record was not found."),
@@ -309,8 +400,10 @@ def verify_domain(center: Center, *, claim_id, actor=None) -> Domain:
         # outer join cannot be locked).
         claim = DomainClaim.objects.select_for_update().get(tenant=center, pk=claim.pk)
         if claim.domain_record_id is not None:
-            assert claim.domain_record is not None
-            return claim.domain_record
+            domain_record = Domain.objects.filter(pk=claim.domain_record_id).first()
+            if domain_record is None:  # pragma: no cover - FK integrity backstop
+                raise RuntimeError("Verified domain claim references a missing domain record.")
+            return domain_record
         existing = Domain.objects.select_for_update().filter(domain=claim.domain).first()
         if existing is not None and existing.tenant_id != center.pk:
             raise ValidationException(
@@ -477,12 +570,11 @@ def _extend_subscription_trial(center: Center, *, new_trial_ends_at) -> None:
 # ---------------------------------------------------------------------------
 @transaction.atomic
 def mint_impersonation_token(*, center: Center, user_id: int, impersonator) -> dict:
-    """Mint a 10-minute, read-only, access-ONLY JWT for `user_id` in `center`.
+    """Mint a 10-minute, read-only opaque session for ``user_id`` in ``center``.
 
-    Claims: ``{schema, impersonator_id, read_only: true, tv}`` — TD-1's auth
-    class validates ``schema`` + ``tv``; ``read_only`` is enforced by
-    ``core.permissions.DenyWriteForReadOnlyToken`` (see integration_needed).
-    No refresh token is minted (impersonation cannot be extended).
+    The row is tenant-schema-bound, records one exact role-native principal, and
+    is centrally write-denied by ``core.session_auth.SessionAuthentication``.
+    No refresh credential is minted, so impersonation cannot be extended.
 
     Writes BOTH audit trails (D4-LE-5): one public-schema PlatformEvent here,
     and one tenant-schema ``audit_log("impersonation.started")`` inside the
@@ -496,12 +588,18 @@ def mint_impersonation_token(*, center: Center, user_id: int, impersonator) -> d
         target = User.objects.filter(pk=user_id).first()
         if target is None:
             raise NotFoundException(_("No such user in that center."), code="user_not_found")
+        principal_kind, principal_id = _unique_impersonation_principal(target)
         # A short-lived READ-ONLY session in the center's schema (custom session auth):
         # tenant-bound by the schema, read_only enforced by DenyWriteForReadOnlyToken,
         # and revocable. Cannot be extended (no refresh).
         from core.session_auth import create_session
 
-        session = create_session(target, read_only=True)
+        session = create_session(
+            target,
+            read_only=True,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
+        )
         session.expires_at = timezone.now() + timedelta(seconds=IMPERSONATION_TOKEN_TTL_SECONDS)
         session.save(update_fields=["expires_at"])
         token_key = session.key
@@ -509,18 +607,54 @@ def mint_impersonation_token(*, center: Center, user_id: int, impersonator) -> d
         _audit_impersonation_started(
             target=target,
             impersonator=impersonator,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
         )
 
     record_platform_event(
         actor=impersonator,
         center=center,
         event=PlatformEvent.Event.IMPERSONATION_MINTED,
-        payload={"target_user_id": user_id, "read_only": True},
+        payload={
+            "target_user_id": user_id,
+            "principal_kind": principal_kind,
+            "principal_id": principal_id,
+            "read_only": True,
+        },
     )
     return {"access": token_key, "expires_in": IMPERSONATION_TOKEN_TTL_SECONDS}
 
 
-def _audit_impersonation_started(*, target, impersonator) -> None:
+def _unique_impersonation_principal(target) -> tuple[str, int]:
+    """Resolve exactly one active role account or reject the bridge target."""
+
+    from django.apps import apps as django_apps
+
+    from core.exceptions import ConflictException
+
+    labels = {
+        "student": "students.StudentProfile",
+        "teacher": "teachers.TeacherProfile",
+        "parent": "parents.ParentProfile",
+        "staff": "org.StaffProfile",
+    }
+    active: list[tuple[str, int]] = []
+    for kind, label in labels.items():
+        model = django_apps.get_model(label)
+        profile_id = (
+            model.objects.filter(user_id=target.pk, is_active=True).values_list("pk", flat=True).first()
+        )
+        if profile_id is not None:
+            active.append((kind, profile_id))
+    if len(active) != 1 or not target.is_active or target.is_staff or target.is_superuser:
+        raise ConflictException(
+            _("The target account does not have one unambiguous active role."),
+            code="impersonation_principal_ambiguous",
+        )
+    return active[0]
+
+
+def _audit_impersonation_started(*, target, impersonator, principal_kind: str, principal_id: int) -> None:
     """Write the tenant-schema audit row (already inside schema_context)."""
     from apps.audit.models import AuditLog
     from apps.audit.services import audit_log
@@ -533,6 +667,8 @@ def _audit_impersonation_started(*, target, impersonator) -> None:
         after={
             "impersonator_id": getattr(impersonator, "pk", None),
             "impersonator_repr": str(impersonator),
+            "principal_kind": principal_kind,
+            "principal_id": principal_id,
             "read_only": True,
         },
     )

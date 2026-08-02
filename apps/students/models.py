@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models.deletion import ProtectedError
 from django.db.models.functions import Lower
 from django.utils.translation import gettext_lazy as _
 
 from apps.users.models import RoleAccount
-from core.fields import EncryptedTextField
+from core.fields import EncryptedJSONField, EncryptedTextField
 
 
 class StudentProfile(RoleAccount):
@@ -28,7 +30,7 @@ class StudentProfile(RoleAccount):
     # It is provisioned automatically and is deliberately not editable or exposed as part
     # of the student account. StudentProfile owns identity + login credentials.
     user = models.OneToOneField(
-        "users.User", on_delete=models.CASCADE, related_name="student_profile", editable=False
+        "users.User", on_delete=models.PROTECT, related_name="student_profile", editable=False
     )
     student_id = models.CharField(max_length=32, unique=True)
 
@@ -54,7 +56,7 @@ class StudentProfile(RoleAccount):
     location = models.CharField(max_length=200, blank=True)  # F2-1: city/area for filtering
     previous_school = models.CharField(max_length=200, blank=True)  # F2-1: academic school at intake
     medical_notes = EncryptedTextField(blank=True)
-    emergency_contacts = models.JSONField(default=list, blank=True)
+    emergency_contacts = EncryptedJSONField(default=list, blank=True)
     photo = models.ImageField(upload_to="students/photos/", blank=True)
     # F2-2: soft block — a barred-but-still-enrolled student (disciplinary/financial),
     # distinct from the WITHDRAWN terminal status. Null = not blocked.
@@ -89,6 +91,22 @@ class StudentProfile(RoleAccount):
     def __str__(self) -> str:  # pragma: no cover
         return self.student_id
 
+    def clean(self) -> None:
+        super().clean()
+        if not self.phone and not self.email:
+            raise ValidationError(
+                {
+                    "phone": [_("A phone or email is required.")],
+                    "email": [_("A phone or email is required.")],
+                }
+            )
+
+    def delete(self, *args, **kwargs):
+        raise ProtectedError(
+            str(_("Student identity history cannot be deleted; deactivate the account instead.")),
+            {self},
+        )
+
     def get_full_name(self) -> str:
         parts = [self.first_name, self.middle_name, self.last_name]
         return " ".join(p for p in parts if p)
@@ -122,9 +140,15 @@ class EnrollmentReason(models.Model):
     def __str__(self) -> str:  # pragma: no cover
         return self.name
 
+    def delete(self, *args, **kwargs):
+        raise ProtectedError(
+            str(_("Enrollment reasons cannot be deleted; deactivate the reason instead.")),
+            {self},
+        )
+
 
 class EnrollmentEvent(models.Model):
-    student = models.ForeignKey(StudentProfile, on_delete=models.CASCADE, related_name="enrollment_events")
+    student = models.ForeignKey(StudentProfile, on_delete=models.PROTECT, related_name="enrollment_events")
     from_status = models.CharField(max_length=16)
     to_status = models.CharField(max_length=16)
     # A slug validated at write time against the active EnrollmentReason rows (kept
@@ -132,9 +156,7 @@ class EnrollmentEvent(models.Model):
     # match EnrollmentReason.slug (64) so any active reason can actually be recorded.
     reason_code = models.CharField(max_length=64, blank=True)
     note = models.TextField(blank=True)
-    actor = models.ForeignKey(
-        "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
-    )
+    actor = models.ForeignKey("users.User", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -142,6 +164,9 @@ class EnrollmentEvent(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.student_id}:{self.from_status}->{self.to_status}"
+
+    def delete(self, *args, **kwargs):
+        raise ProtectedError(str(_("Enrollment history is append-only.")), {self})
 
 
 class StudentIdCounter(models.Model):

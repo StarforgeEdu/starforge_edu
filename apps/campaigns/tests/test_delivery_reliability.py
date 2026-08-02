@@ -110,7 +110,7 @@ def test_broker_failure_is_durable_and_republished_by_dispatcher(
         first_token = campaign.send_claim_token
         assert campaign.status == Campaign.Status.SENDING
         assert campaign.send_heartbeat_at is None
-        assert campaign.last_error.startswith("queue:")
+        assert campaign.last_error == "queue_delivery_failed"
 
         queued = []
         monkeypatch.setattr(deliver_campaign, "delay", lambda *args, **kwargs: queued.append((args, kwargs)))

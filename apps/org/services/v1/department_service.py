@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import DataError, IntegrityError, transaction
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
@@ -12,7 +13,7 @@ from apps.org.dto.org_dto import DepartmentCreateDTO
 from apps.org.interfaces.repositories import IDepartmentRepository
 from apps.org.interfaces.services import IDepartmentService
 from apps.org.models import Department
-from core.exceptions import ValidationException
+from core.exceptions import NotFoundException, ValidationException
 
 _SCALARS = ("name", "slug", "description", "is_active", "budget")
 
@@ -27,8 +28,9 @@ class DepartmentService(IDepartmentService):
     def get(self, department_id: int) -> Department | None:
         return self._departments.get_by_id(department_id)
 
+    @transaction.atomic
     def create(self, data: DepartmentCreateDTO) -> Department:
-        branch = self._resolve_branch(data.branch_id)
+        branch = self._resolve_branch(data.branch_id, for_update=True)
         dept = Department(
             branch=branch,
             name=data.name,
@@ -40,19 +42,38 @@ class DepartmentService(IDepartmentService):
         )
         return self._save(dept)
 
+    @transaction.atomic
     def update(self, department: Department, changes: dict[str, Any]) -> Department:
-        if "branch" in changes or "head" in changes:
-            branch = self._resolve_branch(changes["branch"]) if "branch" in changes else department.branch
-            head_id = changes.get("head", department.head_id)
-            department.branch = branch
-            department.head = self._resolve_head(head_id, branch_id=branch.pk)
+        if "branch" in changes:
+            raise ValidationException(
+                _("A department cannot be moved with a generic update."),
+                code="validation_error",
+                fields={"branch": [_("This field is not supported.")]},
+            )
+        locked = (
+            self._departments.get_queryset().select_for_update(of=("self",)).filter(pk=department.pk).first()
+        )
+        if locked is None:
+            raise NotFoundException(code="not_found")
+        department = locked
+        if "head" in changes:
+            department.head = self._resolve_head(changes["head"], branch_id=department.branch_id)
         for field in _SCALARS:
             if field in changes:
                 setattr(department, field, changes[field])
         return self._save(department)
 
+    @transaction.atomic
     def delete(self, department: Department) -> None:
-        self._departments.delete(department)
+        """Deactivate instead of cascading away memberships and history."""
+        locked = (
+            self._departments.get_queryset().select_for_update(of=("self",)).filter(pk=department.pk).first()
+        )
+        if locked is None:
+            raise NotFoundException(code="not_found")
+        if locked.is_active:
+            locked.is_active = False
+            locked.save(update_fields=["is_active", "updated_at"])
 
     # --- helpers -----------------------------------------------------------
     @staticmethod
@@ -73,21 +94,37 @@ class DepartmentService(IDepartmentService):
         return teacher.user
 
     @staticmethod
-    def _resolve_branch(branch_id: int):
+    def _resolve_branch(branch_id: int, *, for_update: bool = False):
         from apps.org.models import Branch
 
-        branch = Branch.objects.filter(pk=branch_id).first()
+        queryset = Branch.objects.filter(is_active=True, archived_at__isnull=True)
+        if for_update:
+            queryset = queryset.select_for_update(of=("self",))
+        branch = queryset.filter(pk=branch_id).first()
         if branch is None:
             raise ValidationException(
-                _("Invalid branch."), code="invalid_branch", fields={"branch": ["Not found."]}
+                _("Invalid branch."),
+                code="invalid_branch",
+                fields={"branch": [_("Choose an active branch.")]},
             )
         return branch
 
     @staticmethod
     def _save(department: Department) -> Department:
         try:
+            department.full_clean(validate_unique=False, validate_constraints=False)
             with transaction.atomic():  # savepoint: unique-violation must not poison the txn
                 department.save()
+        except DjangoValidationError as exc:
+            fields = {
+                field: [str(message) for message in messages]
+                for field, messages in getattr(exc, "message_dict", {"field": exc.messages}).items()
+            }
+            raise ValidationException(
+                _("Please review the department fields."),
+                code="validation_error",
+                fields=fields,
+            ) from exc
         except IntegrityError as exc:
             raise ValidationException(
                 _("A department with this slug already exists in the branch."),

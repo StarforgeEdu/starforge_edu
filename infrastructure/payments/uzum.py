@@ -1,9 +1,10 @@
-"""Uzum Bank payment provider client (D3-B-4).
+"""Legacy Uzum callback compatibility client.
 
-Uzum signs webhooks with an HMAC-SHA256 over the canonical (sorted) JSON body
-keyed by the merchant API key; the digest arrives in an ``X-Signature`` header
-(modelled as ``signature`` in the payload for the test builders). Verify before
-touching any row (CODE-GUIDE §11).
+This HMAC shape originated in the project's mock-era contract; it is not Uzum
+Bank's current documented Merchant API (Basic auth with separate check/create/
+confirm/reverse/status operations). Production settings disable the route and
+checkout. Keeping the isolated implementation lets old fixtures remain useful
+without misrepresenting it as a deployable provider integration.
 
 Pattern: ABC + real + mock + settings factory (CODE-GUIDE §6). The mock uses the
 real HMAC algorithm so tampering tests are meaningful. `[OWNER:O-6]` — mock-first
@@ -15,21 +16,25 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
 from django.conf import settings
+
+_HEX_SHA256 = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+_SAFE_PROVIDER_VALUE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
 
 
 def uzum_signature(*, payload: dict[str, Any], api_key: str) -> str:
     """HMAC-SHA256 hex digest over the canonical (sorted, compact) JSON body.
 
     The signature itself is never part of the signed body — it travels in the
-    ``X-Signature`` header. Any ``signature`` key in ``payload`` is excluded so a
-    caller can pass either the raw body or a body with the field already set.
+    ``X-Signature`` header. Consequently every body key is authenticated; ignoring
+    a body field would create a malleability gap where it could be changed without
+    invalidating the signature.
     """
-    signable = {k: v for k, v in payload.items() if k != "signature"}
-    body = json.dumps(signable, sort_keys=True, separators=(",", ":"))
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hmac.new(api_key.encode(), body.encode(), hashlib.sha256).hexdigest()
 
 
@@ -45,14 +50,30 @@ class UzumClient(ABC):
 
 class RealUzumClient(UzumClient):
     def verify_signature(self, *, payload: dict[str, Any], signature: str, api_key: str) -> bool:
-        if not signature or not api_key:
+        if not signature or not api_key or _HEX_SHA256.fullmatch(signature) is None:
             return False
-        expected = uzum_signature(payload=payload, api_key=api_key)
-        return hmac.compare_digest(expected.encode("ascii"), signature.encode("utf-8"))
+        try:
+            expected = uzum_signature(payload=payload, api_key=api_key)
+        except (TypeError, UnicodeError, ValueError):
+            return False
+        return hmac.compare_digest(expected.lower(), signature.lower())
 
     def build_checkout(self, *, amount_uzs: int, order_id: str, config: Any) -> dict[str, Any]:
-        merchant = getattr(config, "uzum_merchant_id", "")
-        url = f"{settings.UZUM_CHECKOUT_URL}?merchant={merchant}&order={order_id}&amount={amount_uzs}"
+        from urllib.parse import urlencode
+
+        from infrastructure.http_client import validate_https_endpoint
+
+        merchant = str(getattr(config, "uzum_merchant_id", ""))
+        if (
+            _SAFE_PROVIDER_VALUE.fullmatch(merchant) is None
+            or _SAFE_PROVIDER_VALUE.fullmatch(str(order_id)) is None
+        ):
+            raise ValueError("Legacy Uzum checkout configuration is invalid.")
+        base = validate_https_endpoint(
+            settings.UZUM_CHECKOUT_URL,
+            allowed_hosts=getattr(settings, "UZUM_CHECKOUT_ALLOWED_HOSTS", ()),
+        ).rstrip("/")
+        url = f"{base}?{urlencode({'merchant': merchant, 'order': order_id, 'amount': amount_uzs})}"
         return {"redirect_url": url, "order_id": order_id}
 
 

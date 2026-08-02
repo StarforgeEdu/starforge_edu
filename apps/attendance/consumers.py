@@ -30,53 +30,50 @@ from __future__ import annotations
 from channels.db import database_sync_to_async
 from django_tenants.utils import schema_context
 
-from core.permissions import Role, has_permission_code
-from core.scoping import role_memberships_allow
+from core.permissions import get_user_roles, has_permission_code
 from infrastructure.websocket.consumers import (
     CLOSE_FORBIDDEN,
     CLOSE_UNAUTHORIZED,
     HeartbeatConsumerMixin,
     accepted_subprotocol,
 )
+from infrastructure.websocket.groups import cohort_attendance_group
 
 
 @database_sync_to_async
-def _can_watch_cohort(*, schema: str, user_id: int, cohort_id: int) -> bool:
+def _can_watch_cohort(
+    *,
+    schema: str,
+    user_id: int,
+    cohort_id: int,
+    principal_kind: str,
+    principal_id: int | None,
+) -> bool:
     """Apply the HTTP dashboard's branch/department/teaching scope on connect."""
-    from apps.cohorts.models import Cohort
-    from apps.users.models import RoleMembership
+    from apps.users.models import User
 
     with schema_context(schema):
-        memberships = list(
-            RoleMembership.objects.filter(user_id=user_id, revoked_at__isnull=True).only(
-                "role", "branch_id", "department_id"
-            )
-        )
-        roles = {membership.role for membership in memberships}
-        if not has_permission_code(roles, "attendance:read"):
+        user = User.objects.filter(pk=user_id, is_active=True).first()
+        if user is None:
             return False
-        cohort = Cohort.objects.filter(pk=cohort_id).only("branch_id", "department_id").first()
-        if cohort is None:
+        request_context = type(
+            "AttendanceScopeRequest",
+            (),
+            {
+                "user": user,
+                "principal_kind": principal_kind,
+                "principal_id": principal_id,
+                "principal_validated": True,
+            },
+        )()
+        roles = get_user_roles(request_context)
+        if not user.is_superuser and not has_permission_code(roles, "attendance:read"):
             return False
-        if Role.DIRECTOR in roles:
-            return True
-        if role_memberships_allow(
-            memberships,
-            roles={Role.HEAD_OF_DEPT},
-            branch_id=cohort.branch_id,
-            department_id=cohort.department_id,
-        ):
-            return True
-        if not role_memberships_allow(
-            memberships,
-            roles={Role.TEACHER},
-            branch_id=cohort.branch_id,
-            department_id=cohort.department_id,
-        ):
-            return False
-        from apps.cohorts.selectors import taught_cohorts
+        from apps.attendance.selectors import scoped_dashboard_cohorts
 
-        return taught_cohorts(user_id=user_id).filter(pk=cohort_id).exists()
+        # Reuse the HTTP dashboard's single canonical object scope so WebSocket
+        # and request authorization cannot drift apart.
+        return scoped_dashboard_cohorts(user=user, roles=roles).filter(pk=cohort_id).exists()
 
 
 class AttendanceConsumer(HeartbeatConsumerMixin):
@@ -93,14 +90,26 @@ class AttendanceConsumer(HeartbeatConsumerMixin):
             await self.close(code=CLOSE_FORBIDDEN)
             return
 
-        if not await _can_watch_cohort(schema=schema, user_id=user.pk, cohort_id=cohort_id):
+        if not await _can_watch_cohort(
+            schema=schema,
+            user_id=user.pk,
+            cohort_id=cohort_id,
+            principal_kind=str(self.scope.get("principal_kind") or ""),
+            principal_id=self.scope.get("principal_id"),
+        ):
             await self.close(code=CLOSE_FORBIDDEN)
+            return
+        if not await self.claim_connection_slot():
+            await self.close(code=self.connection_slot_denial_code())
             return
 
         self._cohort_id = cohort_id  # remembered so the heartbeat can re-check scope (R1-05)
-        await self.accept(subprotocol=accepted_subprotocol(self.scope))
-        await self.join_group(f"{schema}.cohort.{cohort_id}")
-        await self.start_heartbeat()
+        try:
+            await self.accept(subprotocol=accepted_subprotocol(self.scope))
+            await self.join_group(cohort_attendance_group(schema, cohort_id))
+            await self.start_heartbeat()
+        except Exception:
+            await self._close_with_cleanup(1011)
 
     async def _still_authorized(self) -> bool:
         """R1-05: re-run the connect-time branch/role gate each heartbeat, so a teacher
@@ -110,9 +119,16 @@ class AttendanceConsumer(HeartbeatConsumerMixin):
         schema = self._schema()
         if user is None or schema is None:
             return False
-        return await _can_watch_cohort(schema=schema, user_id=user.pk, cohort_id=self._cohort_id)
+        return await _can_watch_cohort(
+            schema=schema,
+            user_id=user.pk,
+            cohort_id=self._cohort_id,
+            principal_kind=str(self.scope.get("principal_kind") or ""),
+            principal_id=self.scope.get("principal_id"),
+        )
 
     async def attendance_update(self, event: dict) -> None:
         """Relay a producer payload (group_send type ``attendance.update``)."""
-        payload = {k: v for k, v in event.items() if k != "type"}
-        await self.send_json({"type": "attendance.update", "payload": payload})
+        allowed = ("record_id", "student_id", "lesson_id", "status", "auto")
+        payload = {key: event[key] for key in allowed if key in event}
+        await self.send_bounded_event(event_type="attendance.update", payload=payload)

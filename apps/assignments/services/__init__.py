@@ -11,13 +11,13 @@ notifications + D4-A AI feedback consume the signals).
 from __future__ import annotations
 
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
-from pathlib import PurePosixPath
 
-from botocore.exceptions import ClientError
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -28,48 +28,80 @@ from apps.assignments.signals import (
     assignment_published,
     submission_graded,
 )
+from apps.assignments.storage_keys import (
+    final_attachment_key,
+    parse_final_attachment_key,
+    parse_legacy_attachment_key,
+    parse_pending_attachment_key,
+    pending_attachment_key,
+)
 from apps.cohorts.models import CohortMembership
 from apps.org.selectors import get_center_settings
-from core.exceptions import ConflictException, UnprocessableEntity
+from core.attachment_storage import (
+    AttachmentObjectError,
+    allowed_attachment_mime_types,
+    promote_attachment_object,
+)
+from core.exceptions import ConflictException, NotFoundException, UnprocessableEntity
+from core.storage_keys import normalized_storage_filename
 from core.utils import current_schema
-from infrastructure.storage.s3_client import head_object, presign_post_upload, presign_upload
+from infrastructure.storage.s3_client import delete_object, presign_post_upload
 
 # ---------------------------------------------------------------------------
-# Attachment upload (presigned PUT)
+# Attachment upload and record-bound promotion
 # ---------------------------------------------------------------------------
 
+_UPLOAD_GRANT_SECONDS = 600
+_MAX_ATTACHMENTS = 20
+_MAX_ACTIVE_UPLOAD_GRANTS = 40
 
-def validate_and_presign_upload(
-    *, filename: str, content_type: str, size_bytes: int, requested_by=None
-) -> dict:
-    """Validate against the `allowed_file_types` / `max_upload_mb` knobs (TD-13)
-    and return a presigned PUT URL + the tenant-prefixed key."""
+
+@transaction.atomic
+def validate_and_presign_upload(*, filename: str, content_type: str, size_bytes: int, requested_by) -> dict:
+    """Issue one exact-size, owner-bound POST policy for a staging key."""
+
     settings = get_center_settings()
-    # Sanitize to a basename: a filename containing '/' / '\' / '..' would
-    # otherwise escape the per-upload {uuid}/ isolation when interpolated into
-    # the key (still within {schema}/assignments/, but not cross-tenant).
-    filename = PurePosixPath(filename.replace("\\", "/")).name
-    if not filename or filename in {".", ".."}:
+    normalized_filename = normalized_storage_filename(filename)
+    if normalized_filename is None:
         raise UnprocessableEntity(
             _("That filename is not allowed."),
             code="invalid_filename",
-            fields={"filename": ["Filename must be a non-empty basename."]},
+            fields={"filename": ["Provide one safe filename of at most 255 UTF-8 bytes."]},
+        )
+    filename = normalized_filename
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 1:
+        raise UnprocessableEntity(
+            _("The file size is invalid."),
+            code="invalid_file_size",
+            fields={"size_bytes": ["File size must be a positive integer."]},
+        )
+    content_type = content_type.partition(";")[0].strip().lower()
+    if not content_type or len(content_type) > 127 or "/" not in content_type:
+        raise UnprocessableEntity(
+            _("The content type is invalid."),
+            code="invalid_content_type",
+            fields={"content_type": ["Provide a valid MIME content type."]},
         )
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in {e.lower() for e in settings.allowed_file_types}:
+    allowed_extensions = {
+        str(extension).lower().lstrip(".")
+        for extension in settings.allowed_file_types
+        if isinstance(extension, str)
+    }
+    if ext not in allowed_extensions:
         raise UnprocessableEntity(
             _("That file type is not allowed."),
             code="file_type_not_allowed",
             fields={"filename": [f"Extension '.{ext}' is not in the allowed list."]},
         )
-    # Declared content-type must be consistent with the extension (mirrors the
-    # content app), closing the content-type-confusion gap for known types. Types
-    # with no canonical mapping are not constrained here (the upload is still
-    # presigned for that exact content_type).
-    from apps.content.services import _EXT_MIME
-
-    expected = _EXT_MIME.get(ext)
-    if expected is not None and content_type not in expected:
+    expected = allowed_attachment_mime_types(filename)
+    if not expected:
+        raise UnprocessableEntity(
+            _("That file type is not supported for attachments."),
+            code="file_type_not_allowed",
+            fields={"filename": [f"Extension '.{ext}' has no reviewed attachment signature."]},
+        )
+    if content_type not in expected:
         raise UnprocessableEntity(
             _("The declared content type does not match the file extension."),
             code="content_type_mismatch",
@@ -81,35 +113,114 @@ def validate_and_presign_upload(
             code="file_too_large",
             fields={"size_bytes": [f"Exceeds the {settings.max_upload_mb} MB limit."]},
         )
-    key = f"{current_schema()}/assignments/{uuid.uuid4().hex}/{filename}"
-    if requested_by is not None:
-        expires_at = timezone.now() + timedelta(minutes=10)
-        grant = AssignmentUploadGrant.objects.create(
-            key=key,
-            requested_by=requested_by,
-            content_type=content_type,
-            expected_size_bytes=size_bytes,
-            expires_at=expires_at,
+
+    requested_by.__class__.objects.select_for_update().get(pk=requested_by.pk)
+    now = timezone.now()
+    active_grants = AssignmentUploadGrant.objects.filter(
+        requested_by=requested_by,
+        consumed_at__isnull=True,
+        expires_at__gt=now,
+    ).count()
+    if active_grants >= _MAX_ACTIVE_UPLOAD_GRANTS:
+        raise UnprocessableEntity(
+            _("Too many uploads are waiting to be attached."),
+            code="upload_grant_limit",
+            fields={"filename": ["Attach or let an earlier upload expire before requesting another."]},
         )
-        post = presign_post_upload(key, content_type=content_type, size_bytes=size_bytes)
-        return {
-            "url": post["url"],
-            "fields": post["fields"],
-            "method": "POST",
-            "key": key,
-            "grant_id": grant.pk,
-            "expires_at": expires_at.isoformat(),
-        }
-    # Backwards-compatible internal helper. Public API callers always provide an
-    # owner and receive the enforceable POST policy above.
-    url = presign_upload(key, content_type=content_type)
-    return {"url": url, "key": key}
+
+    expires_at = now + timedelta(seconds=_UPLOAD_GRANT_SECONDS)
+    key = pending_attachment_key(
+        schema=current_schema(),
+        owner_id=requested_by.pk,
+        upload_id=uuid.uuid4().hex,
+        filename=filename,
+    )
+    grant = AssignmentUploadGrant.objects.create(
+        key=key,
+        requested_by=requested_by,
+        content_type=content_type,
+        expected_size_bytes=size_bytes,
+        expires_at=expires_at,
+    )
+    post = presign_post_upload(
+        key,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        expires_in=_UPLOAD_GRANT_SECONDS,
+    )
+    return {
+        "url": post["url"],
+        "fields": post["fields"],
+        "method": "POST",
+        "key": key,
+        "grant_id": grant.pk,
+        "expires_at": expires_at.isoformat(),
+    }
 
 
-def _verify_and_consume_upload_grants(*, keys: list[str], actor) -> None:
-    """Require live, single-use grants and verify the objects S3 actually stored."""
-    if not keys:
-        return
+def _normalize_attachment_keys(keys: object) -> list[str]:
+    if not isinstance(keys, list) or len(keys) > _MAX_ATTACHMENTS:
+        raise UnprocessableEntity(
+            _("The attachment list is invalid."),
+            code="invalid_attachment_key",
+            fields={"attachments": [f"Provide a list of at most {_MAX_ATTACHMENTS} attachment keys."]},
+        )
+    if any(not isinstance(key, str) or not key or len(key) > 512 for key in keys):
+        raise UnprocessableEntity(
+            _("One or more attachment keys are malformed."),
+            code="invalid_attachment_key",
+            fields={"attachments": ["Every attachment key must be non-empty text."]},
+        )
+    if len(keys) != len(set(keys)):
+        raise UnprocessableEntity(
+            _("Duplicate attachment keys are not allowed."),
+            code="invalid_attachment_key",
+            fields={"attachments": ["Attachment keys must be unique."]},
+        )
+    return list(keys)
+
+
+def _object_error(reason: str) -> UnprocessableEntity:
+    if reason == "missing":
+        return UnprocessableEntity(
+            _("An uploaded attachment could not be found."),
+            code="attachment_not_uploaded",
+            fields={"attachments": ["Upload the file before attaching it."]},
+        )
+    if reason == "size":
+        return UnprocessableEntity(
+            _("An uploaded attachment has the wrong size."),
+            code="attachment_size_mismatch",
+            fields={"attachments": ["The stored size does not match its upload grant."]},
+        )
+    if reason == "content_type":
+        return UnprocessableEntity(
+            _("An uploaded attachment has the wrong content type."),
+            code="attachment_type_mismatch",
+            fields={"attachments": ["The stored type does not match its upload grant."]},
+        )
+    return UnprocessableEntity(
+        _("An uploaded attachment does not contain the declared file type."),
+        code="attachment_content_mismatch",
+        fields={"attachments": ["Upload a file whose contents match its filename and type."]},
+    )
+
+
+def _locked_live_grants(*, keys: list[str], actor) -> dict[str, AssignmentUploadGrant]:
+    if keys and actor is None:
+        raise UnprocessableEntity(
+            _("Attachment upload ownership is required."),
+            code="invalid_attachment_grant",
+            fields={"attachments": ["Request a new upload URL for this account."]},
+        )
+    schema = current_schema()
+    parsed = {key: parse_pending_attachment_key(key, schema=schema) for key in keys}
+    if any(value is None or value.owner_id != actor.pk for value in parsed.values()):
+        raise UnprocessableEntity(
+            _("One or more attachment keys are not authorized."),
+            code="invalid_attachment_key",
+            fields={"attachments": ["Use keys returned by your own assignment upload request."]},
+        )
     now = timezone.now()
     grants = {
         grant.key: grant
@@ -124,70 +235,217 @@ def _verify_and_consume_upload_grants(*, keys: list[str], actor) -> None:
         raise UnprocessableEntity(
             _("An attachment upload grant is missing, expired, already used, or belongs to another user."),
             code="invalid_attachment_grant",
-            fields={"attachment_keys": ["Request a new upload URL and upload the file again."]},
+            fields={"attachments": ["Request a new upload URL and upload the file again."]},
         )
+    return grants
+
+
+def _target_identity(target: Assignment | Submission) -> tuple[str, int]:
+    if not target.pk:
+        raise ValueError("An attachment target must be saved before promotion")
+    if isinstance(target, Assignment):
+        return "assignments", target.pk
+    if isinstance(target, Submission):
+        return "submissions", target.pk
+    raise TypeError("Unsupported assignment attachment target")
+
+
+def _trusted_new_final_keys(target: Assignment | Submission, keys: list[str]) -> set[str]:
+    """Return only canonical keys backed by a consumed server upload grant."""
+
+    schema = current_schema()
+    target_kind, target_id = _target_identity(target)
+    parsed = {key: parse_final_attachment_key(key, schema=schema) for key in keys}
+    grant_ids = {
+        item.grant_id
+        for item in parsed.values()
+        if item is not None and item.target_kind == target_kind and item.target_id == target_id
+    }
+    grants = {
+        grant.pk: grant
+        for grant in AssignmentUploadGrant.objects.filter(
+            pk__in=grant_ids,
+            consumed_at__isnull=False,
+            durable_deleted_at__isnull=True,
+        )
+    }
+    trusted: set[str] = set()
+    for key, item in parsed.items():
+        if item is None or item.target_kind != target_kind or item.target_id != target_id:
+            continue
+        grant = grants.get(item.grant_id)
+        if grant is None:
+            continue
+        source = parse_pending_attachment_key(grant.key, schema=schema)
+        if source is not None and source.filename == item.filename and grant.durable_key in (None, key):
+            expected_key = final_attachment_key(
+                schema=schema,
+                target_kind=target_kind,
+                target_id=target_id,
+                grant_id=grant.pk,
+                filename=source.filename,
+            )
+            if key == expected_key:
+                trusted.add(key)
+    return trusted
+
+
+def _legacy_key_is_bound(target: Assignment | Submission, key: str) -> bool:
+    """Safely retain deployed pre-promotion attachments when uniquely attributable."""
+
+    schema = current_schema()
+    if parse_legacy_attachment_key(key, schema=schema) is None:
+        return False
+    grants = AssignmentUploadGrant.objects.filter(
+        Q(durable_key=key) | Q(durable_key__isnull=True),
+        key=key,
+        consumed_at__isnull=False,
+        durable_deleted_at__isnull=True,
+    )
+    if isinstance(target, Submission):
+        grants = grants.filter(requested_by_id=target.student.user_id)
+    if not grants.exists():
+        return False
+    assignment_ids = list(
+        Assignment.objects.filter(attachments__contains=[key]).values_list("pk", flat=True)[:2]
+    )
+    submission_ids = list(
+        Submission.objects.filter(attachments__contains=[key]).values_list("pk", flat=True)[:2]
+    )
+    if len(assignment_ids) + len(submission_ids) != 1:
+        return False
+    if isinstance(target, Assignment):
+        return assignment_ids == [target.pk]
+    return submission_ids == [target.pk]
+
+
+def trusted_attachment_keys(target: Assignment | Submission) -> tuple[str, ...]:
+    """Resolve storage references that are provably bound to this exact row."""
+
+    raw = target.attachments if isinstance(target.attachments, list) else []
+    string_keys = [key for key in raw if isinstance(key, str)]
+    trusted_final = _trusted_new_final_keys(target, string_keys)
+    return tuple(key for key in string_keys if key in trusted_final or _legacy_key_is_bound(target, key))
+
+
+def _delete_promoted_objects(keys: list[str]) -> None:
+    """Best-effort compensation before a failed database transaction unwinds."""
+
+    schema = current_schema()
     for key in keys:
-        grant = grants[key]
-        try:
-            metadata = head_object(key)
-        except ClientError as exc:
-            code = str(exc.response.get("Error", {}).get("Code", ""))
-            if code not in {"404", "NoSuchKey", "NotFound"}:
-                raise
-            raise UnprocessableEntity(
-                _("An uploaded attachment could not be verified."),
-                code="attachment_not_uploaded",
-                fields={"attachment_keys": ["The object does not exist in storage."]},
-            ) from exc
-        actual_size = int(metadata.get("ContentLength", -1))
-        actual_type = str(metadata.get("ContentType", "")).split(";", 1)[0].strip().lower()
-        if actual_size != grant.expected_size_bytes:
-            raise UnprocessableEntity(
-                _("An uploaded attachment has the wrong size."),
-                code="attachment_size_mismatch",
-                fields={"attachment_keys": ["The stored object size does not match its upload grant."]},
-            )
-        if actual_type != grant.content_type.lower():
-            raise UnprocessableEntity(
-                _("An uploaded attachment has the wrong content type."),
-                code="attachment_type_mismatch",
-                fields={"attachment_keys": ["The stored content type does not match its upload grant."]},
-            )
-        grant.actual_size_bytes = actual_size
-        grant.consumed_at = now
-        grant.save(update_fields=["actual_size_bytes", "consumed_at"])
+        if parse_final_attachment_key(key, schema=schema) is None:
+            continue
+        with suppress(Exception):
+            delete_object(key)
 
 
-def consume_assignment_attachments(*, keys: list, actor=None) -> list[str]:
-    """Validate tenant ownership and, for new public writes, consume upload grants."""
-    if len(keys) > 20:
+def discard_promoted_attachment_keys(keys: list[str]) -> None:
+    """Compensate storage promotion when its enclosing database write fails."""
+
+    _delete_promoted_objects(keys)
+
+
+def _enqueue_source_cleanup(grant_ids: list[int]) -> None:
+    if not grant_ids:
+        return
+    schema = current_schema()
+
+    def enqueue() -> None:
+        from celery_tasks.attachment_tasks import cleanup_consumed_upload_sources_for_schema
+
+        cleanup_consumed_upload_sources_for_schema.delay("assignments", grant_ids, _schema_name=schema)
+
+    transaction.on_commit(enqueue, robust=True)
+
+
+def enqueue_attachment_deletions(keys: list[str]) -> None:
+    if not keys:
+        return
+    schema = current_schema()
+    unique_keys = list(dict.fromkeys(keys))
+    key_chunks = [unique_keys[index : index + 500] for index in range(0, len(unique_keys), 500)]
+    now = timezone.now()
+    grant_ids: list[int] = []
+    for chunk in key_chunks:
+        grants = AssignmentUploadGrant.objects.filter(
+            consumed_at__isnull=False,
+            durable_deleted_at__isnull=True,
+        ).filter(Q(durable_key__in=chunk) | Q(durable_key__isnull=True, key__in=chunk))
+        chunk_ids = list(grants.values_list("pk", flat=True))
+        if chunk_ids:
+            AssignmentUploadGrant.objects.filter(pk__in=chunk_ids).update(deletion_requested_at=now)
+            grant_ids.extend(chunk_ids)
+    grant_ids = list(dict.fromkeys(grant_ids))
+    grant_chunks = [grant_ids[index : index + 500] for index in range(0, len(grant_ids), 500)]
+
+    def enqueue() -> None:
+        from celery_tasks.attachment_tasks import delete_attachment_objects
+
+        for chunk in grant_chunks:
+            delete_attachment_objects.delay("assignments", chunk, _schema_name=schema)
+
+    transaction.on_commit(enqueue, robust=True)
+
+
+def consume_assignment_attachments(*, target: Assignment | Submission, keys: list, actor) -> list[str]:
+    """Promote new staging keys and retain only trusted keys already on ``target``."""
+
+    normalized = _normalize_attachment_keys(keys)
+    if not normalized:
+        enqueue_attachment_deletions(list(trusted_attachment_keys(target)))
+        return []
+
+    current = set(trusted_attachment_keys(target))
+    pending_keys = [key for key in normalized if key not in current]
+    if any(parse_pending_attachment_key(key, schema=current_schema()) is None for key in pending_keys):
         raise UnprocessableEntity(
-            _("Too many attachment keys."),
+            _("One or more attachment keys are not authorized for this record."),
             code="invalid_attachment_key",
-            fields={"attachments": ["At most 20 attachment keys are allowed."]},
+            fields={"attachments": ["Use an existing attachment or a new upload grant."]},
         )
+    grants = _locked_live_grants(keys=pending_keys, actor=actor)
+    target_kind, target_id = _target_identity(target)
+    promoted_by_source: dict[str, str] = {}
+    promoted: list[str] = []
+    now = timezone.now()
     try:
-        unique_count = len(set(keys))
-    except TypeError:
-        unique_count = -1
-    if unique_count != len(keys):
-        raise UnprocessableEntity(
-            _("Duplicate or malformed attachment keys are not allowed."),
-            code="invalid_attachment_key",
-            fields={"attachments": ["Each attachment key must be a unique string."]},
-        )
-    prefix = f"{current_schema()}/assignments/"
-    bad = [key for key in keys if not isinstance(key, str) or len(key) > 512 or not key.startswith(prefix)]
-    if bad:
-        raise UnprocessableEntity(
-            _("One or more attachment keys are not valid for this tenant."),
-            code="invalid_attachment_key",
-            fields={"attachments": [f"Keys must start with '{prefix}'."]},
-        )
-    normalized = list(keys)
-    if actor is not None:
-        _verify_and_consume_upload_grants(keys=normalized, actor=actor)
-    return normalized
+        for source_key in pending_keys:
+            grant = grants[source_key]
+            parsed_source = parse_pending_attachment_key(source_key, schema=current_schema())
+            if parsed_source is None:  # guarded above; keeps type narrowing explicit
+                raise UnprocessableEntity(code="invalid_attachment_key")
+            destination_key = final_attachment_key(
+                schema=current_schema(),
+                target_kind=target_kind,
+                target_id=target_id,
+                grant_id=grant.pk,
+                filename=parsed_source.filename,
+            )
+            try:
+                verified = promote_attachment_object(
+                    source_key=source_key,
+                    destination_key=destination_key,
+                    filename=parsed_source.filename,
+                    expected_size_bytes=grant.expected_size_bytes,
+                    expected_content_type=grant.content_type,
+                )
+            except AttachmentObjectError as exc:
+                raise _object_error(exc.reason) from exc
+            promoted.append(destination_key)
+            grant.actual_size_bytes = verified.size_bytes
+            grant.consumed_at = now
+            grant.durable_key = destination_key
+            grant.save(update_fields=["actual_size_bytes", "consumed_at", "durable_key"])
+            promoted_by_source[source_key] = destination_key
+    except Exception:
+        _delete_promoted_objects(promoted)
+        raise
+
+    _enqueue_source_cleanup([grants[key].pk for key in pending_keys])
+    result = [promoted_by_source.get(key, key) for key in normalized]
+    removed = [key for key in current if key not in result]
+    enqueue_attachment_deletions(removed)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +504,15 @@ def submit(
 ) -> Submission:
     """Create a submission. Rejects draft/closed assignments, non-members, and
     attempts past the resubmit limit — each with its own 422 code."""
+    # Serialize against publish/close/delete/cohort moves and re-read the state
+    # after taking the lock. A stale view-level object must not accept an upload
+    # into an assignment that closed or moved out of the student's cohort.
+    locked_assignment = (
+        Assignment.objects.select_for_update().select_related("cohort").filter(pk=assignment.pk).first()
+    )
+    if locked_assignment is None:
+        raise NotFoundException(_("Assignment not found."), code="not_found")
+    assignment = locked_assignment
     if assignment.status == Assignment.Status.CLOSED:
         raise UnprocessableEntity(_("This assignment is closed."), code="assignment_closed")
     if assignment.status != Assignment.Status.PUBLISHED:
@@ -260,12 +527,6 @@ def submit(
             code="student_not_in_cohort",
             fields={"student": ["Not an active cohort member."]},
         )
-
-    # Attachment keys come straight from the client (presigned earlier). Reject
-    # any key not under this tenant's prefix so a student cannot persist
-    # cross-tenant-shaped (or other-student) S3 references that a future
-    # download / quota flow would inherit.
-    keys = consume_assignment_attachments(keys=list(attachment_keys or []), actor=actor)
 
     settings = get_center_settings()
     max_resubmits = (
@@ -299,23 +560,11 @@ def submit(
                 assignment=assignment,
                 student=student,
                 text=text,
-                attachments=keys,
+                # Durable object keys include the submission primary key.
+                attachments=[],
                 is_late=is_late,
                 attempt_number=attempt_number,
             )
-        # D4-A: a new submission requests AI feedback. Emitted on commit so the
-        # receiver enqueues run_assignment_feedback exactly once per submission.
-        schema = current_schema()
-        actor_id = getattr(actor, "id", None)
-        transaction.on_commit(
-            lambda: ai_feedback_requested.send(
-                sender=Submission,
-                submission_id=submission.pk,
-                requested_by=actor_id,
-                schema_name=schema,
-            )
-        )
-        return submission
     except IntegrityError as exc:
         # Two concurrent submits for the same (assignment, student) computed the
         # same attempt_number; the UniqueConstraint catches the loser. Surface a
@@ -325,6 +574,32 @@ def submit(
             _("A concurrent submission was detected. Please retry."),
             code="submission_conflict",
         ) from exc
+
+    promoted: list[str] = []
+    try:
+        promoted = consume_assignment_attachments(
+            target=submission,
+            keys=list(attachment_keys or []),
+            actor=actor,
+        )
+        submission.attachments = promoted
+        submission.save(update_fields=["attachments"])
+    except Exception:
+        _delete_promoted_objects(promoted)
+        raise
+    # D4-A: a new submission requests AI feedback. Emitted on commit so the
+    # receiver enqueues run_assignment_feedback exactly once per submission.
+    schema = current_schema()
+    actor_id = getattr(actor, "id", None)
+    transaction.on_commit(
+        lambda: ai_feedback_requested.send(
+            sender=Submission,
+            submission_id=submission.pk,
+            requested_by=actor_id,
+            schema_name=schema,
+        )
+    )
+    return submission
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +736,14 @@ def check_submission(submission: Submission) -> PlagiarismResult:
 # ---------------------------------------------------------------------------
 
 
-def request_ai_feedback(*, submission: Submission, requested_by=None) -> None:
+def request_ai_feedback(*, submission: Submission, requested_by=None, requested_principal=None) -> None:
     schema = current_schema()
     ai_feedback_requested.send(
         sender=Submission,
         submission_id=submission.pk,
         requested_by=getattr(requested_by, "id", None),
+        requested_principal_kind=getattr(requested_principal, "kind", None),
+        requested_principal_id=getattr(requested_principal, "principal_id", None),
         schema_name=schema,
     )
 

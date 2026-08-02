@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlencode
 
 from django.conf import settings
 
@@ -33,9 +35,31 @@ ACTION_COMPLETE = 1
 # Click error codes (subset we emit).
 ERROR_SUCCESS = 0
 ERROR_SIGN_CHECK_FAILED = -1
+ERROR_INVALID_AMOUNT = -2
+ERROR_ACTION_NOT_FOUND = -3
 ERROR_TRANSACTION_NOT_FOUND = -6
 ERROR_ALREADY_PAID = -4
+ERROR_USER_NOT_FOUND = -5
+ERROR_FAILED_TO_UPDATE_USER = -7
+ERROR_IN_REQUEST = -8
 ERROR_TRANSACTION_CANCELLED = -9
+_SAFE_PROVIDER_VALUE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+_HEX_MD5 = re.compile(r"\A[0-9a-fA-F]{32}\Z")
+
+
+def _wire_text(payload: dict[str, Any], field: str, *, max_length: int = 64) -> str:
+    value = payload[field]
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{field} must be a scalar")
+    text = str(value)
+    if (
+        not text
+        or len(text) > max_length
+        or text.strip() != text
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
+    ):
+        raise ValueError(f"{field} is invalid")
+    return text
 
 
 def click_sign_string(
@@ -58,14 +82,26 @@ def click_sign_string(
     if action == ACTION_COMPLETE:
         parts.append(str(merchant_prepare_id))
     parts.extend([amount, str(action), sign_time])
-    return hashlib.md5("".join(parts).encode()).hexdigest()
+    # Click.uz's published wire contract requires this exact MD5 digest; it is
+    # not a locally chosen primitive and replacing it would reject every real
+    # callback. Empty-secret rejection, constant-time comparison, replay keys,
+    # amount binding, and tenant-specific credentials provide the surrounding
+    # controls. Remove this exception when the provider offers a stronger
+    # signature version.
+    return hashlib.md5("".join(parts).encode()).hexdigest()  # nosec B324
 
 
 class ClickClient(ABC):
     PROVIDER = "click"
 
     @abstractmethod
-    def verify_signature(self, *, payload: dict[str, Any], secret_key: str) -> bool: ...
+    def verify_signature(
+        self,
+        *,
+        payload: dict[str, Any],
+        secret_key: str,
+        expected_service_id: str | None = None,
+    ) -> bool: ...
 
     @abstractmethod
     def build_checkout(self, *, amount_uzs: int, merchant_trans_id: str, config: Any) -> dict[str, Any]: ...
@@ -75,7 +111,13 @@ class RealClickClient(ClickClient):
     """Verifies real Click callbacks. No outbound HTTP for the webhook path —
     Click pushes to us; we only verify the signature it sent."""
 
-    def verify_signature(self, *, payload: dict[str, Any], secret_key: str) -> bool:
+    def verify_signature(
+        self,
+        *,
+        payload: dict[str, Any],
+        secret_key: str,
+        expected_service_id: str | None = None,
+    ) -> bool:
         # An empty/unset secret must never verify: the service_id is semi-public
         # (it's in the browser-visible checkout redirect), so without this guard an
         # attacker could forge md5(...''...) and pass compare_digest. Mirrors the
@@ -83,30 +125,60 @@ class RealClickClient(ClickClient):
         if not secret_key:
             return False
         try:
+            click_trans_id = _wire_text(payload, "click_trans_id")
+            service_id = _wire_text(payload, "service_id")
+            merchant_trans_id = _wire_text(payload, "merchant_trans_id")
+            amount = _wire_text(payload, "amount", max_length=32)
+            sign_time = _wire_text(payload, "sign_time")
+            raw_action = payload["action"]
+            if isinstance(raw_action, bool) or not isinstance(raw_action, (str, int)):
+                return False
+            action = int(raw_action)
+            if action not in (ACTION_PREPARE, ACTION_COMPLETE) or str(raw_action) not in {"0", "1"}:
+                return False
+            merchant_prepare_id = ""
+            if action == ACTION_COMPLETE:
+                merchant_prepare_id = _wire_text(payload, "merchant_prepare_id")
+            if expected_service_id is not None and service_id != str(expected_service_id):
+                return False
             expected = click_sign_string(
-                click_trans_id=str(payload["click_trans_id"]),
-                service_id=str(payload["service_id"]),
+                click_trans_id=click_trans_id,
+                service_id=service_id,
                 secret_key=secret_key,
-                merchant_trans_id=str(payload["merchant_trans_id"]),
-                amount=str(payload["amount"]),
-                action=int(payload["action"]),
-                sign_time=str(payload["sign_time"]),
-                merchant_prepare_id=str(payload.get("merchant_prepare_id", "")),
+                merchant_trans_id=merchant_trans_id,
+                amount=amount,
+                action=action,
+                sign_time=sign_time,
+                merchant_prepare_id=merchant_prepare_id,
             )
         except (KeyError, TypeError, ValueError):
             return False
-        provided = str(payload.get("sign_string", ""))
+        provided = payload.get("sign_string", "")
+        if not isinstance(provided, str) or _HEX_MD5.fullmatch(provided) is None:
+            return False
         # constant-time compare to avoid leaking the digest byte-by-byte
-        return hmac.compare_digest(expected.encode("ascii"), provided.encode("utf-8"))
+        return hmac.compare_digest(expected.lower(), provided.lower())
 
     def build_checkout(self, *, amount_uzs: int, merchant_trans_id: str, config: Any) -> dict[str, Any]:
-        service_id = getattr(config, "click_service_id", "")
-        merchant_id = getattr(config, "click_merchant_id", "")
-        url = (
-            f"{settings.CLICK_CHECKOUT_URL}?service_id={service_id}"
-            f"&merchant_id={merchant_id}&amount={amount_uzs}"
-            f"&transaction_param={merchant_trans_id}"
+        from infrastructure.http_client import validate_https_endpoint
+
+        service_id = str(getattr(config, "click_service_id", ""))
+        merchant_id = str(getattr(config, "click_merchant_id", ""))
+        if not _SAFE_PROVIDER_VALUE.fullmatch(service_id) or not _SAFE_PROVIDER_VALUE.fullmatch(merchant_id):
+            raise ValueError("Click merchant configuration is invalid.")
+        base = validate_https_endpoint(
+            settings.CLICK_CHECKOUT_URL,
+            allowed_hosts=getattr(settings, "CLICK_CHECKOUT_ALLOWED_HOSTS", ()),
+        ).rstrip("/")
+        query = urlencode(
+            {
+                "service_id": service_id,
+                "merchant_id": merchant_id,
+                "amount": amount_uzs,
+                "transaction_param": merchant_trans_id,
+            }
         )
+        url = f"{base}?{query}"
         return {"redirect_url": url, "merchant_trans_id": merchant_trans_id}
 
 
@@ -114,9 +186,19 @@ class MockClickClient(ClickClient):
     """Deterministic mock. The signature it ACCEPTS is the real md5 algorithm
     (so Lane F's tampering tests are meaningful); the checkout url is canned."""
 
-    def verify_signature(self, *, payload: dict[str, Any], secret_key: str) -> bool:
+    def verify_signature(
+        self,
+        *,
+        payload: dict[str, Any],
+        secret_key: str,
+        expected_service_id: str | None = None,
+    ) -> bool:
         # Use the real algorithm — a tampered sign_string must still fail.
-        return RealClickClient().verify_signature(payload=payload, secret_key=secret_key)
+        return RealClickClient().verify_signature(
+            payload=payload,
+            secret_key=secret_key,
+            expected_service_id=expected_service_id,
+        )
 
     def build_checkout(self, *, amount_uzs: int, merchant_trans_id: str, config: Any) -> dict[str, Any]:
         return {

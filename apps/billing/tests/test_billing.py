@@ -110,7 +110,11 @@ def test_middleware_allowlist_passes_when_suspended(tenant_a, client_for):
     client = client_for(tenant_a)
     # /api/v1/auth/ is allowlisted; a suspended tenant must still be able to log
     # in. (login expects POST; we only assert it is NOT the 402 paywall.)
-    resp = client.post("/api/v1/auth/login/", {"username": "x", "password": "y"}, format="json")
+    resp = client.post(
+        "/api/v1/auth/role-login/",
+        {"username": "x", "password": "y"},
+        format="json",
+    )
     assert resp.status_code != 402
 
 
@@ -303,6 +307,37 @@ def test_dunning_dispatch_dedupe(tenant_a, django_capture_on_commit_callbacks):
     with schema_context(tenant_a.schema_name):
         second_count = Notification.objects.filter(user=director).count()
     assert second_count == first_count
+
+
+def test_dunning_recipients_ignore_drifted_custom_director_role(tenant_a):
+    from apps.access.models import AccountType
+    from apps.billing.services import _director_user_ids
+    from apps.org.tests.factories import BranchFactory
+    from apps.users.models import RoleMembership
+    from apps.users.tests.factories import UserFactory
+    from core.permissions import Role
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        owner = UserFactory()
+        RoleMembership.objects.create(user=owner, branch=branch, role=Role.DIRECTOR)
+        custom = AccountType.objects.create(
+            name="Drifted billing observer",
+            slug="drifted-billing-observer",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        impostor = UserFactory()
+        RoleMembership.objects.create(
+            user=impostor,
+            branch=branch,
+            account_type=custom,
+            role=Role.DIRECTOR,
+        )
+
+        recipient_ids = set(_director_user_ids())
+
+    assert owner.pk in recipient_ids
+    assert impostor.pk not in recipient_ids
 
 
 # ---------------------------------------------------------------------------

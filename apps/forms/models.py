@@ -18,6 +18,11 @@ class Form(models.Model):
         PUBLISHED = "published", _("Published")
         CLOSED = "closed", _("Closed")
 
+    class CreatorAttributionStatus(models.TextChoices):
+        CAPTURED = "captured", _("Captured")
+        RESOLVED = "resolved", _("Resolved from legacy data")
+        QUARANTINED = "quarantined", _("Quarantined")
+
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.DRAFT, db_index=True)
@@ -34,11 +39,22 @@ class Form(models.Model):
     # they submit. `audience_roles` is a list of Role values; `audience_user_ids` a list of
     # user ids (the union is the target set).
     audience_roles = models.JSONField(default=list, blank=True)
+    # Immutable role-native targets resolved from the legacy public ``user_id``
+    # selector. A bridge User can back several accounts, so authorization reads this
+    # principal pair and never treats ``audience_user_ids`` as sufficient identity.
+    audience_principals = models.JSONField(default=list, blank=True)
     audience_user_ids = models.JSONField(default=list, blank=True)
     opens_at = models.DateTimeField(null=True, blank=True)
     closes_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_by_principal_kind = models.CharField(max_length=16, blank=True)
+    created_by_principal_id = models.PositiveBigIntegerField(null=True, blank=True)
+    created_by_attribution_status = models.CharField(
+        max_length=16,
+        choices=CreatorAttributionStatus.choices,
+        default=CreatorAttributionStatus.QUARANTINED,
     )
     published_at = models.DateTimeField(null=True, blank=True)
     closed_at = models.DateTimeField(null=True, blank=True)
@@ -48,6 +64,31 @@ class Form(models.Model):
     class Meta:
         ordering = ("-created_at",)
         indexes = [models.Index(fields=("status", "created_at"))]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(opens_at__isnull=True)
+                    | models.Q(closes_at__isnull=True)
+                    | models.Q(closes_at__gt=models.F("opens_at"))
+                ),
+                name="form_close_after_open",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    (
+                        models.Q(created_by_principal_kind__in=("staff", "teacher"))
+                        & models.Q(created_by_principal_id__isnull=False)
+                        & models.Q(created_by_attribution_status__in=("captured", "resolved"))
+                    )
+                    | models.Q(
+                        created_by_principal_kind="",
+                        created_by_principal_id__isnull=True,
+                        created_by_attribution_status="quarantined",
+                    )
+                ),
+                name="form_creator_principal_pair",
+            ),
+        ]
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.title} ({self.status})"
@@ -83,10 +124,25 @@ class FormField(models.Model):
 
 
 class FormResponse(models.Model):
+    class AttributionStatus(models.TextChoices):
+        CAPTURED = "captured", _("Captured")
+        RESOLVED = "resolved", _("Resolved from legacy data")
+        ANONYMOUS = "anonymous", _("Anonymous")
+        UNRESOLVED = "unresolved", _("Needs review")
+        CONFLICTING = "conflicting", _("Conflicting legacy identity")
+        QUARANTINED = "quarantined", _("Quarantined")
+
     form = models.ForeignKey(Form, on_delete=models.CASCADE, related_name="responses")
     # Null when the form is anonymous (or the respondent row was deleted).
     respondent = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="form_responses"
+    )
+    respondent_principal_kind = models.CharField(max_length=16, blank=True)
+    respondent_principal_id = models.PositiveBigIntegerField(null=True, blank=True)
+    respondent_attribution_status = models.CharField(
+        max_length=16,
+        choices=AttributionStatus.choices,
+        default=AttributionStatus.QUARANTINED,
     )
     # Set by the service to the respondent id ONLY when the form dedupes (not
     # anonymous, not allow_multiple); blank otherwise. The partial unique constraint
@@ -97,12 +153,46 @@ class FormResponse(models.Model):
 
     class Meta:
         ordering = ("-created_at",)
-        indexes = [models.Index(fields=("form", "created_at"))]
+        indexes = [
+            models.Index(fields=("form", "created_at")),
+            models.Index(
+                fields=("form", "respondent_principal_kind", "respondent_principal_id"),
+                name="form_response_principal_idx",
+            ),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=("form", "dedupe_token"),
                 condition=~models.Q(dedupe_token=""),
                 name="one_response_per_dedupe_token",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        respondent__isnull=True,
+                        respondent_principal_kind="",
+                        respondent_principal_id__isnull=True,
+                        respondent_attribution_status="anonymous",
+                    )
+                    | (
+                        models.Q(respondent_principal_kind__in=("student", "teacher", "parent", "staff"))
+                        & models.Q(respondent_principal_id__isnull=False)
+                        & models.Q(respondent_attribution_status__in=("captured", "resolved"))
+                    )
+                    | (
+                        models.Q(respondent__isnull=False)
+                        & models.Q(respondent_principal_kind="")
+                        & models.Q(respondent_principal_id__isnull=True)
+                        & models.Q(
+                            respondent_attribution_status__in=(
+                                "unresolved",
+                                "conflicting",
+                                "quarantined",
+                            )
+                        )
+                    )
+                ),
+                name="form_response_principal_pair",
             ),
         ]
 

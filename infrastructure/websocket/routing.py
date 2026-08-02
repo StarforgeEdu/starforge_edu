@@ -8,6 +8,7 @@ Routes:
   - ws/ping/                              -> PingConsumer (smoke, unchanged)
   - ws/notifications/                     -> NotificationConsumer (apps.notifications)
   - ws/cohorts/<cohort_id>/attendance/    -> AttendanceConsumer (apps.attendance)
+  - ws/messaging/threads/<thread_id>/     -> ThreadConsumer (apps.messaging)
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 from django.urls import path
 
 from apps.attendance.routing import websocket_urlpatterns as attendance_ws_urlpatterns
+from apps.messaging.routing import websocket_urlpatterns as messaging_ws_urlpatterns
 from apps.notifications.routing import websocket_urlpatterns as notifications_ws_urlpatterns
 
 from .consumers import PingConsumer
@@ -22,5 +24,6 @@ from .consumers import PingConsumer
 websocket_urlpatterns = [
     path("ws/ping/", PingConsumer.as_asgi()),
     *notifications_ws_urlpatterns,
+    *messaging_ws_urlpatterns,
     *attendance_ws_urlpatterns,
 ]

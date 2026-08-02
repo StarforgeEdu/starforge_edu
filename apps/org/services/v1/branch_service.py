@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import DataError, IntegrityError, transaction
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
@@ -29,6 +30,7 @@ class BranchService(IBranchService):
         # Archived branches are excluded from the writable/detail surface (D1-LF-7).
         return self._branches.active().filter(pk=branch_id).first()
 
+    @transaction.atomic
     def create(self, data: BranchCreateDTO) -> Branch:
         return self._save(
             Branch(
@@ -43,7 +45,12 @@ class BranchService(IBranchService):
             )
         )
 
+    @transaction.atomic
     def update(self, branch: Branch, changes: dict[str, Any]) -> Branch:
+        locked = self._branches.active().select_for_update(of=("self",)).filter(pk=branch.pk).first()
+        if locked is None:
+            raise NotFoundException(code="not_found")
+        branch = locked
         for field in _SCALARS:
             if field in changes:
                 setattr(branch, field, changes[field])
@@ -103,8 +110,19 @@ class BranchService(IBranchService):
     @staticmethod
     def _save(branch: Branch) -> Branch:
         try:
+            branch.full_clean(validate_unique=False, validate_constraints=False)
             with transaction.atomic():  # savepoint: unique-slug violation must not poison the txn
                 branch.save()
+        except DjangoValidationError as exc:
+            fields = {
+                field: [str(message) for message in messages]
+                for field, messages in getattr(exc, "message_dict", {"field": exc.messages}).items()
+            }
+            raise ValidationException(
+                _("Please review the branch fields."),
+                code="validation_error",
+                fields=fields,
+            ) from exc
         except IntegrityError as exc:
             raise ValidationException(
                 _("A branch with this slug already exists."),

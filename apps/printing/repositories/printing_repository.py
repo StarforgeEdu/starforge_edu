@@ -12,7 +12,7 @@ from apps.printing.interfaces.repositories import (
     IPrinterRepository,
     IPrintJobRepository,
 )
-from apps.printing.models import BranchAgent, Printer, PrintJob
+from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
 from core.repositories import BaseRepository
 
 
@@ -24,6 +24,9 @@ class PrintJobRepository(BaseRepository[PrintJob], IPrintJobRepository):
 
     def get(self, *, pk: int) -> PrintJob | None:
         return selectors.print_jobs().filter(pk=pk).first()
+
+    def list_reconciliations(self, *, job_id: int) -> QuerySet[PrintJobReconciliation]:
+        return selectors.print_job_reconciliations(job_id=job_id)
 
 
 class PrinterRepository(BaseRepository[Printer], IPrinterRepository):

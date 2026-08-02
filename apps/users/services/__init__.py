@@ -274,8 +274,13 @@ def sync_role_user_bridge(account) -> None:
 
 
 @transaction.atomic
-def update_role_identity(account, changes: dict) -> None:
-    """Apply validated identity/contact changes to a role-owned account."""
+def update_role_identity(
+    account,
+    changes: dict,
+    *,
+    preferred_language: str | None = None,
+) -> None:
+    """Apply identity and bridge-owned preference changes atomically."""
     identity_fields = ("phone", "email", "first_name", "last_name", "middle_name")
     if any(field in changes for field in identity_fields):
         current = {field: changes.get(field, getattr(account, field)) for field in identity_fields}
@@ -294,8 +299,23 @@ def update_role_identity(account, changes: dict) -> None:
     for field in ("birthdate", "gender", "is_active"):
         if field in changes:
             setattr(account, field, changes[field])
-    account.save()
-    sync_role_user_bridge(account)
+    # Preference-only updates belong to the compatibility user.  Avoid rewriting
+    # the role account (and its password/encrypted identity columns) or revoking
+    # access through bridge synchronization when none of those values changed.
+    if changes:
+        # Write only caller-supplied fields.  Saving the entire role row from a
+        # request-scoped instance can overwrite an unrelated concurrent PATCH
+        # (and rewrites encrypted columns even when their plaintext did not
+        # change).  Keep ``updated_at`` accurate where the concrete profile has
+        # that conventional field.
+        update_fields = list(changes)
+        if any(field.name == "updated_at" for field in account._meta.concrete_fields):
+            update_fields.append("updated_at")
+        account.save(update_fields=update_fields)
+        sync_role_user_bridge(account)
+    if preferred_language is not None and account.user.preferred_language != preferred_language:
+        account.user.preferred_language = preferred_language
+        account.user.save(update_fields=["preferred_language"])
 
 
 @transaction.atomic
@@ -348,7 +368,13 @@ def set_role_account_password(account, raw_password: str, *, must_change: bool =
     revoke_all_for_user(account.user_id)
 
 
-def issue_role_credentials(account, *, actor, resource_type: str) -> dict[str, str | None]:
+def issue_role_credentials(
+    account,
+    *,
+    actor,
+    resource_type: str,
+    audit_scopes=None,
+) -> dict[str, str | None]:
     """Generate and return a role account's one-time password exactly once."""
     from apps.audit.services import audit_log
     from core.exceptions import PermissionException
@@ -360,12 +386,15 @@ def issue_role_credentials(account, *, actor, resource_type: str) -> dict[str, s
         )
     temporary_password = generate_temp_password()
     set_role_account_password(account, temporary_password, must_change=True)
-    audit_log(
-        actor=actor,
-        action="update",
-        resource_type=resource_type,
-        resource_id=str(account.pk),
-    )
+    scopes = tuple(audit_scopes) if audit_scopes is not None else (None,)
+    for scope in scopes:
+        audit_log(
+            actor=actor,
+            action="update",
+            resource_type=resource_type,
+            resource_id=str(account.pk),
+            scope=scope,
+        )
     return {"username": account.username, "temporary_password": temporary_password}
 
 

@@ -12,7 +12,7 @@ from django_tenants.utils import schema_context
 
 pytestmark = pytest.mark.django_db
 
-LOGIN_URL = "/api/v1/auth/login/"
+GENERIC_LOGIN_URL = "/api/v1/auth/login/"
 ROLE_LOGIN_URL = "/api/v1/auth/role-login/"
 CHANGE_URL = "/api/v1/auth/password/change/"
 RESET_REQUEST_URL = "/api/v1/auth/password/reset/request/"
@@ -31,11 +31,58 @@ def _code_from(sms_text: str) -> str:
 
 
 def _password_user(tenant, user_in, *, roles=("teacher",), password=PASSWORD, **kwargs):
+    """Create one real teacher role account and retain its bridge User for assertions."""
+    assert tuple(roles) == ("teacher",)
     user = user_in(tenant, roles=list(roles), **kwargs)
     with schema_context(tenant.schema_name):
-        user.set_password(password)
-        user.save(update_fields=["password"])
+        from apps.teachers.tests.factories import TeacherProfileFactory
+
+        membership = user.role_memberships.get(role="teacher")
+        account = TeacherProfileFactory(
+            user=user,
+            branch=membership.branch,
+            username=user.username,
+            phone=user.phone,
+            # ``User.email`` is nullable for role-native accounts while the
+            # teacher-owned identity deliberately stores an empty string for
+            # "not supplied".  Mirror the production account-creation path
+            # instead of handing ``None`` to a non-null role field.
+            email=user.email or "",
+        )
+        account.set_password(password)
+        account.save(update_fields=["password"])
+    user._test_role_account = account
     return user
+
+
+def _role_account(user):
+    return user._test_role_account
+
+
+def _role_login(client_for, tenant, user, *, password=PASSWORD, **payload):
+    account = _role_account(user)
+    response = client_for(tenant).post(
+        ROLE_LOGIN_URL,
+        {"username": account.username, "password": password, **payload},
+        format="json",
+    )
+    return response
+
+
+def _role_client(client_for, tenant, user, *, password=PASSWORD, **payload):
+    response = _role_login(client_for, tenant, user, password=password, **payload)
+    assert response.status_code == 200, response.content
+    client = client_for(tenant)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.json()['data']['access']}")
+    return client
+
+
+def _reset_payload(user, **values):
+    return {
+        "identifier": _role_account(user).phone,
+        "account_type": "teacher",
+        **values,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +90,14 @@ def _password_user(tenant, user_in, *, roles=("teacher",), password=PASSWORD, **
 # ---------------------------------------------------------------------------
 
 
-def test_login_happy_path_registers_device(tenant_a, client_for, user_in):
+def test_role_login_happy_path_registers_device(tenant_a, client_for, user_in):
     user = _password_user(tenant_a, user_in)
-    client = client_for(tenant_a)
-
-    resp = client.post(
-        LOGIN_URL,
-        {"username": user.username, "password": PASSWORD, "device_id": "dev-1", "platform": "android"},
-        format="json",
+    resp = _role_login(
+        client_for,
+        tenant_a,
+        user,
+        device_id="dev-1",
+        platform="android",
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -69,10 +116,22 @@ def test_login_happy_path_registers_device(tenant_a, client_for, user_in):
     assert me.json()["data"]["tenant_slug"] == tenant_a.schema_name
 
 
+def test_tenant_generic_bridge_login_is_not_routed(tenant_a, client_for):
+    response = client_for(tenant_a).post(
+        GENERIC_LOGIN_URL,
+        {"username": "bridge-user", "password": PASSWORD},
+        format="json",
+    )
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+
 def test_role_login_student_signs_in_as_their_role(tenant_a, client_for):
-    """Role-native login: a student authenticates with their student account's username and
-    the (linked-user) password. The session binds to the linked User so /me works exactly as
-    before, and the response reports which role they logged in as."""
+    """A student authenticates with only their role-native username and password.
+
+    The hidden bridge User remains an authorization/audit link and is not itself a
+    tenant login identity.
+    """
     from apps.students.tests.factories import StudentProfileFactory
 
     with schema_context(tenant_a.schema_name):
@@ -103,8 +162,8 @@ def test_role_login_wrong_password_401(tenant_a, client_for):
 
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory(username="bob.student")
-        student.user.set_password(PASSWORD)
-        student.user.save(update_fields=["password"])
+        student.set_password(PASSWORD)
+        student.save(update_fields=["password"])
 
     client = client_for(tenant_a)
     resp = client.post(ROLE_LOGIN_URL, {"username": "bob.student", "password": "wrong-pass"}, format="json")
@@ -120,9 +179,7 @@ def test_role_login_unknown_username_401(tenant_a, client_for):
 
 
 def test_role_login_tracks_current_user_password_after_change(tenant_a, client_for):
-    """Regression (auth review): role-login checks the LINKED USER's password (single source
-    of truth), so a password change/reset takes effect immediately — the OLD password 401s and
-    the NEW one works — with no drift from a stale role-account snapshot."""
+    """Role login follows the role account's current credential without stale copies."""
     from apps.students.tests.factories import StudentProfileFactory
     from apps.users.services import set_role_account_password
 
@@ -139,43 +196,48 @@ def test_role_login_tracks_current_user_password_after_change(tenant_a, client_f
     assert new.status_code == 200, new.content
 
 
-def test_login_wrong_password_401(tenant_a, client_for, user_in):
+def test_role_login_wrong_password_has_stable_error(tenant_a, client_for, user_in):
     user = _password_user(tenant_a, user_in)
+    resp = _role_login(client_for, tenant_a, user, password="wrong-wrong-1")
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "invalid_credentials"
+
+
+def test_role_login_unknown_username_same_error(tenant_a, client_for):
     resp = client_for(tenant_a).post(
-        LOGIN_URL, {"username": user.username, "password": "wrong-wrong-1"}, format="json"
+        ROLE_LOGIN_URL, {"username": "ghost-user", "password": "whatever-123"}, format="json"
     )
     assert resp.status_code == 401
     assert resp.json()["code"] == "invalid_credentials"
 
 
-def test_login_unknown_username_same_error(tenant_a, client_for):
-    resp = client_for(tenant_a).post(
-        LOGIN_URL, {"username": "ghost-user", "password": "whatever-123"}, format="json"
-    )
-    assert resp.status_code == 401
-    assert resp.json()["code"] == "invalid_credentials"
-
-
-def test_login_inactive_user_same_error(tenant_a, client_for, user_in):
+def test_role_login_inactive_bridge_same_error(tenant_a, client_for, user_in):
     user = _password_user(tenant_a, user_in)
     with schema_context(tenant_a.schema_name):
         user.is_active = False
         user.save(update_fields=["is_active"])
-    resp = client_for(tenant_a).post(
-        LOGIN_URL, {"username": user.username, "password": PASSWORD}, format="json"
-    )
+    resp = _role_login(client_for, tenant_a, user)
     assert resp.status_code == 401
     assert resp.json()["code"] == "invalid_credentials"
 
 
-def test_login_per_username_throttle_429(tenant_a, client_for, user_in):
+def test_role_login_per_username_throttle_429(tenant_a, client_for, user_in):
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
+    username = _role_account(user).username
     for _ in range(5):  # login_user rate: 5/min
         assert (
-            client.post(LOGIN_URL, {"username": user.username, "password": "bad-pass-123"}, format="json")
+            client.post(
+                ROLE_LOGIN_URL,
+                {"username": username, "password": "bad-pass-123"},
+                format="json",
+            )
         ).status_code == 401
-    resp = client.post(LOGIN_URL, {"username": user.username, "password": "bad-pass-123"}, format="json")
+    resp = client.post(
+        ROLE_LOGIN_URL,
+        {"username": username, "password": "bad-pass-123"},
+        format="json",
+    )
     assert resp.status_code == 429
     assert resp.json()["code"] == "throttled"
 
@@ -185,9 +247,9 @@ def test_login_per_username_throttle_429(tenant_a, client_for, user_in):
 # ---------------------------------------------------------------------------
 
 
-def test_password_change_wrong_old_400(tenant_a, user_in, as_user):
+def test_password_change_wrong_old_400(tenant_a, user_in, client_for):
     user = _password_user(tenant_a, user_in)
-    client = as_user(tenant_a, user)
+    client = _role_client(client_for, tenant_a, user)
     resp = client.post(
         CHANGE_URL, {"old_password": "not-the-one-1", "new_password": NEW_PASSWORD}, format="json"
     )
@@ -195,13 +257,18 @@ def test_password_change_wrong_old_400(tenant_a, user_in, as_user):
     assert resp.json()["code"] == "wrong_password"
 
 
-def test_password_change_ends_other_sessions(tenant_a, client_for, user_in, as_user):
-    from apps.auth.services import issue_token
+def test_password_change_ends_other_sessions(tenant_a, client_for, user_in):
+    from core.session_auth import create_session
 
     user = _password_user(tenant_a, user_in)
+    account = _role_account(user)
     with schema_context(tenant_a.schema_name):
-        old = issue_token(user)
-    client = as_user(tenant_a, user)
+        old = create_session(
+            user,
+            principal_kind="teacher",
+            principal_id=account.pk,
+        )
+    client = _role_client(client_for, tenant_a, user)
 
     resp = client.post(CHANGE_URL, {"old_password": PASSWORD, "new_password": NEW_PASSWORD}, format="json")
     assert resp.status_code == 200
@@ -211,21 +278,17 @@ def test_password_change_ends_other_sessions(tenant_a, client_for, user_in, as_u
 
     # Old session revoked by the password change...
     stale = client_for(tenant_a)
-    stale.credentials(HTTP_AUTHORIZATION=f"Bearer {old['access']}")
+    stale.credentials(HTTP_AUTHORIZATION=f"Bearer {old.key}")
     assert stale.get(ME_URL).status_code == 401
 
     # ...the returned session works, and so does the new password.
     fresh = client_for(tenant_a)
     fresh.credentials(HTTP_AUTHORIZATION=f"Bearer {new['data']['access']}")
     assert fresh.get(ME_URL).status_code == 200
-    assert (
-        client_for(tenant_a).post(
-            LOGIN_URL, {"username": user.username, "password": NEW_PASSWORD}, format="json"
-        )
-    ).status_code == 200
+    assert _role_login(client_for, tenant_a, user, password=NEW_PASSWORD).status_code == 200
 
 
-def test_password_change_preserves_current_push_device_binding(
+def test_role_password_change_preserves_only_current_push_eligibility(
     tenant_a,
     client_for,
     user_in,
@@ -235,15 +298,13 @@ def test_password_change_preserves_current_push_device_binding(
     from core.session_auth import create_session, validate_session_key
 
     user = _password_user(tenant_a, user_in)
-    login = client_for(tenant_a).post(
-        LOGIN_URL,
-        {
-            "username": user.username,
-            "password": PASSWORD,
-            "device_id": "current-phone",
-            "platform": "ios",
-        },
-        format="json",
+    account = _role_account(user)
+    login = _role_login(
+        client_for,
+        tenant_a,
+        user,
+        device_id="current-phone",
+        platform="ios",
     )
     assert login.status_code == 200
     client = client_for(tenant_a)
@@ -265,7 +326,12 @@ def test_password_change_preserves_current_push_device_binding(
             platform="android",
             push_token="old-private-token",
         )
-        create_session(user, device_id="old-tablet")
+        create_session(
+            user,
+            device_id="old-tablet",
+            principal_kind="teacher",
+            principal_id=account.pk,
+        )
 
     changed = client.post(
         CHANGE_URL,
@@ -283,10 +349,19 @@ def test_password_change_preserves_current_push_device_binding(
         old = Device.objects.get(user=user, device_id="old-tablet")
         assert current.revoked_at is None
         assert current.push_token == "current-private-token"
-        assert old.revoked_at is not None
-        assert old.push_token == ""
+        # Role password rotation revokes every old Session. Device metadata may
+        # remain registered, but without a live exact-principal session it is
+        # ineligible for private push delivery.
+        assert old.push_token == "old-private-token"
+        from apps.notifications.models import EventType, Notification
+
+        notification = Notification.objects.create(
+            user=user,
+            event_type=EventType.REPORT_READY,
+            title="Device scope",
+        )
         assert list(
-            notification_tasks._active_push_devices(user).values_list(
+            notification_tasks._active_push_devices(notification).values_list(
                 "device_id",
                 flat=True,
             )
@@ -345,8 +420,17 @@ def test_role_password_change_keeps_device_id_and_push_eligibility(
         assert fresh_session.device_id == "role-phone"
         device = Device.objects.get(user=user, device_id="role-phone")
         assert device.push_token == "role-private-token"
+        from apps.notifications.models import EventType, Notification
+
+        notification = Notification.objects.create(
+            user=user,
+            event_type=EventType.REPORT_READY,
+            title="Role device scope",
+            recipient_principal_kind="student",
+            recipient_principal_id=student.pk,
+        )
         assert list(
-            notification_tasks._active_push_devices(user).values_list(
+            notification_tasks._active_push_devices(notification).values_list(
                 "device_id",
                 flat=True,
             )
@@ -363,29 +447,29 @@ def test_password_reset_flow(tenant_a, client_for, user_in, sms_outbox):
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
 
-    resp = client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json")
+    resp = client.post(RESET_REQUEST_URL, _reset_payload(user), format="json")
     assert resp.status_code == 202
     assert len(sms_outbox) == 1
 
     code = _code_from(sms_outbox[0]["text"])
     resp = client.post(
         RESET_CONFIRM_URL,
-        {"identifier": user.phone, "code": code, "new_password": NEW_PASSWORD},
+        _reset_payload(user, code=code, new_password=NEW_PASSWORD),
         format="json",
     )
     assert resp.status_code == 204
 
-    assert (
-        client.post(LOGIN_URL, {"username": user.username, "password": NEW_PASSWORD}, format="json")
-    ).status_code == 200
-    assert (
-        client.post(LOGIN_URL, {"username": user.username, "password": PASSWORD}, format="json")
-    ).status_code == 401
+    assert _role_login(client_for, tenant_a, user, password=NEW_PASSWORD).status_code == 200
+    assert _role_login(client_for, tenant_a, user, password=PASSWORD).status_code == 401
 
 
 def test_password_reset_unknown_identifier_silent_202(tenant_a, client_for, sms_outbox):
     """Anti-enumeration: unknown identifiers get the same 202 and no SMS."""
-    resp = client_for(tenant_a).post(RESET_REQUEST_URL, {"identifier": "+998905550001"}, format="json")
+    resp = client_for(tenant_a).post(
+        RESET_REQUEST_URL,
+        {"identifier": "+998905550001", "account_type": "teacher"},
+        format="json",
+    )
     assert resp.status_code == 202
     assert len(sms_outbox) == 0
 
@@ -402,8 +486,12 @@ def test_password_reset_disabled_sms_is_uniform_and_never_dispatches(
 
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
-    known = client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json")
-    unknown = client.post(RESET_REQUEST_URL, {"identifier": "+998905550099"}, format="json")
+    known = client.post(RESET_REQUEST_URL, _reset_payload(user), format="json")
+    unknown = client.post(
+        RESET_REQUEST_URL,
+        {"identifier": "+998905550099", "account_type": "teacher"},
+        format="json",
+    )
 
     assert known.status_code == unknown.status_code == 503
     assert known.json() == unknown.json()
@@ -428,8 +516,16 @@ def test_password_reset_disabled_email_is_uniform_and_never_dispatches(
         lambda **kwargs: pytest.fail("disabled email transport was called"),
     )
     client = client_for(tenant_a)
-    known = client.post(RESET_REQUEST_URL, {"identifier": user.email}, format="json")
-    unknown = client.post(RESET_REQUEST_URL, {"identifier": "unknown@example.com"}, format="json")
+    known = client.post(
+        RESET_REQUEST_URL,
+        {"identifier": _role_account(user).email, "account_type": "teacher"},
+        format="json",
+    )
+    unknown = client.post(
+        RESET_REQUEST_URL,
+        {"identifier": "unknown@example.com", "account_type": "teacher"},
+        format="json",
+    )
 
     assert known.status_code == unknown.status_code == 503
     assert known.json() == unknown.json()
@@ -446,21 +542,22 @@ def test_disabling_sms_rejects_an_already_issued_reset_capability(
 ):
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
-    assert client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json").status_code == 202
+    assert client.post(RESET_REQUEST_URL, _reset_payload(user), format="json").status_code == 202
     code = _code_from(sms_outbox[-1]["text"])
 
     with override_settings(SMS_ENABLED=False):
         disabled = client.post(
             RESET_CONFIRM_URL,
-            {"identifier": user.phone, "code": code, "new_password": NEW_PASSWORD},
+            _reset_payload(user, code=code, new_password=NEW_PASSWORD),
             format="json",
         )
 
     assert disabled.status_code == 503
     assert disabled.json()["code"] == "password_reset_unavailable"
     with schema_context(tenant_a.schema_name):
-        user.refresh_from_db()
-        assert user.check_password(PASSWORD)
+        account = _role_account(user)
+        account.refresh_from_db()
+        assert account.check_password(PASSWORD)
 
 
 def test_password_reset_confirm_does_not_reveal_account_existence(
@@ -471,19 +568,20 @@ def test_password_reset_confirm_does_not_reveal_account_existence(
 ):
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
-    client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json")
+    client.post(RESET_REQUEST_URL, _reset_payload(user), format="json")
     issued_code = _code_from(sms_outbox[-1]["text"])
     wrong_code = str((int(issued_code) + 1) % (10**settings.OTP_LENGTH)).zfill(settings.OTP_LENGTH)
 
     known = client.post(
         RESET_CONFIRM_URL,
-        {"identifier": user.phone, "code": wrong_code, "new_password": NEW_PASSWORD},
+        _reset_payload(user, code=wrong_code, new_password=NEW_PASSWORD),
         format="json",
     )
     unknown = client.post(
         RESET_CONFIRM_URL,
         {
             "identifier": "+998905550099",
+            "account_type": "teacher",
             "code": wrong_code,
             "new_password": NEW_PASSWORD,
         },
@@ -497,7 +595,7 @@ def test_password_reset_confirm_does_not_reveal_account_existence(
 @override_settings(OTP_IDENTIFIER_RATE_LIMIT=2, OTP_IDENTIFIER_RATE_WINDOW_SECONDS=60)
 def test_password_reset_identifier_rate_limit_is_distributed(tenant_a, client_for):
     client = client_for(tenant_a)
-    body = {"identifier": "+998905550001"}
+    body = {"identifier": "+998905550001", "account_type": "teacher"}
 
     assert client.post(RESET_REQUEST_URL, body, format="json").status_code == 202
     assert client.post(RESET_REQUEST_URL, body, format="json").status_code == 202
@@ -508,17 +606,17 @@ def test_password_reset_identifier_rate_limit_is_distributed(tenant_a, client_fo
 def test_password_reset_global_rate_limit_spans_tenants(tenant_a, tenant_b, client_for):
     first = client_for(tenant_a).post(
         RESET_REQUEST_URL,
-        {"identifier": "+998905550001"},
+        {"identifier": "+998905550001", "account_type": "teacher"},
         format="json",
     )
     second = client_for(tenant_b).post(
         RESET_REQUEST_URL,
-        {"identifier": "+998905550002"},
+        {"identifier": "+998905550002", "account_type": "teacher"},
         format="json",
     )
     blocked = client_for(tenant_a).post(
         RESET_REQUEST_URL,
-        {"identifier": "+998905550003"},
+        {"identifier": "+998905550003", "account_type": "teacher"},
         format="json",
     )
 
@@ -530,10 +628,10 @@ def test_password_reset_global_rate_limit_spans_tenants(tenant_a, tenant_b, clie
 def test_password_reset_wrong_code_400(tenant_a, client_for, user_in, sms_outbox):
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
-    client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json")
+    client.post(RESET_REQUEST_URL, _reset_payload(user), format="json")
     resp = client.post(
         RESET_CONFIRM_URL,
-        {"identifier": user.phone, "code": "000000", "new_password": NEW_PASSWORD},
+        _reset_payload(user, code="000000", new_password=NEW_PASSWORD),
         format="json",
     )
     assert resp.status_code == 400
@@ -545,19 +643,19 @@ def test_password_reset_wrong_code_5x_invalidates(tenant_a, client_for, user_in,
     (the attempt cap bites — D1-LC regression for the committed increment)."""
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
-    client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json")
+    client.post(RESET_REQUEST_URL, _reset_payload(user), format="json")
     code = _code_from(sms_outbox[0]["text"])
 
     for _ in range(settings.OTP_MAX_ATTEMPTS):
         resp = client.post(
             RESET_CONFIRM_URL,
-            {"identifier": user.phone, "code": "000000", "new_password": NEW_PASSWORD},
+            _reset_payload(user, code="000000", new_password=NEW_PASSWORD),
             format="json",
         )
         assert resp.status_code == 400
     resp = client.post(
         RESET_CONFIRM_URL,
-        {"identifier": user.phone, "code": code, "new_password": NEW_PASSWORD},
+        _reset_payload(user, code=code, new_password=NEW_PASSWORD),
         format="json",
     )
     # Confirm failures are deliberately indistinguishable from an unknown
@@ -573,8 +671,8 @@ def test_reset_request_cooldown_silently_202_no_resend(tenant_a, client_for, use
     A 202-vs-429 difference here was an account-existence oracle."""
     user = _password_user(tenant_a, user_in)
     client = client_for(tenant_a)
-    assert client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json").status_code == 202
-    resp = client.post(RESET_REQUEST_URL, {"identifier": user.phone}, format="json")
+    assert client.post(RESET_REQUEST_URL, _reset_payload(user), format="json").status_code == 202
+    resp = client.post(RESET_REQUEST_URL, _reset_payload(user), format="json")
     assert resp.status_code == 202  # was 429 — would have leaked account existence
     assert len(sms_outbox) == 1  # cooldown still prevented a second send
 
@@ -585,10 +683,48 @@ def test_reset_request_ip_distinct_identifier_cap(tenant_a, client_for):
     cap = settings.OTP_IP_DISTINCT_IDENTIFIER_CAP
     client = client_for(tenant_a)
     for i in range(cap):
-        resp = client.post(RESET_REQUEST_URL, {"identifier": f"+9989055500{i:02d}"}, format="json")
+        resp = client.post(
+            RESET_REQUEST_URL,
+            {"identifier": f"+9989055500{i:02d}", "account_type": "teacher"},
+            format="json",
+        )
         assert resp.status_code == 202
-    resp = client.post(RESET_REQUEST_URL, {"identifier": "+998905551999"}, format="json")
+    resp = client.post(
+        RESET_REQUEST_URL,
+        {"identifier": "+998905551999", "account_type": "teacher"},
+        format="json",
+    )
     assert resp.status_code == 429
+    # The first rejected identifier must not become allowlisted merely because
+    # its seen-pair key now exists.
+    assert (
+        client.post(
+            RESET_REQUEST_URL,
+            {"identifier": "+998905551999", "account_type": "teacher"},
+            format="json",
+        ).status_code
+        == 429
+    )
+
+
+def test_reset_rate_cache_never_stores_plain_contact_or_ip(tenant_a, client_for):
+    from django.core.cache import cache
+
+    client = client_for(tenant_a)
+    identifier = "+998905551234"
+    ip = "127.0.0.1"
+    assert (
+        client.post(
+            RESET_REQUEST_URL,
+            {"identifier": identifier, "account_type": "teacher"},
+            format="json",
+        ).status_code
+        == 202
+    )
+
+    cache_keys = " ".join(str(key) for key in getattr(cache, "_cache", {}))
+    assert identifier not in cache_keys
+    assert ip not in cache_keys
 
 
 # ---------------------------------------------------------------------------
@@ -623,19 +759,23 @@ def test_logout_revokes_the_session(tenant_a, user_in, as_user):
     client = as_user(tenant_a, user)
     assert client.get(ME_URL).status_code == 200
 
-    assert client.post(LOGOUT_URL).status_code == 204
+    assert client.post(LOGOUT_URL).status_code == 200
 
     resp = client.get(ME_URL)  # same key, now revoked (/me/ is a layered endpoint)
     assert resp.status_code == 401
     assert resp.json()["code"] == "authentication_failed"
     with schema_context(tenant_a.schema_name):
         user.refresh_from_db()
-        assert user.token_version == previous_token_version + 1
+        assert user.token_version == previous_token_version
 
 
 def test_throttle_survives_non_string_identifier(tenant_a, client_for):
     """Throttles run before validation — a JSON-int identifier must 400, not 500."""
-    resp = client_for(tenant_a).post(RESET_REQUEST_URL, {"identifier": 12345}, format="json")
+    resp = client_for(tenant_a).post(
+        RESET_REQUEST_URL,
+        {"identifier": 12345, "account_type": "teacher"},
+        format="json",
+    )
     assert resp.status_code in (400, 429)
 
 

@@ -17,6 +17,7 @@ from apps.students.views.v1.student_views import (
     student_dashboard_view,
     student_detail_view,
     student_events_view,
+    student_leadership_profile_view,
     student_report_view,
     student_transition_view,
     student_unblock_view,
@@ -42,6 +43,11 @@ urlpatterns = [
     # Collection + detail.
     path("", students_collection_view, name="students-collection"),
     path("<int:pk>/", student_detail_view, name="students-detail"),
+    path(
+        "<int:pk>/leadership-profile/",
+        student_leadership_profile_view,
+        name="student-leadership-profile",
+    ),
     path("<int:pk>/transition/", student_transition_view, name="students-transition"),
     path("<int:pk>/block/", student_block_view, name="students-block"),
     path("<int:pk>/unblock/", student_unblock_view, name="students-unblock"),

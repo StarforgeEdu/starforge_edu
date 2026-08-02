@@ -31,7 +31,18 @@ class AttendanceRepository(BaseRepository[AttendanceRecord], IAttendanceReposito
         return self.scoped(user=user, roles=roles).filter(pk=pk).first()
 
     def get_lesson(self, *, lesson_id: int, user, roles: set[str]) -> Lesson | None:
-        return schedule_selectors.scoped_lessons(user=user, roles=roles).filter(pk=lesson_id).first()
+        # Resolve the action target through the exact attendance-write scope,
+        # not through schedule:read.  Otherwise a read grant in Branch B could
+        # expose a lesson while attendance:write was held only in Branch A.
+        return (
+            schedule_selectors.scoped_lessons(
+                user=user,
+                roles=roles,
+                permission="attendance:write",
+            )
+            .filter(pk=lesson_id)
+            .first()
+        )
 
     def students_by_ids(self, *, ids: list[int]) -> dict[int, StudentProfile]:
         return {s.pk: s for s in StudentProfile.objects.filter(pk__in=ids)}

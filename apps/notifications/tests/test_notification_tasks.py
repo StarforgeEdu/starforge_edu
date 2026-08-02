@@ -29,11 +29,142 @@ def test_push_device_history_has_targeted_expression_index():
     assert len(index.expressions) == 2
 
 
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_delivery_workers_serialize_on_notification_row(tenant_a, monkeypatch):
+    """Duplicate workers cannot both emit the same non-push channel."""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from threading import Event
+
+    from django.db import close_old_connections
+
+    import celery_tasks.notification_tasks as nt
+    from apps.notifications.models import Channel, Notification, NotificationDelivery
+
+    user = _user_with_phone(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        notification = Notification.objects.create(
+            user=user,
+            event_type="attendance.absent",
+            title="Absent",
+            body="A learner is absent.",
+        )
+        notification_id = notification.pk
+
+    first_holds_lock = Event()
+    release_first = Event()
+    second_started = Event()
+    delivery_calls: list[int] = []
+
+    def slow_delivery(notification, channel, _context, _render_template):
+        delivery_calls.append(notification.pk)
+        nt._record(notification, channel, NotificationDelivery.Status.SENT)
+        first_holds_lock.set()
+        if not release_first.wait(timeout=10):
+            raise RuntimeError("test timed out waiting to release the first delivery")
+        return "sent"
+
+    monkeypatch.setattr(nt, "_deliver", slow_delivery)
+
+    def deliver(*, mark_started: bool = False):
+        close_old_connections()
+        try:
+            with schema_context(tenant_a.schema_name):
+                if mark_started:
+                    second_started.set()
+                return nt.dispatch_notification.run(
+                    notification_id,
+                    channels=[Channel.IN_APP],
+                )
+        finally:
+            close_old_connections()
+
+    second = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(deliver)
+        try:
+            assert first_holds_lock.wait(timeout=10)
+            second = pool.submit(deliver, mark_started=True)
+            assert second_started.wait(timeout=10)
+            # It has entered the task but is blocked at Notification.select_for_update.
+            with pytest.raises(FutureTimeout):
+                second.result(timeout=0.25)
+        finally:
+            release_first.set()
+        assert second is not None
+        assert first.result(timeout=10)["results"][Channel.IN_APP] == "sent"
+        assert second.result(timeout=10)["results"][Channel.IN_APP] == "already_handled"
+
+    assert delivery_calls == [notification_id]
+    with schema_context(tenant_a.schema_name):
+        assert (
+            NotificationDelivery.objects.filter(
+                notification_id=notification_id,
+                channel=Channel.IN_APP,
+                status=NotificationDelivery.Status.SENT,
+            ).count()
+            == 1
+        )
+        Notification.objects.filter(pk=notification_id).delete()
+        type(user).objects.filter(pk=user.pk).delete()
+
+
+def test_bulk_reschedule_child_is_exact_principal_and_idempotent_in_database(tenant_a, monkeypatch):
+    import celery_tasks.notification_tasks as nt
+    from apps.notifications import services
+    from apps.notifications.models import EventType, Notification
+    from apps.students.tests.factories import StudentProfileFactory
+
+    # Keep this focused on durable notification creation. Channel delivery has
+    # separate task tests and must not add external-adapter work to this assertion.
+    monkeypatch.setattr(services, "_queue_dispatch", lambda *_args, **_kwargs: None)
+    moves = [
+        {
+            "lesson_id": 7001,
+            "old_start": "2026-08-01T09:00:00+05:00",
+            "moved_at": "2026-08-01T10:00:00.000001+05:00",
+            "move_id": "10000000000000000000000000000001",
+        },
+        {
+            "lesson_id": 7001,
+            "old_start": "2026-08-08T09:00:00+05:00",
+            "moved_at": "2026-08-01T10:00:00.000002+05:00",
+            "move_id": "10000000000000000000000000000002",
+        },
+    ]
+    with schema_context(tenant_a.schema_name):
+        students = [StudentProfileFactory(), StudentProfileFactory()]
+        recipients = [
+            {
+                "user_id": student.user_id,
+                "principal_kind": "student",
+                "principal_id": student.pk,
+            }
+            for student in students
+        ]
+
+        first = nt.dispatch_lesson_reschedule_chunk.run(moves=moves, recipients=recipients)
+        second = nt.dispatch_lesson_reschedule_chunk.run(moves=moves, recipients=recipients)
+
+        assert first == second == {"attempted": 4, "deliverable": 4}
+        rows = Notification.objects.filter(
+            event_type=EventType.SCHEDULE_LESSON_REMINDER,
+            dedupe_key__startswith="schedule.lesson_rescheduled:7001:",
+        )
+        assert rows.count() == 4
+        assert set(rows.values_list("recipient_principal_kind", flat=True)) == {"student"}
+        assert set(rows.values_list("recipient_principal_id", flat=True)) == {
+            student.pk for student in students
+        }
+
+
 def _user_with_phone(tenant):
+    from apps.notifications.tests.helpers import ensure_notification_principal
     from apps.users.tests.factories import UserFactory
 
     with schema_context(tenant.schema_name):
-        return UserFactory(phone="+998901112233", email="payer@example.com")
+        user = UserFactory(phone="+998901112233", email="payer@example.com")
+        return ensure_notification_principal(user)
 
 
 def _set_quiet_hours(tenant, *, start, end):
@@ -44,6 +175,18 @@ def _set_quiet_hours(tenant, *, start, end):
         cs.quiet_hours_start = start
         cs.quiet_hours_end = end
         cs.save(update_fields=["quiet_hours_start", "quiet_hours_end"])
+
+
+def test_async_fanout_requires_a_stable_dedupe_discriminator():
+    import celery_tasks.notification_tasks as nt
+
+    with pytest.raises(ValueError, match="dedupe_prefix"):
+        nt.dispatch_many_chunk(
+            event_type="assignments.created",
+            context={},
+            recipients=[],
+            dedupe_prefix=None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -152,14 +295,64 @@ def test_deferred_delivery_rechecks_operator_channel_switch(tenant_a, monkeypatc
         )
 
 
+def test_deferred_delivery_rechecks_role_principal_preference(tenant_a, monkeypatch):
+    import celery_tasks.notification_tasks as nt
+    from apps.notifications.models import Channel, Notification, NotificationDelivery
+    from apps.notifications.services import upsert_preferences
+
+    monkeypatch.setattr(
+        nt,
+        "_deliver",
+        lambda *_args, **_kwargs: pytest.fail("an opted-out deferred task reached its adapter"),
+    )
+    user = _user_with_phone(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        notification = Notification.objects.create(
+            user=user,
+            event_type="attendance.absent",
+            title="Absent",
+            body="A learner is absent.",
+        )
+        NotificationDelivery.objects.create(
+            notification=notification,
+            channel=Channel.SMS,
+            status=NotificationDelivery.Status.SKIPPED_QUIET_HOURS,
+        )
+        upsert_preferences(
+            user=user,
+            recipient_principal_kind=user.notification_principal_kind,
+            recipient_principal_id=user.notification_principal_id,
+            rows=[
+                {
+                    "event_type": notification.event_type,
+                    "channel": Channel.SMS,
+                    "enabled": False,
+                }
+            ],
+        )
+
+        assert nt.deliver_single_channel(notification.pk, Channel.SMS) == "skipped_pref"
+        assert not NotificationDelivery.objects.filter(
+            notification=notification,
+            channel=Channel.SMS,
+            status=NotificationDelivery.Status.SKIPPED_QUIET_HOURS,
+        ).exists()
+        assert (
+            NotificationDelivery.objects.filter(
+                notification=notification,
+                channel=Channel.SMS,
+                status=NotificationDelivery.Status.SKIPPED_PREF,
+            ).count()
+            == 1
+        )
+
+
 # --------------------------------------------------------------------------- #
 # In-app WS group name must be schema-prefixed (cross-tenant isolation)
 # --------------------------------------------------------------------------- #
 @time_machine.travel("2026-06-16 12:00:00 +05:00", tick=False)
 def test_in_app_group_send_is_schema_prefixed(tenant_a, monkeypatch, django_capture_on_commit_callbacks):
-    """The producer group name MUST be ``{schema}.user.{id}`` — an unscoped
-    ``user.{id}`` collides across tenants on the shared Redis channel layer
-    (tenant A user 5 receives tenant B user 5's notifications)."""
+    """The producer uses one tenant + role-principal group, never a bridge user."""
     from apps.notifications.services import dispatch
 
     captured: list[str] = []
@@ -183,10 +376,13 @@ def test_in_app_group_send_is_schema_prefixed(tenant_a, monkeypatch, django_capt
 
     assert captured, "in-app delivery must call group_send"
     group = captured[0]
-    assert group == f"{tenant_a.schema_name}.user.{user.pk}"
+    assert group == (
+        f"{tenant_a.schema_name}.n.{user.notification_principal_kind}.{user.notification_principal_id}"
+    )
     assert group.startswith(f"{tenant_a.schema_name}.")
-    # The pre-fix unscoped name must never be produced.
+    # Neither the pre-tenant nor bridge-user group may carry private events.
     assert group != f"user.{user.pk}"
+    assert group != f"{tenant_a.schema_name}.user.{user.pk}"
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +398,7 @@ def test_dispatch_many_reaches_all_recipients_inline_and_offloaded(tenant_a, mon
     calls: list[int] = []
     monkeypatch.setattr(
         "apps.notifications.services.dispatch",
-        lambda *, event_type, recipient_id, context, dedupe_key=None: calls.append(recipient_id),
+        lambda **kwargs: calls.append(kwargs["recipient_id"]),
     )
     with schema_context(tenant_a.schema_name):
         receivers._dispatch_many(
@@ -227,7 +423,7 @@ def test_lesson_reschedule_dedupe_key_varies_per_move(tenant_a, monkeypatch):
 
     keys: list[str] = []
 
-    def _capture(*, user_ids, event_type, context, dedupe_prefix, **kw):
+    def _capture(*, recipients, event_type, context, dedupe_prefix, **kw):
         keys.append(dedupe_prefix)
 
     monkeypatch.setattr(receivers, "_dispatch_many", _capture)
@@ -299,21 +495,20 @@ def test_quiet_hours_redelivery_does_not_double_defer(
     tenant_a, monkeypatch, django_capture_on_commit_callbacks
 ):
     """A Celery redelivery of ``dispatch_notification`` for a quiet-hours channel
-    that already has a SKIPPED_QUIET_HOURS marker must NOT record a second skip
-    nor schedule a second deferred delivery (which would double-send paid SMS)."""
+    that already has a SKIPPED_QUIET_HOURS marker must NOT record a second skip.
+    The due reconciler must lease the marker exactly once per retry window."""
     import celery_tasks.notification_tasks as nt
     from apps.notifications.models import Channel, Notification, NotificationDelivery
     from apps.notifications.services import dispatch
 
     _set_quiet_hours(tenant_a, start=time(22, 0), end=time(7, 0))
 
-    schedule_calls: list[dict] = []
+    schedule_calls: list[tuple[tuple, dict]] = []
 
-    def fake_apply_async(*args, **kwargs):
-        schedule_calls.append(kwargs)
-        return None
+    def fake_delay(*args, **kwargs):
+        schedule_calls.append((args, kwargs))
 
-    monkeypatch.setattr(nt.deliver_single_channel, "apply_async", fake_apply_async)
+    monkeypatch.setattr(nt.deliver_single_channel, "delay", fake_delay)
 
     user = _user_with_phone(tenant_a)
     with schema_context(tenant_a.schema_name):
@@ -324,18 +519,17 @@ def test_quiet_hours_redelivery_does_not_double_defer(
                 context={"amount": "1"},
                 dedupe_key=f"qh:{user.pk}",
             )
-        # First dispatch already ran the fan-out once (one SMS deferral scheduled).
+        # First dispatch writes one durable marker and no broker ETA.
         sms_skips = NotificationDelivery.objects.filter(
             notification=notif, channel=Channel.SMS, status=NotificationDelivery.Status.SKIPPED_QUIET_HOURS
         ).count()
         assert sms_skips == 1
-        first_schedule_count = len(schedule_calls)
-        assert first_schedule_count >= 1
+        assert schedule_calls == []
 
         # Simulate Celery redelivering the SAME dispatch task.
         nt.dispatch_notification(notif.pk)
 
-        # No SECOND skip marker, no SECOND scheduled deferral for SMS.
+        # No second skip marker or immediate broker work.
         assert (
             NotificationDelivery.objects.filter(
                 notification=notif,
@@ -344,11 +538,21 @@ def test_quiet_hours_redelivery_does_not_double_defer(
             ).count()
             == 1
         )
-        # The redelivery must not have scheduled additional SMS deferrals.
-        sms_schedules = [c for c in schedule_calls if (c.get("kwargs") or {}).get("channel") == Channel.SMS]
-        assert len(sms_schedules) == 1
+        assert schedule_calls == []
         # sanity: still a single notification row
         assert Notification.objects.filter(pk=notif.pk).count() == 1
+
+    with (
+        time_machine.travel("2026-06-17 07:00:00 +05:00", tick=False),
+        schema_context(tenant_a.schema_name),
+        django_capture_on_commit_callbacks(execute=True),
+    ):
+        assert nt.reconcile_deferred_notification_deliveries_for_schema() >= 1
+        # The first sweep wrote a five-minute lease before publishing. A
+        # concurrent/repeated sweep cannot enqueue the same marker again.
+        assert nt.reconcile_deferred_notification_deliveries_for_schema() == 0
+    sms_schedules = [call for call in schedule_calls if call[0][1] == Channel.SMS]
+    assert len(sms_schedules) == 1
 
 
 @time_machine.travel("2026-06-16 12:00:00 +05:00", tick=False)
@@ -459,6 +663,7 @@ def test_push_retry_targets_only_the_failed_device(
 ):
     import celery_tasks.notification_tasks as nt
     from apps.notifications.models import Channel, EventType, Notification, NotificationDelivery
+    from apps.notifications.tests.helpers import session_principal_kwargs
     from apps.users.models import Device
     from core.session_auth import create_session
     from infrastructure.push import fcm_client
@@ -483,8 +688,8 @@ def test_push_retry_targets_only_the_failed_device(
     with schema_context(tenant_a.schema_name):
         Device.objects.create(user=user, device_id="device-1", platform="android", push_token="fails-once")
         Device.objects.create(user=user, device_id="device-2", platform="ios", push_token="already-sent")
-        create_session(user, device_id="device-1")
-        create_session(user, device_id="device-2")
+        create_session(user, device_id="device-1", **session_principal_kwargs(user))
+        create_session(user, device_id="device-2", **session_principal_kwargs(user))
         notification = Notification.objects.create(
             user=user,
             event_type=EventType.ASSIGNMENTS_CREATED,
@@ -520,6 +725,7 @@ def test_push_retry_targets_only_the_failed_device(
 def test_push_targets_only_devices_with_active_unexpired_sessions(tenant_a, monkeypatch):
     import celery_tasks.notification_tasks as nt
     from apps.notifications.models import Channel, EventType, Notification
+    from apps.notifications.tests.helpers import session_principal_kwargs
     from apps.users.models import Device, Session
     from core.session_auth import create_session
     from infrastructure.push import fcm_client
@@ -555,9 +761,9 @@ def test_push_targets_only_devices_with_active_unexpired_sessions(tenant_a, monk
             platform="android",
             push_token="revoked-token",
         )
-        create_session(user, device_id="live-device")
-        expired = create_session(user, device_id="expired-device")
-        revoked = create_session(user, device_id="revoked-device")
+        create_session(user, device_id="live-device", **session_principal_kwargs(user))
+        expired = create_session(user, device_id="expired-device", **session_principal_kwargs(user))
+        revoked = create_session(user, device_id="revoked-device", **session_principal_kwargs(user))
         Session.objects.filter(pk=expired.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
         Session.objects.filter(pk=revoked.pk).update(revoked_at=timezone.now())
         notification = Notification.objects.create(
@@ -579,6 +785,7 @@ def test_push_targets_only_devices_with_active_unexpired_sessions(tenant_a, monk
 def test_push_with_only_expired_session_records_no_devices(tenant_a, monkeypatch):
     import celery_tasks.notification_tasks as nt
     from apps.notifications.models import Channel, EventType, Notification, NotificationDelivery
+    from apps.notifications.tests.helpers import session_principal_kwargs
     from apps.users.models import Device, Session
     from core.session_auth import create_session
     from infrastructure.push import fcm_client
@@ -598,7 +805,7 @@ def test_push_with_only_expired_session_records_no_devices(tenant_a, monkeypatch
             platform="ios",
             push_token="must-not-send",
         )
-        session = create_session(user, device_id="expired-only")
+        session = create_session(user, device_id="expired-only", **session_principal_kwargs(user))
         Session.objects.filter(pk=session.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
         notification = Notification.objects.create(
             user=user,

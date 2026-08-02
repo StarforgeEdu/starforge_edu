@@ -21,10 +21,25 @@ def _payment_method(tenant) -> int:
         return PaymentMethod.objects.create(name="Cash", slug="cash").id
 
 
-def test_request_approve_disburse_writes_ledger(tenant_a, as_role):
-    teacher, teacher_user = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def _same_branch_clients(tenant, user_in, as_user, *roles):
+    with schema_context(tenant.schema_name):
+        from apps.org.tests.factories import BranchFactory
+
+        branch = BranchFactory()
+    users = [user_in(tenant, roles=[role], branch=branch) for role in roles]
+    return branch, [(as_user(tenant, user), user) for user in users]
+
+
+def test_request_approve_disburse_writes_ledger(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a,
+        user_in,
+        as_user,
+        Role.TEACHER,
+        Role.DIRECTOR,
+        Role.CASHIER,
+    )
+    (teacher, teacher_user), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     # a loan kind carries a borrower in its payload (F21-1)
@@ -200,10 +215,16 @@ def test_create_accepts_long_description(tenant_a, as_role):
     assert r.json()["data"]["description"] == "d" * 5000
 
 
-def test_decision_only_request_cannot_disburse(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_decision_only_request_cannot_disburse(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a,
+        user_in,
+        as_user,
+        Role.TEACHER,
+        Role.DIRECTOR,
+        Role.CASHIER,
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     rid = teacher.post(REQ, {"kind": "other", "title": "Note only"}, format="json").json()["data"]["id"]
@@ -220,10 +241,16 @@ def test_student_cannot_request(tenant_a, as_role):
     assert resp.status_code == 403
 
 
-def test_approval_notifies_requester_and_disburser(tenant_a, as_role):
-    teacher, teacher_user = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_approval_notifies_requester_and_disburser(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a,
+        user_in,
+        as_user,
+        Role.TEACHER,
+        Role.DIRECTOR,
+        Role.CASHIER,
+    )
+    (teacher, teacher_user), (director, _), (cashier, _) = actors
 
     rid = teacher.post(
         REQ,

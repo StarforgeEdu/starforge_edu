@@ -69,10 +69,23 @@ class IRecurrenceRuleService(ABC):
     def get(self, *, pk: int) -> RecurrenceRule | None: ...
 
     @abstractmethod
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[RecurrenceRule]: ...
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[RecurrenceRule]: ...
 
     @abstractmethod
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> RecurrenceRule | None: ...
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> RecurrenceRule | None: ...
 
     @abstractmethod
     def create(self, *, data: dict[str, Any], created_by) -> RecurrenceRule: ...
@@ -89,10 +102,23 @@ class IRecurrenceRuleService(ABC):
 
 class ILessonService(ABC):
     @abstractmethod
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[Lesson]: ...
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[Lesson]: ...
 
     @abstractmethod
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> Lesson | None: ...
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> Lesson | None: ...
 
     @abstractmethod
     def cancel(self, lesson: Lesson, *, reason: str, actor) -> Lesson: ...

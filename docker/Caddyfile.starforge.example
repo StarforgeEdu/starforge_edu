@@ -1,9 +1,25 @@
+# Keep this state file on the same root-owned bind mount as the Caddyfile.  The
+# release controller atomically replaces it and performs one zero-downtime
+# reload; do not edit it by hand during a cutover.
+import maintenance.d/state.caddy
+
 starforge.example.com {
-	handle /ws/* {
-		reverse_proxy starforge-daphne:8001
-	}
-	handle {
-		reverse_proxy starforge-web:8000
+	route {
+		# Operations must be able to distinguish liveness/readiness from public
+		# business availability while the edge maintenance gate is active.
+		@health path /healthz/live /healthz/live/ /healthz/ready /healthz/ready/
+		handle @health {
+			reverse_proxy starforge-web:8000
+		}
+
+		import starforge_api_maintenance
+
+		handle /ws/* {
+			reverse_proxy starforge-daphne:8001
+		}
+		handle {
+			reverse_proxy starforge-web:8000
+		}
 	}
 }
 
@@ -11,5 +27,16 @@ starforge.example.com {
 # Preserve the Host header, path, and query string because SigV4 signs them.
 # Do not enable access logging here: presigned credentials are in the query string.
 storage.example.com {
+	route {
+		# Blocks every method except GET/HEAD/OPTIONS while a release snapshot is
+		# being taken. This also closes already-issued presigned upload URLs.
+		import starforge_storage_maintenance
+		reverse_proxy starforge-minio:9000
+	}
+}
+
+# Public-read static bucket only. Keep this origin distinct from user-controlled
+# media so the application CSP never authorizes uploaded content as scripts.
+static-storage.example.com {
 	reverse_proxy starforge-minio:9000
 }

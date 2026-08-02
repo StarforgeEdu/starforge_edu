@@ -41,6 +41,32 @@ def test_director_create_list_retrieve_delete(tenant_a, as_role):
     assert client.get(f"{URL}{tid}/").status_code == 404
 
 
+def test_delete_cannot_erase_payout_policy_history(tenant_a, as_role):
+    from decimal import Decimal
+
+    from apps.org.tests.factories import BranchFactory
+    from apps.teachers.models import PayoutPolicy, TeacherProfile
+    from apps.teachers.services import set_payout_policy
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        teacher = TeacherProfileFactory(branch=BranchFactory())
+        set_payout_policy(
+            teacher=teacher,
+            method=PayoutPolicy.Method.FLAT_MONTHLY,
+            flat_amount_uzs=Decimal("2500000"),
+        )
+
+    response = client.delete(f"{URL}{teacher.pk}/")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "teacher_has_compensation_history"
+    with schema_context(tenant_a.schema_name):
+        assert TeacherProfile.objects.filter(pk=teacher.pk).exists()
+        assert PayoutPolicy.objects.filter(teacher_id=teacher.pk).exists()
+
+
 def test_create_accepts_custom_teacher_account_type(tenant_a, as_role):
     from apps.access.models import AccountType, AccountTypePermission
     from apps.org.tests.factories import BranchFactory
@@ -90,6 +116,55 @@ def test_create_accepts_custom_teacher_account_type(tenant_a, as_role):
     ]
 
 
+def test_teacher_detail_never_exposes_unrelated_bridge_memberships(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.access.models import AccountType
+    from apps.org.tests.factories import BranchFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        visible_branch = BranchFactory()
+        hidden_branch = BranchFactory()
+        teacher = TeacherProfileFactory(branch=visible_branch)
+        teacher_type = AccountType.objects.create(
+            name="Scoped instructor",
+            slug="scoped-instructor",
+            account_kind=AccountType.AccountKind.TEACHER,
+        )
+        staff_type = AccountType.objects.create(
+            name="Hidden payroll administrator",
+            slug="hidden-payroll-administrator",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        RoleMembership.objects.create(
+            user=teacher.user,
+            account_type=teacher_type,
+            role=teacher_type.compatibility_role,
+            branch=visible_branch,
+        )
+        RoleMembership.objects.create(
+            user=teacher.user,
+            account_type=staff_type,
+            role=staff_type.compatibility_role,
+            branch=hidden_branch,
+        )
+
+    client = as_user(
+        tenant_a,
+        user_in(tenant_a, roles=[Role.REGISTRAR], branch=visible_branch),
+    )
+    response = client.get(f"{URL}{teacher.pk}/")
+
+    assert response.status_code == 200, response.content
+    assignments = response.json()["data"]["account_type_assignments"]
+    assert [row["account_type_slug"] for row in assignments] == ["scoped-instructor"]
+    assert "hidden-payroll-administrator" not in str(response.json())
+
+
 def test_create_requires_phone_or_email(tenant_a, as_role):
     from apps.org.tests.factories import BranchFactory
 
@@ -99,6 +174,39 @@ def test_create_requires_phone_or_email(tenant_a, as_role):
     resp = client.post(URL, {"branch": branch.id, "first_name": "NoContact"}, format="json")
     assert resp.status_code == 422
     assert "phone" in resp.json()["errors"]
+
+
+def test_mutations_reject_unknown_fields_instead_of_silently_ignoring_them(
+    tenant_a,
+    as_role,
+):
+    from apps.org.tests.factories import BranchFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        teacher = TeacherProfileFactory(branch=branch)
+
+    create = client.post(
+        URL,
+        {
+            "branch": branch.pk,
+            "phone": "+998905550071",
+            "departmant": 17,
+        },
+        format="json",
+    )
+    update = client.patch(
+        f"{URL}{teacher.pk}/",
+        {"qualificatons": "silently ignored typo"},
+        format="json",
+    )
+
+    assert create.status_code == 400
+    assert set(create.json()["errors"]) == {"departmant"}
+    assert update.status_code == 400
+    assert set(update.json()["errors"]) == {"qualificatons"}
 
 
 def test_list_is_branch_scoped(tenant_a, user_in, as_user):
@@ -140,3 +248,76 @@ def test_list_emits_branch_and_department_names(tenant_a, user_in, as_user):
     assert row["branch_name"] == "North Campus"
     assert row["department"] == department.id
     assert row["department_name"] == "Mathematics"
+
+
+def test_directory_reader_cannot_receive_compensation_fields(tenant_a, user_in, as_user):
+    from apps.org.tests.factories import BranchFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        teacher = TeacherProfileFactory(branch=branch, salary_type="monthly", rate="9000000")
+
+    client = as_user(tenant_a, user_in(tenant_a, roles=["registrar"], branch=branch))
+    row = next(item for item in client.get(URL).json()["data"] if item["id"] == teacher.id)
+
+    assert "salary_type" not in row
+    assert "rate" not in row
+
+
+def test_teacher_writer_without_compensation_authority_cannot_blind_write_compensation(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.org.tests.factories import BranchFactory
+    from apps.teachers.models import TeacherProfile
+    from apps.teachers.tests.factories import TeacherProfileFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        writer = user_in(tenant_a)
+        writer_type = AccountType.objects.create(
+            name="Faculty editor without payroll",
+            slug="faculty-editor-without-payroll",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=writer_type,
+            permission="teachers:write",
+        )
+        RoleMembership.objects.create(
+            user=writer,
+            account_type=writer_type,
+            role=writer_type.compatibility_role,
+            branch=branch,
+        )
+        teacher = TeacherProfileFactory(branch=branch, salary_type="monthly", rate="9000000")
+        writer.refresh_from_db()
+
+    client = as_user(tenant_a, writer)
+    update = client.patch(
+        f"{URL}{teacher.pk}/",
+        {"salary_type": "hourly", "rate": "250000"},
+        format="json",
+    )
+    create = client.post(
+        URL,
+        {
+            "branch": branch.pk,
+            "phone": "+998905550088",
+            "salary_type": "hourly",
+            "rate": "250000",
+        },
+        format="json",
+    )
+
+    assert update.status_code == 403
+    assert create.status_code == 403
+    with schema_context(tenant_a.schema_name):
+        teacher.refresh_from_db()
+        assert teacher.salary_type == "monthly"
+        assert str(teacher.rate) == "9000000.00"
+        assert not TeacherProfile.objects.filter(phone="+998905550088").exists()

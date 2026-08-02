@@ -61,8 +61,9 @@ def wallet_txn_to_dict(txn: WalletTransaction) -> dict:
 
 
 def wallet_payload_to_dict(payload: dict) -> dict:
+    wallet = payload["wallet"]
     return {
-        "wallet": wallet_to_dict(payload["wallet"]),
+        "wallet": wallet_to_dict(wallet) if wallet is not None else None,
         "transactions": [wallet_txn_to_dict(t) for t in payload["transactions"]],
     }
 

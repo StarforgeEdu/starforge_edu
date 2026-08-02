@@ -12,45 +12,47 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 from datetime import timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from apps.academics.grading import display_for
+from apps.academics.dto import ResultFieldError, validate_result_values
+from apps.academics.integrity import (
+    ExamReadiness,
+    assessment_integrity_write,
+    recompute_term_grades,
+)
+from apps.academics.integrity import (
+    correct_exam as correct_exam_transition,
+)
+from apps.academics.integrity import (
+    exam_readiness as assessment_readiness,
+)
+from apps.academics.integrity import (
+    publish_exam as publish_exam_transition,
+)
 from apps.academics.models import Exam, ExamResult, Grade, Transcript
-from apps.academics.signals import grade_changed
 from apps.cohorts.models import CohortMembership
-from apps.org.selectors import get_center_settings
 from apps.students.models import StudentProfile
-from core.exceptions import UnprocessableEntity, ValidationException
+from core.exceptions import ConflictException, UnprocessableEntity, ValidationException
 from core.utils import current_schema
 from infrastructure.storage.s3_client import presign_download, upload_bytes
 
 # Max rows accepted in one results-CSV import (bounds memory + per-row DB work).
 MAX_IMPORT_ROWS = 5000
+# 5,000 normal rows, including bounded notes, fit comfortably while a tenant's
+# much broader generic document-upload ceiling no longer controls this parser.
+MAX_IMPORT_BYTES = 2 * 1024 * 1024
 
-_HUNDRED = Decimal("100")
+logger = logging.getLogger("starforge.academics")
 
 
 # ---------------------------------------------------------------------------
 # Exam results
 # ---------------------------------------------------------------------------
-
-
-def _emit_grade_changed(result: ExamResult, old_score, new_score, actor, schema: str) -> None:
-    transaction.on_commit(
-        lambda: grade_changed.send(
-            sender=ExamResult,
-            instance=result,
-            old_score=old_score,
-            new_score=new_score,
-            actor_id=getattr(actor, "id", None),
-            schema_name=schema,
-        )
-    )
 
 
 @transaction.atomic
@@ -65,18 +67,31 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
     # Serialize batches for one exam so the existing-result snapshot is stable
     # and concurrent imports cannot race on (exam, student).
     exam = Exam.objects.select_related("cohort").select_for_update().get(pk=exam.pk)
+    if exam.is_published or exam.requires_republish:
+        raise ConflictException(
+            _("Published results can only change through an explicit correction."),
+            code="exam_results_locked",
+        )
 
     duplicate_errors: dict[str, list[str]] = {}
     field_errors: dict[str, list[str]] = {}
     seen_student_ids: set[int] = set()
     for index, row in enumerate(rows):
-        score = row["score"]
         student_id = row["student"].pk
         if student_id in seen_student_ids:
             duplicate_errors[str(index)] = [str(_("A student may appear only once per batch."))]
         seen_student_ids.add(student_id)
-        if not score.is_finite() or score < 0 or score > exam.max_score:
-            field_errors[str(index)] = [f"Score must be between 0 and {exam.max_score} (got {score})."]
+        try:
+            values = validate_result_values(
+                score=row.get("score"),
+                note=row.get("note", ""),
+                max_score=exam.max_score,
+            )
+        except ResultFieldError as exc:
+            field_errors.setdefault(str(index), []).append(exc.message)
+        else:
+            row["score"] = values.score
+            row["note"] = values.note
     if duplicate_errors:
         raise UnprocessableEntity(
             _("A student may appear only once per batch."),
@@ -117,6 +132,7 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
     }
     from apps.audit.context import current_request
     from apps.audit.models import AuditLog
+    from apps.audit.scopes import scoped_audit_scope
     from apps.audit.services import (
         audit_logs_bulk_on_commit,
         diff_snapshots,
@@ -127,11 +143,10 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
         student_id: serialize_instance(result) for student_id, result in existing_by_student.items()
     }
 
-    schema = current_schema()
     now = timezone.now()
+    audit_scope = scoped_audit_scope(exam.cohort.branch_id, exam.cohort.department_id)
     to_create: list[ExamResult] = []
     to_update: list[ExamResult] = []
-    changed_scores: list[tuple[ExamResult, Decimal]] = []
     ordered_results: list[ExamResult] = []
     for row in rows:
         student = row["student"]
@@ -147,24 +162,23 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
             )
             to_create.append(result)
         else:
-            old_score = result.score
+            if result.score == row["score"] and result.note == row.get("note", ""):
+                ordered_results.append(result)
+                continue
             result.score = row["score"]
             result.note = row.get("note", "")
             result.graded_by = actor
             result.graded_at = now
             to_update.append(result)
-            if old_score != result.score:
-                changed_scores.append((result, old_score))
         ordered_results.append(result)
-        # Only emit on an actual change — re-entering an identical score is a
-        # no-op and must not produce audit churn (D3-D consumes grade_changed).
-    if to_create:
-        ExamResult.objects.bulk_create(to_create)
-    if to_update:
-        ExamResult.objects.bulk_update(
-            to_update,
-            fields=("score", "note", "graded_by", "graded_at"),
-        )
+    with assessment_integrity_write():
+        if to_create:
+            ExamResult.objects.bulk_create(to_create)
+        if to_update:
+            ExamResult.objects.bulk_update(
+                to_update,
+                fields=("score", "note", "graded_by", "graded_at"),
+            )
     request = current_request()
     audit_entries = [
         {
@@ -174,6 +188,7 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
             "resource_id": result.pk,
             "after": serialize_instance(result),
             "request": request,
+            "scope": audit_scope,
         }
         for result in to_create
     ]
@@ -189,12 +204,20 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
                 serialize_instance(result),
             ),
             "request": request,
+            "scope": audit_scope,
         }
         for result in to_update
     )
     audit_logs_bulk_on_commit(audit_entries)
-    for result, old_score in changed_scores:
-        _emit_grade_changed(result, old_score, result.score, actor, schema)
+    # Draft changes never emit the grades-published signal. Refresh any existing
+    # aggregate from the currently published evidence so stale rows cannot
+    # survive, but preserve their publication state when the inputs are unchanged.
+    recompute_term_grades(
+        student_ids=seen_student_ids,
+        subject_id=exam.subject_id,
+        term_id=exam.term_id,
+        publish=None,
+    )
     return {
         "created": len(to_create),
         "updated": len(to_update),
@@ -208,18 +231,17 @@ def bulk_grade_import(*, exam: Exam, csv_file, actor=None) -> dict:
     per-row errors and **zero rows written** if any row is invalid (DoD)."""
     # Bound input: file size (mirrors import_students_csv) + a row cap, so an
     # unbounded CSV can't exhaust memory / per-row DB work.
-    settings_obj = get_center_settings()
-    max_bytes = settings_obj.max_upload_mb * 1024 * 1024
+    max_bytes = MAX_IMPORT_BYTES
     size = getattr(csv_file, "size", None)
     if size is not None and size > max_bytes:
         raise ValidationException(
-            _("File exceeds the maximum upload size of %(mb)s MB.") % {"mb": settings_obj.max_upload_mb},
+            _("CSV files may not exceed %(bytes)s bytes.") % {"bytes": max_bytes},
             code="file_too_large",
         )
     raw = csv_file.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValidationException(
-            _("File exceeds the maximum upload size of %(mb)s MB.") % {"mb": settings_obj.max_upload_mb},
+            _("CSV files may not exceed %(bytes)s bytes.") % {"bytes": max_bytes},
             code="file_too_large",
         )
     if isinstance(raw, bytes):
@@ -232,9 +254,11 @@ def bulk_grade_import(*, exam: Exam, csv_file, actor=None) -> dict:
     else:
         text = raw
     reader = csv.DictReader(io.StringIO(text))
-    if not {"student_id", "score"} <= set(reader.fieldnames or []):
+    fieldnames = set(reader.fieldnames or [])
+    if not {"student_id", "score"} <= fieldnames or fieldnames - {"student_id", "score", "note"}:
         raise ValidationException(
-            _("CSV must have at least 'student_id' and 'score' columns."), code="bad_csv_header"
+            _("CSV columns must be student_id, score, and optional note."),
+            code="bad_csv_header",
         )
 
     # Restrict CSV rows to students actively enrolled in this exam's cohort, so a
@@ -273,19 +297,15 @@ def bulk_grade_import(*, exam: Exam, csv_file, actor=None) -> dict:
             row_errors.append({"row": line_no, "error": f"Student '{code}' is not in this exam's cohort."})
             continue
         try:
-            score = Decimal((raw_row.get("score") or "").strip())
-        except (InvalidOperation, ValueError):
-            row_errors.append({"row": line_no, "error": "Score is not a number."})
+            values = validate_result_values(
+                score=(raw_row.get("score") or "").strip(),
+                note=raw_row.get("note") or "",
+                max_score=exam.max_score,
+            )
+        except ResultFieldError as exc:
+            row_errors.append({"row": line_no, "field": exc.field, "error": exc.message})
             continue
-        if not score.is_finite():
-            # Decimal("NaN")/"Infinity" parse without raising, but a NaN comparison
-            # below raises InvalidOperation (an uncaught 500) — reject as a bad row.
-            row_errors.append({"row": line_no, "error": "Score is not a number."})
-            continue
-        if score < 0 or score > exam.max_score:
-            row_errors.append({"row": line_no, "error": f"Score out of range 0..{exam.max_score}."})
-            continue
-        rows.append({"student": student, "score": score, "note": (raw_row.get("note") or "").strip()})
+        rows.append({"student": student, "score": values.score, "note": values.note})
 
     if row_errors:
         raise UnprocessableEntity(
@@ -296,12 +316,42 @@ def bulk_grade_import(*, exam: Exam, csv_file, actor=None) -> dict:
     return record_results(exam=exam, rows=rows, actor=actor)
 
 
-def publish_exam(*, exam: Exam, actor=None) -> Exam:
-    if not exam.is_published:
-        exam.is_published = True
-        exam.published_at = timezone.now()
-        exam.save(update_fields=["is_published", "published_at"])
-    return exam
+def publish_exam(
+    *,
+    exam: Exam,
+    actor=None,
+    expected_version: int,
+    confirmed: bool,
+) -> tuple[Exam, ExamReadiness]:
+    return publish_exam_transition(
+        exam=exam,
+        actor=actor,
+        expected_version=expected_version,
+        confirmed=confirmed,
+    )
+
+
+def exam_readiness(*, exam: Exam):
+    return assessment_readiness(exam=exam)
+
+
+def correct_exam(
+    *,
+    exam: Exam,
+    changes: dict,
+    rows: list[dict],
+    reason: str,
+    expected_version: int,
+    actor=None,
+):
+    return correct_exam_transition(
+        exam=exam,
+        changes=changes,
+        rows=rows,
+        reason=reason,
+        expected_version=expected_version,
+        actor=actor,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,62 +364,30 @@ def compute_term_grade(*, student, subject, term, settings=None, publish: bool =
     `100 * sum(score/max * weight) / sum(weight)`. Returns None when nothing
     published contributes. Writes/updates the `Grade` with a `components`
     breakdown and a scheme-rendered `value_display`."""
-    settings = settings or get_center_settings()
-    results = ExamResult.objects.filter(
-        student=student, exam__subject=subject, exam__term=term, exam__is_published=True
-    ).select_related("exam")
-
-    total_weight = Decimal("0")
-    acc = Decimal("0")
-    components: list[dict] = []
-    for result in results:
-        exam = result.exam
-        max_score = exam.max_score or Decimal("0")
-        weight = exam.weight
-        fraction = (result.score / max_score) if max_score else Decimal("0")
-        acc += fraction * weight
-        total_weight += weight
-        components.append(
-            {
-                "exam": exam.id,
-                "title": exam.title,
-                "score": str(result.score),
-                "max_score": str(max_score),
-                "weight": str(weight),
-            }
-        )
-    if total_weight == 0:
-        return None
-
-    value_raw = (_HUNDRED * acc / total_weight).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-    defaults: dict = {
-        "value_raw": value_raw,
-        "value_display": display_for(value_raw, settings.grading_scheme),
-        "components": components,
-    }
-    if publish:
-        defaults["is_published"] = True
-        defaults["published_at"] = timezone.now()
-    grade, _created = Grade.objects.update_or_create(
-        student=student, subject=subject, term=term, defaults=defaults
+    # ``settings`` remains accepted for call compatibility; the canonical
+    # recompute path loads the tenant settings once for the whole batch.
+    del settings
+    grades = recompute_term_grades(
+        student_ids=[student.pk],
+        subject_id=subject.pk,
+        term_id=term.pk,
+        publish=True if publish else None,
     )
-    return grade
+    return grades[0] if grades else None
 
 
 def recompute_cohort_term(*, cohort, subject, term, publish: bool = False) -> list[Grade]:
     """Recompute every active member's grade for (subject, term)."""
-    settings = get_center_settings()
-    student_ids = CohortMembership.objects.filter(cohort=cohort, end_date__isnull=True).values_list(
-        "student_id", flat=True
+    student_ids = CohortMembership.objects.filter(
+        cohort=cohort,
+        end_date__isnull=True,
+    ).values_list("student_id", flat=True)
+    return recompute_term_grades(
+        student_ids=student_ids,
+        subject_id=subject.pk,
+        term_id=term.pk,
+        publish=True if publish else None,
     )
-    grades: list[Grade] = []
-    for student in StudentProfile.objects.filter(pk__in=list(student_ids)):
-        grade = compute_term_grade(
-            student=student, subject=subject, term=term, settings=settings, publish=publish
-        )
-        if grade is not None:
-            grades.append(grade)
-    return grades
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +518,15 @@ def _generate_transcript(transcript_id: int) -> str:
 
 
 def mark_transcript_failed(transcript_id: int, exc: Exception) -> None:
-    Transcript.objects.filter(pk=transcript_id).update(status=Transcript.Status.FAILED, error=str(exc)[:2000])
+    logger.error(
+        "Transcript %s generation failed",
+        transcript_id,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    Transcript.objects.filter(pk=transcript_id).update(
+        status=Transcript.Status.FAILED,
+        error="transcript_generation_failed",
+    )
 
 
 def presign_transcript(transcript: Transcript) -> str | None:

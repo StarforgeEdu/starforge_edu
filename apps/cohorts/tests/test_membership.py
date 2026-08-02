@@ -34,13 +34,16 @@ def test_multi_cohort_enrollment_keeps_stable_primary_and_bills_each(
 
     from apps.finance.models import Invoice
     from apps.finance.tests.factories import FeeScheduleFactory
+    from apps.org.tests.factories import DepartmentFactory
 
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory.create()
-        cohort_a = CohortFactory.create(branch=branch)
-        cohort_b = CohortFactory.create(branch=branch)
-        FeeScheduleFactory(cohort=cohort_a, amount_uzs=Decimal("100000.00"))
-        FeeScheduleFactory(cohort=cohort_b, amount_uzs=Decimal("60000.00"))
+        department_a = DepartmentFactory(branch=branch)
+        department_b = DepartmentFactory(branch=branch)
+        cohort_a = CohortFactory.create(branch=branch, department=department_a)
+        cohort_b = CohortFactory.create(branch=branch, department=department_b)
+        schedule_a = FeeScheduleFactory(cohort=cohort_a, amount_uzs=Decimal("100000.00"))
+        schedule_b = FeeScheduleFactory(cohort=cohort_b, amount_uzs=Decimal("60000.00"))
         student = StudentProfileFactory.create(branch=branch)
         # execute=True runs the on_commit auto-issue so per-cohort invoices materialize.
         with django_capture_on_commit_callbacks(execute=True):
@@ -58,8 +61,16 @@ def test_multi_cohort_enrollment_keeps_stable_primary_and_bills_each(
         # PRIMARY stays the first cohort — a secondary enroll must not silently flip it.
         student.refresh_from_db()
         assert student.current_cohort_id == cohort_a.id
-        # Each cohort billed on its own fee schedule (per-course billing is intended).
-        assert Invoice.objects.filter(student=student).count() == 2
+        # Each course is billed against its own cohort and immutable department
+        # snapshot, rather than attributing both charges to the stable primary.
+        invoices = {invoice.fee_schedule_id: invoice for invoice in Invoice.objects.filter(student=student)}
+        assert set(invoices) == {schedule_a.pk, schedule_b.pk}
+        assert invoices[schedule_a.pk].cohort_id == cohort_a.pk
+        assert invoices[schedule_a.pk].branch_at_issue_id == branch.pk
+        assert invoices[schedule_a.pk].department_at_issue_id == department_a.pk
+        assert invoices[schedule_b.pk].cohort_id == cohort_b.pk
+        assert invoices[schedule_b.pk].branch_at_issue_id == branch.pk
+        assert invoices[schedule_b.pk].department_at_issue_id == department_b.pk
 
 
 def test_cohort_move_keeps_history(director, tenant_a):

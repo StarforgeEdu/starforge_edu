@@ -155,7 +155,9 @@ def click_sign(
     if merchant_prepare_id is not None:
         parts.append(merchant_prepare_id)
     parts += [amount, str(action), sign_time]
-    return hashlib.md5("".join(parts).encode()).hexdigest()
+    # Click's protocol mandates MD5; this digest is interoperability data, not a
+    # password or local security primitive.
+    return hashlib.md5("".join(parts).encode(), usedforsecurity=False).hexdigest()
 
 
 def make_click_prepare(
@@ -200,6 +202,7 @@ def make_click_complete(
     sign_time: str = "2026-06-16 09:01:00",
     service_id: str = CLICK_SERVICE_ID,
     secret_key: str = CLICK_SECRET_KEY,
+    error: int = 0,
     tamper_sign: bool = False,
 ) -> dict[str, Any]:
     action = 1
@@ -222,6 +225,7 @@ def make_click_complete(
         "merchant_prepare_id": merchant_prepare_id,
         "amount": amount,
         "action": action,
+        "error": error,
         "sign_time": sign_time,
         "sign_string": sign,
     }

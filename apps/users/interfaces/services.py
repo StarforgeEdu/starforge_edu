@@ -7,7 +7,7 @@ from typing import Any
 
 from django.db.models import QuerySet
 
-from apps.users.models import Device, User
+from apps.users.models import Device, Session, User
 
 
 class IUserService(ABC):
@@ -34,3 +34,23 @@ class IUserService(ABC):
     @abstractmethod
     def revoke_device(self, *, user: User, pk: int) -> bool:
         """Soft-delete the caller's device. Returns False if it does not exist."""
+
+    # --- authenticated sessions (exact-principal scoped) ---
+    @abstractmethod
+    def sessions_for(
+        self,
+        *,
+        user: User,
+        principal_kind: str,
+        principal_id: int | None,
+    ) -> QuerySet[Session]: ...
+
+    @abstractmethod
+    def revoke_session(
+        self,
+        *,
+        user: User,
+        principal_kind: str,
+        principal_id: int | None,
+        session_id: int,
+    ) -> bool: ...

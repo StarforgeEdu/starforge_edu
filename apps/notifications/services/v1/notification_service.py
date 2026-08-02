@@ -28,27 +28,83 @@ class NotificationService(INotificationService):
     def __init__(self, repository: INotificationRepository) -> None:
         self.repository = repository
 
-    def feed(self, *, user) -> QuerySet[Notification]:
-        return self.repository.feed(user=user)
+    def feed(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[Notification]:
+        return self.repository.feed(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        )
 
-    def get_own(self, *, user, pk: int) -> Notification | None:
-        return self.repository.get_own(user=user, pk=pk)
+    def get_own(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        pk: int,
+    ) -> Notification | None:
+        return self.repository.get_own(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+            pk=pk,
+        )
 
-    def unread_count(self, *, user) -> int:
-        return self.repository.unread_count(user=user)
+    def unread_count(self, *, user, recipient_principal_kind: str, recipient_principal_id: int) -> int:
+        return self.repository.unread_count(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        )
 
-    def mark_read(self, *, user, notification_id: int) -> bool:
-        return domain.mark_read(user=user, notification_id=notification_id)
+    def mark_read(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        notification_id: int,
+    ) -> bool:
+        return domain.mark_read(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+            notification_id=notification_id,
+        )
 
-    def mark_all_read(self, *, user) -> int:
-        return domain.mark_all_read(user=user)
+    def mark_all_read(self, *, user, recipient_principal_kind: str, recipient_principal_id: int) -> int:
+        return domain.mark_all_read(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        )
 
-    def preferences(self, *, user) -> QuerySet[NotificationPreference]:
-        return self.repository.preferences(user=user)
+    def preferences(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[NotificationPreference]:
+        return self.repository.preferences(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+        )
 
-    def upsert_preferences(self, *, user, rows: list[PreferenceRowDTO]) -> list[NotificationPreference]:
+    def upsert_preferences(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        rows: list[PreferenceRowDTO],
+    ) -> list[NotificationPreference]:
         payload = [{"event_type": r.event_type, "channel": r.channel, "enabled": r.enabled} for r in rows]
-        return domain.upsert_preferences(user=user, rows=payload)
+        return domain.upsert_preferences(
+            user=user,
+            recipient_principal_kind=recipient_principal_kind,
+            recipient_principal_id=recipient_principal_id,
+            rows=payload,
+        )
 
     def announce(self, data: AnnouncementDTO, *, actor) -> dict[str, Any]:
         return domain.announce_cohort(cohort_id=data.cohort_id, title=data.title, body=data.body, actor=actor)

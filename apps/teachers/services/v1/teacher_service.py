@@ -12,7 +12,7 @@ from apps.teachers.dto.teacher_dto import TeacherCreateDTO
 from apps.teachers.interfaces.repositories import ITeacherRepository
 from apps.teachers.interfaces.teacher_service import ITeacherService
 from apps.teachers.models import TeacherProfile
-from core.exceptions import NotFoundException, ValidationException
+from core.exceptions import ConflictException, NotFoundException, ValidationException
 
 _SCALAR_FIELDS = ("hire_date", "subjects", "qualifications", "salary_type", "rate", "is_substitute")
 _IDENTITY_FIELDS = (
@@ -115,6 +115,13 @@ class TeacherService(ITeacherService):
         return teacher
 
     def delete(self, teacher: TeacherProfile) -> None:
+        from apps.teachers.models import PayoutPolicy
+
+        if PayoutPolicy.objects.filter(teacher=teacher).exists():
+            raise ConflictException(
+                _("A teacher with compensation history cannot be deleted; deactivate the account instead."),
+                code="teacher_has_compensation_history",
+            )
         self._teachers.delete(teacher)
 
     def dashboard(self, user, roles) -> dict[str, Any]:

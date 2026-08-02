@@ -24,9 +24,10 @@ def test_schema_covers_the_layered_api():
         "/api/v1/cohorts/",
         "/api/v1/finance/invoices/",
         "/api/v1/approvals/requests/",
-        "/api/v1/auth/login/",
+        "/api/v1/auth/role-login/",
     ):
         assert p in paths, p
+    assert "/api/v1/auth/login/" not in paths
     # Methods are introspected accurately from the views.
     assert set(m for m in paths["/api/v1/students/"] if m in ("get", "post")) == {"get", "post"}
     assert {"get", "patch", "put", "delete"} <= set(paths["/api/v1/students/{pk}/"])
@@ -59,8 +60,13 @@ def test_reports_drf_app_is_covered():
 
 def test_auth_and_security_scheme():
     s = build_schema(None)
-    login = s["paths"]["/api/v1/auth/login/"]["post"]  # POST (via @require_POST), public
-    assert "security" not in login
+    role_login = s["paths"]["/api/v1/auth/role-login/"]["post"]
+    assert "security" not in role_login
+    # Generic bridge-user login is discoverable only on the public/platform
+    # schema, never on a tenant contract.
+    platform = build_schema("config.urls_public")
+    platform_login = platform["paths"]["/api/v1/auth/login/"]["post"]
+    assert "security" not in platform_login
     students = s["paths"]["/api/v1/students/"]["get"]  # secured
     assert students.get("security") == [{"sessionAuth": []}]
     comps = s["components"]

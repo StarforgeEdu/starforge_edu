@@ -38,14 +38,36 @@ class FeeScheduleRepository(BaseRepository[FeeSchedule], IFeeScheduleRepository)
 class InvoiceRepository(BaseRepository[Invoice], IInvoiceRepository):
     model = Invoice
 
-    def scoped(self, *, user, roles: set[str]) -> QuerySet[Invoice]:
-        return selectors.scoped_invoices(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> QuerySet[Invoice]:
+        return selectors.scoped_invoice_summaries(
+            user=user,
+            roles=roles,
+            permission=permission,
+        )
 
-    def get_scoped(self, *, pk: int, user, roles: set[str]) -> Invoice | None:
-        return self.scoped(user=user, roles=roles).filter(pk=pk).first()
-
-    def get_by_pk(self, pk: int) -> Invoice | None:
-        return selectors._invoice_base().filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> Invoice | None:
+        return (
+            selectors.scoped_invoices(
+                user=user,
+                roles=roles,
+                permission=permission,
+            )
+            .filter(pk=pk)
+            .first()
+        )
 
 
 class DiscountRepository(BaseRepository[Discount], IDiscountRepository):
@@ -90,6 +112,3 @@ class CashierShiftRepository(BaseRepository[CashierShift], ICashierShiftReposito
 
     def query(self) -> QuerySet[CashierShift]:
         return CashierShift.objects.select_related("cashier", "branch", "closed_by").all()
-
-    def get(self, pk: int) -> CashierShift | None:
-        return self.query().filter(pk=pk).first()

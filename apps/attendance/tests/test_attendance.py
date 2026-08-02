@@ -58,6 +58,19 @@ def _enroll(cohort, *, n=1, branch=None) -> list[Any]:
     return students
 
 
+def _grant_teacher_scope(user, branch) -> None:
+    """Align legacy test actors with the branch their lesson belongs to."""
+    from apps.users.models import RoleMembership
+    from core.permissions import Role
+
+    RoleMembership.objects.get_or_create(
+        user=user,
+        branch=branch,
+        role=Role.TEACHER,
+    )
+    user.refresh_from_db()
+
+
 # --------------------------------------------------------------------------- #
 # mark_attendance — service-level behavior
 # --------------------------------------------------------------------------- #
@@ -67,6 +80,7 @@ def test_mark_upserts_unique_per_student_lesson(tenant_a, user_in):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         (student,) = _enroll(lesson.cohort, branch=branch)
@@ -90,6 +104,7 @@ def test_teacher_of_other_cohort_denied(tenant_a, user_in):
     intruder = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(intruder, branch)
         profile = TeacherProfileFactory(user=owner, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         (student,) = _enroll(lesson.cohort, branch=branch)
@@ -104,6 +119,7 @@ def test_student_not_in_cohort_rejected(tenant_a, user_in):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         outsider: Any = StudentProfileFactory(branch=branch)  # never enrolled
@@ -119,6 +135,7 @@ def test_future_lesson_cannot_be_pre_marked_service_or_api(tenant_a, user_in, as
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(
             branch=branch,
@@ -154,6 +171,7 @@ def test_late_threshold_boundary(tenant_a, user_in, minutes_late, expected):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = timezone.now() - timedelta(hours=1)
         lesson = _make_lesson(branch=branch, teacher=profile, starts_at=starts_at)
@@ -185,6 +203,7 @@ def test_late_signal_emits_only_when_record_becomes_late(
     try:
         with schema_context(tenant_a.schema_name):
             branch = BranchFactory()
+            _grant_teacher_scope(teacher_user, branch)
             profile = TeacherProfileFactory(user=teacher_user, branch=branch)
             starts_at = timezone.now() - timedelta(hours=1)
             lesson = _make_lesson(branch=branch, teacher=profile, starts_at=starts_at)
@@ -214,6 +233,7 @@ def test_arrived_at_never_clobbers_excused_or_absent(tenant_a, user_in, submitte
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = timezone.now() - timedelta(hours=1)
         lesson = _make_lesson(branch=branch, teacher=profile, starts_at=starts_at)
@@ -247,6 +267,7 @@ def test_late_threshold_knob_changes_behavior_no_code_change(tenant_a, user_in):
         cache.clear()
 
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = timezone.now() - timedelta(hours=1)
         lesson = _make_lesson(branch=branch, teacher=profile, starts_at=starts_at)
@@ -272,6 +293,7 @@ def test_correction_window_knob_changes_behavior_no_code_change(tenant_a, user_i
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = _aware(2026, 6, 1, 10)
         lesson = _make_lesson(
@@ -336,6 +358,7 @@ def test_correction_window_expired_teacher_403_director_ok(tenant_a, user_in, as
     director_user = user_in(tenant_a, roles=["director"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = _aware(2026, 6, 1, 10)
         lesson = _make_lesson(
@@ -523,6 +546,7 @@ def test_auto_absent_skips_marked_students(tenant_a, user_in):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = timezone.now() - timedelta(minutes=40)
         lesson = _make_lesson(branch=branch, teacher=profile, starts_at=starts_at)
@@ -562,6 +586,7 @@ def test_manual_attendance_rejects_cancelled_lesson(tenant_a, user_in):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         lesson.status = Lesson.Status.CANCELLED
@@ -594,6 +619,7 @@ def test_absence_signal_emitted_manual_and_auto(tenant_a, user_in, django_captur
     try:
         with schema_context(tenant_a.schema_name):
             branch = BranchFactory()
+            _grant_teacher_scope(teacher_user, branch)
             profile = TeacherProfileFactory(user=teacher_user, branch=branch)
             starts_at = timezone.now() - timedelta(minutes=40)
             lesson = _make_lesson(branch=branch, teacher=profile, starts_at=starts_at)
@@ -712,11 +738,16 @@ def test_mark_requires_write_perm(tenant_a, as_role):
 
 
 def test_records_list_scoping_student_parent_teacher(tenant_a, user_in, as_user):
-    teacher_user = user_in(tenant_a, roles=["teacher"])
     student_user = user_in(tenant_a, roles=["student"])
     parent_user = user_in(tenant_a, roles=["parent"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+
+    # The permission-bearing teacher membership and the teaching assignment are
+    # intentionally in the same branch. Cross-branch assignment denial has its
+    # own regression below and must not be smuggled into this valid-scope fixture.
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
 
@@ -753,6 +784,42 @@ def test_records_list_scoping_student_parent_teacher(tenant_a, user_in, as_user)
     teacher_body = as_user(tenant_a, teacher_user).get("/api/v1/attendance/records/").json()
     assert teacher_body["pagination"]["total"] == 2
     assert all(r["lesson"] != foreign_lesson_id for r in teacher_body["data"])
+
+
+def test_teacher_assignment_cannot_borrow_attendance_scope_from_another_branch(tenant_a, user_in, as_user):
+    """A malformed cross-branch teaching assignment is not an authorization grant.
+
+    Natural ownership and the exact permission-bearing teacher membership must
+    intersect for both record reads and the whole-class dashboard.
+    """
+    from apps.users.models import RoleMembership
+    from core.permissions import Role
+
+    teacher_user = user_in(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        cohort_branch = BranchFactory()
+        membership_branch = BranchFactory()
+        RoleMembership.objects.create(
+            user=teacher_user,
+            branch=membership_branch,
+            role=Role.TEACHER,
+        )
+        profile = TeacherProfileFactory(user=teacher_user, branch=membership_branch)
+        cohort = CohortFactory(branch=cohort_branch, primary_teacher=profile)
+        lesson = _make_lesson(branch=cohort_branch, teacher=profile, cohort=cohort)
+        student = StudentProfileFactory(branch=cohort_branch, current_cohort=cohort)
+        CohortMembershipFactory(cohort=cohort, student=student)
+        record = AttendanceRecordFactory(student=student, lesson=lesson, status=Status.PRESENT)
+        teacher_user.refresh_from_db()
+
+    client = as_user(tenant_a, teacher_user)
+    listing = client.get("/api/v1/attendance/records/")
+    assert listing.status_code == 200
+    assert record.id not in {row["id"] for row in listing.json()["data"]}
+
+    dashboard = client.get(f"/api/v1/attendance/cohorts/{cohort.id}/dashboard/")
+    assert dashboard.status_code == 403
+    assert dashboard.json()["code"] == "out_of_scope"
 
 
 def test_hod_attendance_is_department_scoped_for_reads_dashboard_and_mark(tenant_a, user_in, as_user):
@@ -827,9 +894,11 @@ def test_hod_attendance_is_department_scoped_for_reads_dashboard_and_mark(tenant
 def test_record_payload_surfaces_group_and_teacher(tenant_a, user_in, as_user):
     """The attendance record answers 'which group / which teacher' (the owner's
     screenshot gap) directly from the lesson, with no extra query per row."""
-    teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+
+    teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
+    with schema_context(tenant_a.schema_name):
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         (student,) = _enroll(lesson.cohort, branch=branch)
@@ -869,6 +938,54 @@ def test_csv_export_shape(tenant_a, user_in, as_user):
     assert len(rows) == record_count + 1  # header + one row per record
 
 
+def test_csv_export_neutralizes_formula_cells_and_has_constant_query_count(
+    tenant_a,
+    user_in,
+    as_user,
+    django_assert_max_num_queries,
+):
+    director = user_in(tenant_a, roles=["director"])
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        profile = TeacherProfileFactory(branch=branch)
+        cohort = CohortFactory(branch=branch)
+        students = _enroll(cohort, n=8, branch=branch)
+        for index, student in enumerate(students):
+            student.first_name = "=HYPERLINK"
+            student.last_name = f"row-{index}"
+            student.save(update_fields=("first_name", "last_name"))
+            starts_at = _aware(2026, 5, 1, 9) + timedelta(days=index)
+            lesson = _make_lesson(
+                branch=branch,
+                teacher=profile,
+                cohort=cohort,
+                starts_at=starts_at,
+                ends_at=starts_at + timedelta(hours=1),
+            )
+            lesson.title = "@SUM(A1:A2)"
+            lesson.save(update_fields=("title",))
+            AttendanceRecordFactory(student=student, lesson=lesson, status=Status.PRESENT)
+
+    client = as_user(tenant_a, director)
+    with django_assert_max_num_queries(9):
+        response = client.get("/api/v1/attendance/export/")
+        content = b"".join(response.streaming_content).decode()
+
+    assert response.status_code == 200
+    assert "'@SUM(A1:A2)" in content
+    assert "'=HYPERLINK" in content
+
+
+def test_csv_export_refuses_unbounded_result(monkeypatch, tenant_a, user_in, as_user):
+    director = user_in(tenant_a, roles=["director"])
+    monkeypatch.setattr("apps.attendance.views.v1.attendance_views.MAX_EXPORT_ROWS", -1)
+
+    response = as_user(tenant_a, director).get("/api/v1/attendance/export/")
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "export_too_large"
+
+
 def test_records_list_cross_tenant_isolated(tenant_a, tenant_b, user_in, as_user):
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
@@ -886,6 +1003,7 @@ def test_mark_cross_tenant_lesson_404(tenant_a, tenant_b, user_in, as_user):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         lesson_id = lesson.id
@@ -932,6 +1050,7 @@ def test_attendance_tolerates_a_student_moved_after_the_lesson(tenant_a, user_in
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)  # cohort A, started ~1h ago
         (student,) = _enroll(lesson.cohort, branch=branch)
@@ -949,6 +1068,7 @@ def test_attendance_rejects_a_student_who_left_before_the_lesson(tenant_a, user_
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(branch=branch, teacher=profile)
         student: Any = StudentProfileFactory(branch=branch)
@@ -988,6 +1108,7 @@ def test_attendance_membership_uses_center_local_lesson_date(tenant_a, user_in):
     teacher_user = user_in(tenant_a, roles=["teacher"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        _grant_teacher_scope(teacher_user, branch)
         teacher = TeacherProfileFactory(user=teacher_user, branch=branch)
         lesson = _make_lesson(
             branch=branch,

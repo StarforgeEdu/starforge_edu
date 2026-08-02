@@ -140,6 +140,10 @@ class RolePermissionOverride(models.Model):
             # authority or escalate a role to everything. Defense in depth — the
             # service also 400s it for a friendly message.
             models.CheckConstraint(condition=~models.Q(permission="*:*"), name="no_master_wildcard_override"),
+            models.CheckConstraint(
+                condition=~models.Q(permission__startswith="access:"),
+                name="no_access_resource_override",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover

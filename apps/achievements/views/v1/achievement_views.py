@@ -14,22 +14,24 @@ from typing import Any
 
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 
 from apps.achievements.dto.achievement_dto import CreateAchievementDTO, GrantAchievementDTO
 from apps.achievements.interfaces.services import IAchievementService
 from apps.achievements.models import Achievement
+from apps.achievements.openapi_contracts import APPROVE_CONTRACT, REJECT_CONTRACT
 from apps.achievements.presenters import achievement_grant_to_dict, achievement_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
-from core.exceptions import NotFoundException, PermissionException, ValidationException
+from core.exceptions import NotFoundException, ValidationException
 from core.http import int_field, read_json, str_field
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import _request_overrides, get_user_roles, has_permission_code
 from core.responses import created, error, paginated, success
 from core.scoping import (
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_branch_ids,
-    request_permission_membership_allows,
 )
 
 _RESOURCE = "achievements"
@@ -39,20 +41,28 @@ def _service() -> IAchievementService:
     return container.resolve(IAchievementService)  # type: ignore[type-abstract]
 
 
-def _scope(request: HttpRequest) -> tuple[bool, bool, bool, set[int]]:
+def _scope(request: HttpRequest, *, permission: str) -> tuple[bool, bool, bool, set[int]]:
     """(is_unscoped, can_write, can_approve, branch_ids) for the caller."""
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     roles = get_user_roles(req)
     overrides = _request_overrides(req)
-    unscoped = is_unscoped(req)
+    unscoped = is_permission_unscoped(req, permission=permission)
     can_write = has_permission_code(roles, f"{_RESOURCE}:write", overrides)
-    can_approve = unscoped or has_permission_code(roles, f"{_RESOURCE}:approve", overrides)
+    can_approve = has_permission_code(roles, f"{_RESOURCE}:approve", overrides)
     write_branch_ids = permission_membership_branch_ids(roles=roles, permission=f"{_RESOURCE}:write")
     return unscoped, can_write, can_approve, write_branch_ids
 
 
-def _get_visible(request: HttpRequest, pk: int) -> Achievement:
-    is_unscoped, can_write, can_approve, branch_ids = _scope(request)
+def _get_visible(
+    request: HttpRequest,
+    pk: int,
+    *,
+    permission: str = "achievements:read",
+) -> Achievement:
+    is_unscoped, can_write, can_approve, branch_ids = _scope(
+        request,
+        permission=permission,
+    )
     achievement = _service().get_visible(
         user=request.user,
         is_unscoped=is_unscoped,
@@ -71,7 +81,10 @@ def _get_visible(request: HttpRequest, pk: int) -> Achievement:
 def achievements_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:read")
-        is_unscoped, can_write, can_approve, branch_ids = _scope(request)
+        is_unscoped, can_write, can_approve, branch_ids = _scope(
+            request,
+            permission=f"{_RESOURCE}:read",
+        )
         qs = _service().scoped_list(
             user=request.user,
             is_unscoped=is_unscoped,
@@ -103,13 +116,23 @@ def achievement_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     return success(achievement_to_dict(_get_visible(request, pk)))
 
 
+@openapi_contract(
+    path="/api/v1/achievements/{pk}/approve/",
+    operations=(APPROVE_CONTRACT,),
+)
 @csrf_exempt
+@require_POST
 @require_auth
 def achievement_approve_view(request: HttpRequest, pk: int) -> HttpResponse:
     return _decide(request, pk, approve=True)
 
 
+@openapi_contract(
+    path="/api/v1/achievements/{pk}/reject/",
+    operations=(REJECT_CONTRACT,),
+)
 @csrf_exempt
+@require_POST
 @require_auth
 def achievement_reject_view(request: HttpRequest, pk: int) -> HttpResponse:
     return _decide(request, pk, approve=False)
@@ -121,27 +144,21 @@ def achievement_grant_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
-    achievement = _get_visible(request, pk)
+    achievement = _get_visible(request, pk, permission=f"{_RESOURCE}:write")
     body = read_json(request)
-    student = _service().resolve_student(int_field(body, "student", required=True))  # type: ignore[arg-type]
-    if student is None:
-        raise ValidationException(
-            "Invalid student.", code="validation_error", fields={"student": ["Not found."]}
-        )
-    # Object-level scope: the recipient must be in the caller's branch (unless the
-    # caller is unscoped — director/superuser). Without this a branch-scoped teacher
-    # could grant a GLOBAL achievement to another branch's student (cross-branch write)
-    # and use the endpoint as a student-pk existence oracle. Mirrors the sales / cards /
-    # compliance student-write paths.
-    if not request_permission_membership_allows(
+    is_unscoped, _can_write, _can_approve, branch_ids = _scope(
         request,
         permission=f"{_RESOURCE}:write",
-        branch_id=student.branch_id,
-        enforce_department=False,
-    ):
-        raise PermissionException(
-            "You can only grant to a student in your own branch.", code="branch_out_of_scope"
-        )
+    )
+    student = _service().resolve_student(
+        int_field(body, "student", required=True),  # type: ignore[arg-type]
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+    )
+    if student is None:
+        # Missing and outside-scope identifiers are resolved through the same
+        # queryset and deliberately return the same response.
+        raise NotFoundException(code="not_found")
     dto = GrantAchievementDTO(student_id=student.pk, note=str_field(body, "note", max_length=255))
     grant = _service().grant(achievement, dto, granted_by=request.user, student=student)
     return created(achievement_grant_to_dict(grant))
@@ -167,7 +184,7 @@ def achievement_grants_view(request: HttpRequest, pk: int) -> HttpResponse:
     # Staff-only: who earned an achievement (+ the staff notes) is NOT for a
     # student/parent to enumerate — they only get their own wall via `mine`.
     check_perm(request, f"{_RESOURCE}:write")
-    achievement = _get_visible(request, pk)
+    achievement = _get_visible(request, pk, permission=f"{_RESOURCE}:write")
     qs = _service().grants_of(achievement)
     items, total, page, size = paginate(request, qs)
     return paginated([achievement_grant_to_dict(g) for g in items], total=total, page=page, page_size=size)
@@ -178,7 +195,11 @@ def _decide(request: HttpRequest, pk: int, *, approve: bool) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:approve")
-    achievement = _get_visible(request, pk)  # 404 if the approver can't see it (no leak)
+    achievement = _get_visible(
+        request,
+        pk,
+        permission=f"{_RESOURCE}:approve",
+    )  # 404 if the approver can't see it (no leak)
     decided = _service().decide(achievement_id=achievement.pk, approve=approve, actor=request.user)
     return success(achievement_to_dict(decided))
 
@@ -208,7 +229,10 @@ def _create(request: HttpRequest) -> HttpResponse:
         emoji=str_field(body, "emoji", max_length=32),
         cohort_id=int_field(body, "cohort"),
     )
-    is_unscoped, _can_write, can_approve, branch_ids = _scope(request)
+    is_unscoped, _can_write, can_approve, branch_ids = _scope(
+        request,
+        permission=f"{_RESOURCE}:write",
+    )
     achievement = _service().create(
         dto, creator=request.user, can_approve=can_approve, is_scoped=not is_unscoped, branch_ids=branch_ids
     )

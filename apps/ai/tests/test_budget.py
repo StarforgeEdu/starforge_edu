@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 
 import pytest
 import time_machine
@@ -13,11 +13,15 @@ from apps.ai.models import AIRequest, TenantAIBudget
 from apps.ai.services import (
     AIBudgetExceeded,
     Usage,
-    check_and_reserve_budget,
     cost_microusd,
     record_usage,
 )
+from apps.ai.services import (
+    check_and_reserve_budget as _check_and_reserve_budget,
+)
 from apps.ai.tests.factories import AIPromptFactory, make_budget
+from apps.assignments.models import Submission
+from apps.assignments.tests.factories import SubmissionFactory
 
 pytestmark = pytest.mark.django_db
 
@@ -25,6 +29,17 @@ pytestmark = pytest.mark.django_db
 def _seed(tenant):
     with schema_context(tenant.schema_name):
         AIPromptFactory()
+
+
+def check_and_reserve_budget(**kwargs):
+    """Give legacy budget tests a real, exactly owned assignment source."""
+
+    source_id = int(kwargs["source_id"])
+    submission = Submission.objects.select_related("student__user").filter(
+        pk=source_id
+    ).first() or SubmissionFactory(pk=source_id)
+    kwargs["requested_by"] = submission.student.user
+    return _check_and_reserve_budget(**kwargs)
 
 
 def test_reserve_creates_queued_request(tenant_a):
@@ -39,6 +54,18 @@ def test_reserve_creates_queued_request(tenant_a):
         )
         assert req.status == AIRequest.Status.QUEUED
         assert req.idempotency_key == "assignment_feedback:assignments:1:v1"
+
+
+def test_omitted_estimate_reserves_the_selected_prompt_version_cap(tenant_a):
+    _seed(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        make_budget(daily_token_limit=10_000, monthly_token_limit=100_000)
+        req = check_and_reserve_budget(
+            feature="assignment_feedback",
+            source_app="assignments",
+            source_id=82,
+        )
+        assert req.reserved_tokens == req.prompt.token_cost_cap == 4000
 
 
 def test_over_daily_budget_denies_and_records(tenant_a):
@@ -107,13 +134,23 @@ def test_record_usage_bumps_counters_atomically(tenant_a):
         )
         req.status = AIRequest.Status.RUNNING
         req.save(update_fields=["status"])
-        record_usage(ai_request_id=req.pk, usage=Usage(input_tokens=120, output_tokens=80))
+        record_usage(
+            ai_request_id=req.pk,
+            usage=Usage(
+                input_tokens=120,
+                output_tokens=80,
+                cache_read_tokens=30,
+                cache_creation_tokens=20,
+            ),
+        )
         budget = TenantAIBudget.objects.get(pk=1)
-        assert budget.tokens_used_today == 200
-        assert budget.tokens_used_month == 200
+        assert budget.tokens_used_today == 250
+        assert budget.tokens_used_month == 250
         req.refresh_from_db()
         assert req.input_tokens == 120
         assert req.output_tokens == 80
+        assert req.cache_read_tokens == 30
+        assert req.cache_creation_tokens == 20
 
 
 def test_record_usage_no_double_count_on_terminal(tenant_a):
@@ -180,6 +217,44 @@ def test_month_anchor_rolls_over():
 
 
 def test_cost_microusd_uses_settings():
-    # 1M input + 1M output at default placeholder prices = 3M + 15M microUSD.
-    usage = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost_microusd(usage) == 3_000_000 + 15_000_000
+    # Every Anthropic receipt class is priced; cache usage must not disappear
+    # from cost evidence merely because it is reported outside base input.
+    usage = Usage(
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+        cache_creation_tokens=1_000_000,
+    )
+    assert cost_microusd(usage) == 3_000_000 + 15_000_000 + 300_000 + 3_750_000
+
+
+def test_old_period_failure_cannot_erase_current_period_budget_usage(tenant_a):
+    """A delayed job's reservation vanished at rollover; releasing it again must
+    not subtract unrelated usage admitted in the new day/month."""
+    _seed(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        make_budget(daily_token_limit=10_000, monthly_token_limit=100_000)
+        old_request = check_and_reserve_budget(
+            feature="assignment_feedback",
+            estimated_tokens=500,
+            source_app="assignments",
+            source_id=81,
+        )
+        previous_month_day = timezone.localdate().replace(day=1) - timedelta(days=1)
+        AIRequest.objects.filter(pk=old_request.pk).update(
+            created_at=timezone.make_aware(datetime.combine(previous_month_day, time.min))
+        )
+        budget = TenantAIBudget.objects.get(pk=1)
+        budget.day_anchor = timezone.localdate()
+        budget.month_anchor = timezone.localdate()
+        budget.tokens_used_today = 321
+        budget.tokens_used_month = 654
+        budget.save()
+
+        from apps.ai.services import terminalize_failure
+
+        terminalize_failure(ai_request_id=old_request.pk, error_code="local_failure")
+
+        budget.refresh_from_db()
+        assert budget.tokens_used_today == 321
+        assert budget.tokens_used_month == 654

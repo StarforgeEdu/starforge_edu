@@ -11,18 +11,24 @@ with it:
   naming the degraded dependency (so a caller knows e.g. notifications aren't being sent).
 
 Toggling is CONTROLLABLE without a restart: the disabled set is the union of the
-``DISABLED_APPS`` setting (ops default) and a cache-backed override a director can change via
-the system-status endpoint. Resolution is a cheap in-memory graph walk + one cache read, so
-it adds negligible latency.
+``DISABLED_APPS`` setting (ops default) and a durable per-tenant override an authorized
+organization operator can change through the system-status endpoint. Redis is only a cache;
+losing it must not silently re-enable a tenant feature. Resolution is a cheap in-memory graph
+walk plus one cache read on the hot path (and one database read only on a cache miss).
 
-This module is pure logic (no Django models); the ``AppAvailabilityMiddleware`` and the
-``/api/v1/org/system/`` endpoints drive it.
+The dependency resolver is pure logic. The persistence helpers deliberately import the
+organization model lazily so migration/startup paths can load this module before tenant tables
+exist. ``AppAvailabilityMiddleware`` and ``/api/v1/org/system/apps/`` drive the public behavior.
 """
 
 from __future__ import annotations
 
+import logging
+
 from django.conf import settings
 from django.core.cache import cache
+
+logger = logging.getLogger("starforge.availability")
 
 # URL mount (/api/v1/<mount>/) -> app label. Most mounts equal the label; the exceptions
 # are listed explicitly. Anything not here is treated as an unmanaged path (always up).
@@ -101,6 +107,7 @@ APP_DEPENDENCIES: dict[str, dict[str, list[str]]] = {
 }
 
 _DISABLED_CACHE_PREFIX = "core:availability:disabled_apps"
+_CACHE_MISS = object()
 
 STATUS_UP = "up"
 STATUS_DEGRADED = "degraded"
@@ -132,7 +139,11 @@ def _cache_key() -> str:
 def disabled_apps() -> set[str]:
     """The apps off for the CURRENT tenant: the global ops default UNION this tenant's
     runtime override (a director toggling apps, no restart needed)."""
-    override = cache.get(_cache_key()) or ()
+    cache_key = _cache_key()
+    override = cache.get(cache_key, _CACHE_MISS)
+    if override is _CACHE_MISS:
+        override = _database_disabled_apps()
+        cache.set(cache_key, sorted(override), timeout=None)
     return set(_global_disabled()) | set(override)
 
 
@@ -141,10 +152,81 @@ def set_tenant_disabled_apps(apps: set[str]) -> set[str]:
     (a typo can't silently disable everything), foundational ``PROTECTED_APPS`` are stripped
     (disabling them would brick the control plane itself), and a globally-disabled app is
     implicitly included. Returns the resulting effective disabled set."""
+    from django.db import transaction
+
+    from apps.org.models import CenterSettings
+    from core.exceptions import ValidationException
+
     known = set(APP_MOUNTS.values())
-    tenant_set = sorted((set(apps) & known) - PROTECTED_APPS)
-    cache.set(_cache_key(), tenant_set, timeout=None)
+    unknown = sorted(set(apps) - known)
+    if unknown:
+        raise ValidationException(
+            "Unknown application labels.",
+            code="validation_error",
+            fields={"disabled": [f"Unknown app labels: {', '.join(unknown)}."]},
+        )
+    tenant_set = sorted(set(apps) - PROTECTED_APPS)
+    cache_key = _cache_key()
+    with transaction.atomic():
+        # Only tenant provisioning/migrations may create the policy singleton.
+        # A feature-toggle PATCH must not recreate all unrelated settings from
+        # defaults after accidental data loss.
+        settings_row = CenterSettings.objects.select_for_update().filter(pk=1).first()
+        if settings_row is None:
+            from core.exceptions import ServiceUnavailableException
+
+            raise ServiceUnavailableException(
+                "Organization settings are not ready.",
+                code="configuration_unavailable",
+            )
+        if settings_row.disabled_apps != tenant_set:
+            settings_row.disabled_apps = tenant_set
+            settings_row.save(update_fields=("disabled_apps", "updated_at"))
+    # Publish only after the outermost transaction commits. A caller may wrap
+    # this service in a larger workflow; caching uncommitted state would leave
+    # Redis disagreeing with PostgreSQL if that workflow later rolls back.
+    cached_value = tuple(tenant_set)
+
+    def publish_cache() -> None:
+        cache.set(cache_key, list(cached_value), timeout=None)
+
+    transaction.on_commit(publish_cache)
     return set(tenant_set) | set(_global_disabled())
+
+
+def _database_disabled_apps() -> set[str]:
+    """Load the durable tenant override without making a read-path write."""
+    from django.db import DatabaseError
+
+    from apps.org.models import CenterSettings
+
+    allowed = set(APP_MOUNTS.values()) - PROTECTED_APPS
+    try:
+        raw = CenterSettings.objects.filter(pk=1).values_list("disabled_apps", flat=True).first()
+    except DatabaseError:
+        # Runtime policy is security-sensitive: when its authoritative row
+        # cannot be read, do not silently re-enable optional tenant features.
+        # The protected control plane remains reachable for diagnosis/repair.
+        logger.critical(
+            "tenant disabled-app configuration is unavailable; failing closed",
+            exc_info=True,
+        )
+        return allowed
+    normalized: list[str] = []
+    if isinstance(raw, list):
+        for app in raw:
+            if not isinstance(app, str) or app not in allowed:
+                break
+            normalized.append(app)
+    if not isinstance(raw, list) or len(normalized) != len(raw) or len(normalized) != len(set(normalized)):
+        # This should be unreachable behind the database constraint. If storage
+        # is corrupted or constraints were bypassed, disabling every optional
+        # app is safer than silently re-enabling features the operator may have
+        # intentionally turned off. The protected control plane remains usable
+        # so an owner can repair the row.
+        logger.critical("tenant disabled-app configuration is invalid; failing closed")
+        return allowed
+    return set(normalized)
 
 
 def app_for_mount(mount: str) -> str | None:

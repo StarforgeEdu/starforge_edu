@@ -29,18 +29,32 @@ pytestmark = pytest.mark.django_db
 REQ = "/api/v1/approvals/requests/"
 
 
-def _invoice(tenant, **kwargs) -> int:
+def _invoice(tenant, *, requester=None, **kwargs) -> int:
     with schema_context(tenant.schema_name):
+        if requester is not None and "student" not in kwargs:
+            from apps.students.tests.factories import StudentProfileFactory
+
+            branch_id = (
+                requester.role_memberships.filter(revoked_at__isnull=True)
+                .values_list("branch_id", flat=True)
+                .first()
+            )
+            kwargs["student"] = StudentProfileFactory.create(branch_id=branch_id)
         return InvoiceFactory.create(**kwargs).id
 
 
 def test_approving_payment_delay_extends_due_date(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     today = timezone.now().date()
     due = today + timedelta(days=5)
     new_due = today + timedelta(days=40)
-    inv_id = _invoice(tenant_a, due_date=due, status=Invoice.Status.ISSUED)
+    inv_id = _invoice(
+        tenant_a,
+        requester=teacher_user,
+        due_date=due,
+        status=Invoice.Status.ISSUED,
+    )
 
     r = teacher.post(
         REQ,
@@ -69,12 +83,17 @@ def test_approving_payment_delay_extends_due_date(tenant_a, as_role):
 
 
 def test_payment_delay_unoverdues_invoice(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     today = timezone.now().date()
     new_due = today + timedelta(days=60)
     # Already tipped OVERDUE on an old due date; a future extension rescues it.
-    inv_id = _invoice(tenant_a, due_date=today - timedelta(days=20), status=Invoice.Status.OVERDUE)
+    inv_id = _invoice(
+        tenant_a,
+        requester=teacher_user,
+        due_date=today - timedelta(days=20),
+        status=Invoice.Status.OVERDUE,
+    )
 
     rid = teacher.post(
         REQ,
@@ -95,14 +114,22 @@ def test_payment_delay_unoverdues_invoice(tenant_a, as_role):
 
 
 def test_payment_delay_partially_paid_invoice_unoverdues_to_partially_paid(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     today = timezone.now().date()
     new_due = today + timedelta(days=60)
     with schema_context(tenant_a.schema_name):
         from apps.finance.models import PaymentAllocation
+        from apps.students.tests.factories import StudentProfileFactory
+
+        branch_id = (
+            teacher_user.role_memberships.filter(revoked_at__isnull=True)
+            .values_list("branch_id", flat=True)
+            .first()
+        )
 
         inv = InvoiceFactory.create(
+            student=StudentProfileFactory.create(branch_id=branch_id),
             due_date=today - timedelta(days=20),
             status=Invoice.Status.OVERDUE,
             total_uzs=Decimal("1000000.00"),
@@ -131,12 +158,17 @@ def test_payment_delay_partially_paid_invoice_unoverdues_to_partially_paid(tenan
 def test_rejecting_approved_delay_restores_due_date(tenant_a, as_role):
     """Overturning an approved delay puts the due date back and re-flags OVERDUE
     when the restored date is again in the past — a rejected grace must not stick."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     today = timezone.now().date()
     original_due = today - timedelta(days=20)
     new_due = today + timedelta(days=60)
-    inv_id = _invoice(tenant_a, due_date=original_due, status=Invoice.Status.OVERDUE)
+    inv_id = _invoice(
+        tenant_a,
+        requester=teacher_user,
+        due_date=original_due,
+        status=Invoice.Status.OVERDUE,
+    )
 
     rid = teacher.post(
         REQ,
@@ -163,7 +195,7 @@ def test_rejecting_approved_delay_restores_due_date(tenant_a, as_role):
 
 
 def test_rejecting_stacked_delays_preserves_other_active_extensions(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     today = timezone.localdate()
     original_due = today + timedelta(days=5)
@@ -190,6 +222,7 @@ def test_rejecting_stacked_delays_preserves_other_active_extensions(tenant_a, as
     # the newer extension is also rejected, restore the true original baseline.
     first_invoice_id = _invoice(
         tenant_a,
+        requester=teacher_user,
         due_date=original_due,
         status=Invoice.Status.ISSUED,
     )
@@ -206,6 +239,7 @@ def test_rejecting_stacked_delays_preserves_other_active_extensions(tenant_a, as
     # older one, then removing that one reaches the original deadline.
     second_invoice_id = _invoice(
         tenant_a,
+        requester=teacher_user,
         due_date=original_due,
         status=Invoice.Status.ISSUED,
     )
@@ -220,7 +254,7 @@ def test_rejecting_stacked_delays_preserves_other_active_extensions(tenant_a, as
 
 
 def test_payment_delay_requires_valid_open_invoice(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     today = timezone.now().date()
     new_due = (today + timedelta(days=30)).isoformat()
     # missing invoice_id
@@ -233,7 +267,7 @@ def test_payment_delay_requires_valid_open_invoice(tenant_a, as_role):
     assert bad.json()["code"] == "payment_delay_invoice_required"
 
     # a paid invoice is not open
-    paid_id = _invoice(tenant_a, status=Invoice.Status.PAID)
+    paid_id = _invoice(tenant_a, requester=teacher_user, status=Invoice.Status.PAID)
     closed = teacher.post(
         REQ,
         {"kind": "payment_delay", "title": "x", "payload": {"invoice_id": paid_id, "new_due_date": new_due}},
@@ -244,10 +278,15 @@ def test_payment_delay_requires_valid_open_invoice(tenant_a, as_role):
 
 
 def test_payment_delay_must_move_date_later(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     today = timezone.now().date()
     due = today + timedelta(days=5)
-    inv_id = _invoice(tenant_a, due_date=due, status=Invoice.Status.ISSUED)
+    inv_id = _invoice(
+        tenant_a,
+        requester=teacher_user,
+        due_date=due,
+        status=Invoice.Status.ISSUED,
+    )
     r = teacher.post(
         REQ,
         {
@@ -264,9 +303,14 @@ def test_payment_delay_must_move_date_later(tenant_a, as_role):
 def test_payment_delay_into_the_past_rejected(tenant_a, as_role):
     """Later than the current due date but still before today = a meaningless
     no-op grace; reject it at the gate."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     today = timezone.now().date()
-    inv_id = _invoice(tenant_a, due_date=today - timedelta(days=20), status=Invoice.Status.OVERDUE)
+    inv_id = _invoice(
+        tenant_a,
+        requester=teacher_user,
+        due_date=today - timedelta(days=20),
+        status=Invoice.Status.OVERDUE,
+    )
     r = teacher.post(
         REQ,
         {
@@ -284,10 +328,15 @@ def test_payment_delay_revalidated_at_approve(tenant_a, as_role):
     """The invoice can change between request and decision: if it is voided in
     the meantime, approving rolls back atomically (422) and the request stays
     pending — never an invoice mutated for a no-longer-valid target."""
-    teacher, _ = as_role(Role.TEACHER)
+    teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     today = timezone.now().date()
-    inv_id = _invoice(tenant_a, due_date=today + timedelta(days=5), status=Invoice.Status.ISSUED)
+    inv_id = _invoice(
+        tenant_a,
+        requester=teacher_user,
+        due_date=today + timedelta(days=5),
+        status=Invoice.Status.ISSUED,
+    )
     rid = teacher.post(
         REQ,
         {

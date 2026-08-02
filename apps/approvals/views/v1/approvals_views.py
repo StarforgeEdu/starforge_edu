@@ -2,9 +2,9 @@
 
 The A-1 approvals engine: anyone with approvals:write may request; approvers
 (approvals:approve) approve/reject; the requester may cancel their own; cashiers
-(approvals:disburse) pay out -> an append-only ledger row. A requester sees only
-their own requests; handlers see all (selectors.scoped_requests). The ledger is
-read-only (ledger:read); entries are written only by the services.
+(approvals:disburse) pay out -> an append-only ledger row. A requester sees their
+own requests; branch handlers see only requests in their exact permission scope.
+The ledger is read-only and branch-scoped; entries are written only by services.
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from django.db.models import Q, QuerySet
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.approvals.interfaces.services import IApprovalService, ILedgerService
 from apps.approvals.models import LedgerEntry
 from apps.approvals.presenters import approval_request_to_dict, ledger_entry_to_dict
+from apps.approvals.services import KIND_SALARY_PREP
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
@@ -25,6 +27,13 @@ from core.http import decimal_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
 from core.permissions import get_user_roles
 from core.responses import created, error, paginated, success
+from core.scoping import (
+    is_permission_unscoped,
+    permission_membership_branch_ids,
+    permission_membership_scope_q,
+    request_permission_membership_allows,
+    scope_to_permission_memberships,
+)
 from core.tenant_context import assert_tenant_context
 
 # Documented request kinds (configured instances of the engine); "other" is the
@@ -59,6 +68,12 @@ _REQUEST_KINDS = frozenset(
     }
 )
 _DIRECTIONS = {LedgerEntry.Direction.IN, LedgerEntry.Direction.OUT}
+_COMPENSATION_VISIBILITY_PERMISSIONS = (
+    "compensation:read",
+    "compensation:run",
+    "compensation:approve",
+    "compensation:disburse",
+)
 
 
 def _approval_service() -> IApprovalService:
@@ -110,6 +125,60 @@ def _roles(request: HttpRequest) -> set[str]:
     return get_user_roles(request)
 
 
+def _compensation_visibility_q(request: HttpRequest) -> Q:
+    """Exact scopes where this caller may know a salary request exists.
+
+    Approval permissions and compensation permissions are separate on purpose.
+    Combining either one from Branch A with the other from Branch B would be a
+    cross-membership salary oracle, so every compensation scope is derived from
+    the membership that grants that exact capability.
+    """
+    visible = Q(pk__in=[])
+    roles = _roles(request)
+    for permission in _COMPENSATION_VISIBILITY_PERMISSIONS:
+        visible |= permission_membership_scope_q(
+            roles=roles,
+            permission=permission,
+            branch_field="branch_id",
+            account_kinds={"staff"},
+        )
+    return visible
+
+
+def _scope_sensitive_requests(request: HttpRequest, queryset: QuerySet) -> QuerySet:
+    if request.user.is_superuser:
+        return queryset
+    salary_visible = Q(kind=KIND_SALARY_PREP) & _compensation_visibility_q(request)
+    return queryset.filter(~Q(kind=KIND_SALARY_PREP) | salary_visible)
+
+
+def _scope_sensitive_ledger(request: HttpRequest, queryset: QuerySet) -> QuerySet:
+    """Hide salary ledger rows from generic ledger readers.
+
+    ``entry_type`` is pinned for current salary writes; the approval relation is
+    included as a fail-closed compatibility signal for older rows.
+    """
+    if request.user.is_superuser:
+        return queryset
+    salary_row = Q(entry_type=KIND_SALARY_PREP) | Q(approval_requests__kind=KIND_SALARY_PREP)
+    return queryset.filter(~salary_row | (salary_row & _compensation_visibility_q(request))).distinct()
+
+
+def _salary_permission(request: HttpRequest, req, permission: str) -> None:
+    if req.kind != KIND_SALARY_PREP:
+        return
+    check_perm(request, permission)
+    if not request_permission_membership_allows(
+        request,
+        permission=permission,
+        branch_id=req.branch_id,
+        account_kinds={"staff"},
+    ):
+        # Match the surrounding scoped retrieval contract: a caller cannot use
+        # salary IDs to distinguish another branch's records.
+        raise NotFoundException(code="not_found")
+
+
 def _create_data(request: HttpRequest) -> dict[str, Any]:
     data = read_json(request)
     amount = decimal_field(data, "amount_uzs", max_digits=18, decimal_places=2)
@@ -129,6 +198,24 @@ def _create_data(request: HttpRequest) -> dict[str, Any]:
     }
 
 
+def _create_branch_scope(request: HttpRequest, data: dict[str, Any]) -> set[int] | None:
+    """Return the exact write scope; the domain binds and validates the branch.
+
+    Reject an explicitly guessed branch before resolving it so scoped callers
+    cannot use validation differences to discover another branch.
+    """
+    if is_permission_unscoped(request, permission="approvals:write"):
+        return None
+    allowed_branch_ids = permission_membership_branch_ids(
+        roles=_roles(request),
+        permission="approvals:write",
+    )
+    branch_id = data.get("branch")
+    if branch_id is not None and branch_id not in allowed_branch_ids:
+        raise NotFoundException(code="not_found")
+    return allowed_branch_ids
+
+
 @csrf_exempt
 @require_auth
 def approval_requests_collection_view(request: HttpRequest) -> HttpResponse:
@@ -136,7 +223,10 @@ def approval_requests_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "approvals:read")
         qs = apply_filters(
             request,
-            _approval_service().scoped(user=request.user, roles=_roles(request)),
+            _scope_sensitive_requests(
+                request,
+                _approval_service().scoped(user=request.user, roles=_roles(request)),
+            ),
             filter_fields=("kind", "status", "branch"),
             ordering_fields=("created_at", "amount_uzs"),
             default_ordering="-created_at",
@@ -145,15 +235,44 @@ def approval_requests_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([approval_request_to_dict(r) for r in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "approvals:write")
-        req = _approval_service().create(data=_create_data(request), requested_by=request.user)
+        data = _create_data(request)
+        req = _approval_service().create(
+            data=data,
+            requested_by=request.user,
+            allowed_branch_ids=_create_branch_scope(request, data),
+        )
         return created(approval_request_to_dict(req))
     return _method_not_allowed()
 
 
-def _get_request_in_scope(request: HttpRequest, pk: int):
-    req = _approval_service().get_scoped(pk=pk, user=request.user, roles=_roles(request))
+def _get_request_in_scope(
+    request: HttpRequest,
+    pk: int,
+    *,
+    permission: str | None = "approvals:read",
+    include_requested_by: bool = True,
+):
+    req = _approval_service().get_scoped(
+        pk=pk,
+        user=request.user,
+        roles=_roles(request),
+        permission=permission,
+        include_requested_by=include_requested_by,
+    )
     if req is None:
         raise NotFoundException(code="not_found")
+    if req.kind == KIND_SALARY_PREP:
+        visible = any(
+            request_permission_membership_allows(
+                request,
+                permission=permission_name,
+                branch_id=req.branch_id,
+                account_kinds={"staff"},
+            )
+            for permission_name in _COMPENSATION_VISIBILITY_PERMISSIONS
+        )
+        if not visible:
+            raise NotFoundException(code="not_found")
     return req
 
 
@@ -176,7 +295,13 @@ def approval_request_approve_view(request: HttpRequest, pk: int) -> HttpResponse
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "approvals:approve")
-    req = _get_request_in_scope(request, pk)
+    req = _get_request_in_scope(
+        request,
+        pk,
+        permission="approvals:approve",
+        include_requested_by=False,
+    )
+    _salary_permission(request, req, "compensation:approve")
     result = _approval_service().approve(request_id=req.pk, actor=request.user, note=_decision_note(request))
     return success(approval_request_to_dict(result))
 
@@ -187,7 +312,13 @@ def approval_request_reject_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "approvals:approve")
-    req = _get_request_in_scope(request, pk)
+    req = _get_request_in_scope(
+        request,
+        pk,
+        permission="approvals:approve",
+        include_requested_by=False,
+    )
+    _salary_permission(request, req, "compensation:approve")
     result = _approval_service().reject(request_id=req.pk, actor=request.user, note=_decision_note(request))
     return success(approval_request_to_dict(result))
 
@@ -198,7 +329,7 @@ def approval_request_cancel_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "approvals:write")
-    req = _get_request_in_scope(request, pk)
+    req = _get_request_in_scope(request, pk, permission=None, include_requested_by=True)
     # Only the requester may cancel their own request (approvals:write is broad).
     if not request.user.is_superuser and req.requested_by_id != request.user.id:
         raise PermissionException("You can only cancel your own request.", code="not_requester")
@@ -212,7 +343,13 @@ def approval_request_disburse_view(request: HttpRequest, pk: int) -> HttpRespons
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "approvals:disburse")
-    req = _get_request_in_scope(request, pk)
+    req = _get_request_in_scope(
+        request,
+        pk,
+        permission="approvals:disburse",
+        include_requested_by=False,
+    )
+    _salary_permission(request, req, "compensation:disburse")
     data = read_json(request)
     result = _approval_service().disburse(
         request_id=req.pk,
@@ -235,9 +372,15 @@ def ledger_collection_view(request: HttpRequest) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "ledger:read")
     assert_tenant_context()
+    qs = scope_to_permission_memberships(
+        request,
+        _scope_sensitive_ledger(request, _ledger_service().list_entries()),
+        permission="ledger:read",
+        branch_field="branch_id",
+    )
     qs = apply_filters(
         request,
-        _ledger_service().list_entries(),
+        qs,
         filter_fields=("direction", "entry_type", "branch", "source_kind"),
         ordering_fields=("created_at", "amount_uzs"),
         default_ordering="-created_at",
@@ -253,7 +396,13 @@ def ledger_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "ledger:read")
     assert_tenant_context()
-    entry = _ledger_service().list_entries().filter(pk=pk).first()
+    entries = scope_to_permission_memberships(
+        request,
+        _scope_sensitive_ledger(request, _ledger_service().list_entries()),
+        permission="ledger:read",
+        branch_field="branch_id",
+    )
+    entry = entries.filter(pk=pk).first()
     if entry is None:
         raise NotFoundException(code="not_found")
     return success(ledger_entry_to_dict(entry))

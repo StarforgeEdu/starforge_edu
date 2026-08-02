@@ -17,6 +17,6 @@ class SessionKeyScheme(OpenApiAuthenticationExtension):
     target_class = "core.session_auth.SessionAuthentication"
     name = "sessionAuth"
 
-    def get_security_definition(self, auto_schema):
+    def get_security_definition(self, _auto_schema):
         # Opaque session key presented as `Authorization: Bearer <key>`.
         return {"type": "http", "scheme": "bearer"}

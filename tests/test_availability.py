@@ -1,15 +1,21 @@
-"""Fault isolation (core.availability): every app can be turned off, one app down never
-falls the whole API, dependency-aware graceful degradation with warnings, controllable."""
+"""Durable fault isolation: one app can be disabled without taking down unrelated APIs.
+
+The database is authoritative and Redis is only the per-request cache. Tests cover dependency
+degradation, cache loss, transaction rollback, and control-plane self-lockout prevention.
+"""
 
 from __future__ import annotations
 
 import pytest
 from django.core.cache import cache
+from django.db import DatabaseError
 from django_tenants.utils import schema_context
 
 from core.permissions import Role
 
-pytestmark = pytest.mark.django_db
+# These tests exercise transaction.on_commit cache publication. They need real
+# commits rather than pytest-django's outer rollback-only TestCase transaction.
+pytestmark = pytest.mark.django_db(transaction=True)
 
 
 def _disable(tenant, apps):
@@ -73,8 +79,13 @@ def test_soft_dependency_down_degrades_with_warnings(tenant_a, as_role):
     r = director.get("/api/v1/attendance/records/")
     assert r.status_code == 200  # still works
     body = r.json()
-    assert "warnings" in body
-    assert any("notifications" in w for w in body["warnings"])
+    assert body["warnings"] == [
+        {
+            "code": "information_delayed",
+            "message": "Some information may be delayed.",
+            "affected_sections": ["attendance"],
+        }
+    ]
 
 
 def test_control_endpoint_lists_and_toggles(tenant_a, as_role):
@@ -100,6 +111,52 @@ def test_control_endpoint_rejects_a_bad_body(tenant_a, as_role):
     director, _ = as_role(Role.DIRECTOR)
     r = director.patch("/api/v1/org/system/apps/", {"disabled": "placement"}, format="json")
     assert r.status_code == 400
+
+
+def test_disabled_apps_persist_across_cache_loss_and_model_writes_invalidate(tenant_a):
+    from apps.org.models import CenterSettings
+    from core.availability import _cache_key, disabled_apps
+
+    cache.clear()
+    _disable(tenant_a, {"placement"})
+    with schema_context(tenant_a.schema_name):
+        key = _cache_key()
+        assert CenterSettings.objects.get(pk=1).disabled_apps == ["placement"]
+        assert disabled_apps() == {"placement"}
+
+        cache.clear()
+        assert disabled_apps() == {"placement"}
+
+        settings_row = CenterSettings.objects.get(pk=1)
+        settings_row.disabled_apps = ["notifications"]
+        settings_row.save(update_fields=("disabled_apps", "updated_at"))
+        assert cache.get(key) is None
+        assert disabled_apps() == {"notifications"}
+
+
+def test_disabled_apps_rollback_never_publishes_uncommitted_cache_state(tenant_a):
+    from django.db import transaction
+
+    from apps.org.models import CenterSettings
+    from core.availability import _cache_key, disabled_apps, set_tenant_disabled_apps
+
+    cache.clear()
+    _disable(tenant_a, {"placement"})
+    with schema_context(tenant_a.schema_name):
+        key = _cache_key()
+        assert cache.get(key) == ["placement"]
+
+        def rollback_probe() -> None:
+            with transaction.atomic():
+                set_tenant_disabled_apps({"notifications"})
+                raise RuntimeError("rollback probe")
+
+        with pytest.raises(RuntimeError, match="rollback probe"):
+            rollback_probe()
+
+        assert CenterSettings.objects.get(pk=1).disabled_apps == ["placement"]
+        assert cache.get(key) == ["placement"]
+        assert disabled_apps() == {"placement"}
 
 
 def test_foundational_apps_cannot_be_disabled(tenant_a, as_role):
@@ -151,3 +208,24 @@ def test_resolve_status_reads_disabled_set_once(tenant_a, monkeypatch):
     with schema_context(tenant_a.schema_name):
         availability.resolve_status("payments")
     assert calls["n"] == 1
+
+
+def test_database_policy_read_failure_disables_optional_apps_but_keeps_control_plane(
+    tenant_a,
+    monkeypatch,
+):
+    """A policy-store outage must fail closed without bricking its repair surface."""
+    from apps.org.models import CenterSettings
+    from core import availability
+
+    def unavailable(*args, **kwargs):
+        del args, kwargs
+        raise DatabaseError("policy store unavailable")
+
+    cache.clear()
+    monkeypatch.setattr(CenterSettings.objects, "filter", unavailable)
+    with schema_context(tenant_a.schema_name):
+        disabled = availability.disabled_apps()
+
+    assert disabled == set(availability.APP_MOUNTS.values()) - availability.PROTECTED_APPS
+    assert availability.PROTECTED_APPS.isdisjoint(disabled)

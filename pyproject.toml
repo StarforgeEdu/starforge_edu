@@ -64,6 +64,7 @@ dev = [
     "pytest-cov>=6.0",
     "pytest-xdist>=3.6",       # TESTING.md §1 parallel test runner
     "pip-audit>=2.10",         # locked-environment vulnerability gate
+    "bandit>=1.9.4",           # static Python security gate (medium/high findings fail CI)
     "factory-boy>=3.3",        # TD-16 / TESTING.md §4 — the factory standard
     "time-machine>=2.16",      # TESTING.md §5 — deterministic time travel
     "pre-commit>=4.0",

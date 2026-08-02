@@ -170,7 +170,7 @@ def test_student_create_rejects_garbage_email(director, tenant_a):
 
 
 # --- read-only impersonation write-deny ------------------------------------
-def test_read_only_session_cannot_logout_or_change_password(tenant_a, user_in, client_for):
+def test_read_only_session_can_end_itself_but_cannot_change_password(tenant_a, user_in, client_for):
     from core.session_auth import create_session
 
     user = user_in(tenant_a, roles=[Role.DIRECTOR])
@@ -179,10 +179,6 @@ def test_read_only_session_cannot_logout_or_change_password(tenant_a, user_in, c
     client = client_for(tenant_a)
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {session.key}")
 
-    logout = client.post("/api/v1/auth/logout/", {}, format="json")
-    assert logout.status_code == 403
-    assert logout.json()["code"] == "read_only_token"
-
     change = client.post(
         "/api/v1/auth/password/change/",
         {"old_password": "x", "new_password": "y"},
@@ -190,6 +186,10 @@ def test_read_only_session_cannot_logout_or_change_password(tenant_a, user_in, c
     )
     assert change.status_code == 403
     assert change.json()["code"] == "read_only_token"
+
+    logout = client.post("/api/v1/auth/logout/", {}, format="json")
+    assert logout.status_code == 200
+    assert logout.json()["success"] is True
 
 
 # --- branch-reassignment scope on update -----------------------------------

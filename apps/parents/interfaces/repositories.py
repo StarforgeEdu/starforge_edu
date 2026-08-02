@@ -13,11 +13,11 @@ from core.interfaces import IBaseRepository
 
 
 class IParentRepository(IBaseRepository[ParentProfile]):
-    def scoped(self, *, user, roles) -> QuerySet[ParentProfile]:
+    def scoped(self, *, user, roles, permission: str) -> QuerySet[ParentProfile]:
         """Parents visible through membership scope or self ownership."""
         raise NotImplementedError
 
-    def get_scoped(self, *, user, roles, pk: int) -> ParentProfile | None:
+    def get_scoped(self, *, user, roles, permission: str, pk: int) -> ParentProfile | None:
         """A single in-scope parent by pk, or None (out-of-scope reads 404, no leak)."""
         raise NotImplementedError
 
@@ -25,26 +25,48 @@ class IParentRepository(IBaseRepository[ParentProfile]):
         """The signed-in user's own parent profile (self-service), or None."""
         raise NotImplementedError
 
-    def students_for(self, parent: ParentProfile, *, user=None, roles=None) -> QuerySet:
+    def students_for(
+        self,
+        parent: ParentProfile,
+        *,
+        user=None,
+        roles=None,
+        permission: str = "parents:read",
+    ) -> QuerySet:
         """The parent's linked students (the sanctioned parents→students link)."""
         raise NotImplementedError
 
-    def all_students_in_scope(self, parent: ParentProfile, *, user, roles) -> bool:
-        """Whether every child linked to the parent is in the caller's scope."""
+    def all_students_in_scope(
+        self,
+        parent: ParentProfile,
+        *,
+        user,
+        roles,
+        permission: str,
+        lock_parent: bool = True,
+    ) -> bool:
+        """Whether the permission covers the parent and every linked child."""
         raise NotImplementedError
 
 
 class IGuardianRepository(IBaseRepository[Guardian]):
-    def scoped(self, *, user, roles) -> QuerySet[Guardian]:
+    def scoped(self, *, user, roles, permission: str) -> QuerySet[Guardian]:
         raise NotImplementedError
 
-    def get_scoped(self, *, user, roles, pk: int) -> Guardian | None:
+    def get_scoped(self, *, user, roles, permission: str, pk: int) -> Guardian | None:
         raise NotImplementedError
 
 
 class IPickupRepository(IBaseRepository[PickupAuthorization]):
-    def scoped(self, *, user, roles) -> QuerySet[PickupAuthorization]:
+    def scoped(self, *, user, roles, permission: str) -> QuerySet[PickupAuthorization]:
         raise NotImplementedError
 
-    def get_scoped(self, *, user, roles, pk: int) -> PickupAuthorization | None:
+    def get_scoped(
+        self,
+        *,
+        user,
+        roles,
+        permission: str,
+        pk: int,
+    ) -> PickupAuthorization | None:
         raise NotImplementedError

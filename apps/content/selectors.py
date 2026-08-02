@@ -6,32 +6,34 @@ from __future__ import annotations
 from django.db.models import Q, QuerySet, Sum
 
 from apps.content.models import ContentLibrary, LessonFile
-from core.permissions import PermissionRoleSet, Role, has_permission_code
-from core.scoping import permission_membership_scope_q
+from core.permissions import (
+    PermissionRoleSet,
+    Role,
+    get_unambiguous_user_authorization_context,
+    has_permission_code,
+)
+from core.scoping import permission_membership_is_unscoped, permission_membership_scope_q
 
 # F4-5 content review/publication. REVIEWER_ROLES are the content staff (vs
 # learners): they may see files still pending dual approval and may download a
 # view-only file. Reach differs by role: a DIRECTOR sees every file tenant-wide;
-# a HEAD_OF_DEPT (manager) stays department-scoped like everywhere else but
-# additionally reaches any file still pending the manager sign-off so they can
-# counter-sign content anywhere — they get NO blanket read of already-published
-# content in libraries outside their scope. A TEACHER/LIBRARIAN sees drafts only
-# within their own library visibility. Everyone else (students, parents,
-# non-academic staff) sees only dual-approved, published files.
+# a HEAD_OF_DEPT (manager) stays department-scoped like everywhere else and
+# never reaches pending files outside the membership granting approval. A
+# TEACHER/LIBRARIAN sees drafts only within their own library visibility.
+# Everyone else sees only dual-approved, published files.
 REVIEWER_ROLES = {Role.DIRECTOR, Role.HEAD_OF_DEPT, Role.TEACHER, Role.LIBRARIAN}
 _MANAGER_APPROVAL_ROLES = {Role.DIRECTOR, Role.HEAD_OF_DEPT}
-_CONTENT_SCOPE_PERMISSIONS = (
-    "content:read",
-    "content:write",
-    "content:approve",
-    "content:publish",
-)
+_CONTENT_MANAGEMENT_PERMISSIONS = ("content:write", "content:approve", "content:publish")
 
 
-def has_global_content_scope(roles: set[str]) -> bool:
-    """Whether the caller holds the protected owner wildcard."""
+def has_global_content_scope(roles: set[str], *, permission: str = "content:read") -> bool:
+    """Whether one organization-wide membership supplies ``permission``."""
     if isinstance(roles, PermissionRoleSet):
-        return has_permission_code(roles, "*:*")
+        return permission_membership_is_unscoped(
+            roles=roles,
+            permission=permission,
+            account_kinds={"staff", "teacher"},
+        )
     return Role.DIRECTOR in roles
 
 
@@ -72,6 +74,7 @@ def _related_cohort_ids(user) -> set[int]:
         Q(memberships__student__user=user, memberships__end_date__isnull=True)
         | Q(
             memberships__student__guardians__parent__user=user,
+            memberships__student__guardians__revoked_at__isnull=True,
             memberships__end_date__isnull=True,
         )
         | Q(pk__in=taught_cohorts(user=user).values("pk"))
@@ -79,38 +82,39 @@ def _related_cohort_ids(user) -> set[int]:
     return set(qs.values_list("id", flat=True))
 
 
-def _visibility_filter(user, roles: set[str], memberships) -> Q:
-    """Q over ContentLibrary matching what `user` may see (TD-13 visibility)."""
+def _visibility_filter(user, roles: set[str], memberships, *, permission: str) -> Q:
+    """Build the library scope for one exact operation.
+
+    Tenant- and role-visible libraries are organization-wide mutation targets.
+    Scoped users may read them when they are in the intended audience, but they
+    cannot modify them by borrowing a branch-level grant.
+    """
+    read = permission == "content:read"
     dept_ids = {m.department_id for m in memberships if m.department_id}
-    cohort_ids = _related_cohort_ids(user)
-    q = Q(visibility=ContentLibrary.Visibility.TENANT)
+    cohort_ids = _related_cohort_ids(user) if read else set()
+    q = Q(visibility=ContentLibrary.Visibility.TENANT) if read else Q(pk__in=[])
     if isinstance(roles, PermissionRoleSet):
-        # The selector backs read, write, and approval endpoints. Their permission
-        # gates choose the operation; this union binds that operation to the exact
-        # membership that supplies it, so a Branch A grant cannot borrow Branch B.
-        department_scope = Q(pk__in=[])
-        cohort_scope = Q(pk__in=[])
-        for permission in _CONTENT_SCOPE_PERMISSIONS:
-            department_scope |= permission_membership_scope_q(
-                roles=roles,
-                permission=permission,
-                branch_field="department__branch_id",
-                department_field="department_id",
-                account_kinds={"staff", "teacher"},
-            )
-            cohort_scope |= permission_membership_scope_q(
-                roles=roles,
-                permission=permission,
-                branch_field="cohort__branch_id",
-                department_field="cohort__department_id",
-                account_kinds={"staff", "teacher"},
-            )
+        department_scope = permission_membership_scope_q(
+            roles=roles,
+            permission=permission,
+            branch_field="department__branch_id",
+            department_field="department_id",
+            account_kinds={"staff", "teacher"},
+        )
+        cohort_scope = permission_membership_scope_q(
+            roles=roles,
+            permission=permission,
+            branch_field="cohort__branch_id",
+            department_field="cohort__department_id",
+            account_kinds={"staff", "teacher"},
+        )
         q |= Q(visibility=ContentLibrary.Visibility.DEPARTMENT) & department_scope
         q |= Q(visibility=ContentLibrary.Visibility.COHORT) & cohort_scope
     else:
         # Direct selector calls/tests may pass a plain role set (legacy contract).
         q |= Q(visibility=ContentLibrary.Visibility.DEPARTMENT, department_id__in=dept_ids)
-    q |= Q(visibility=ContentLibrary.Visibility.COHORT, cohort_id__in=cohort_ids)
+    if read:
+        q |= Q(visibility=ContentLibrary.Visibility.COHORT, cohort_id__in=cohort_ids)
     # A canonical custom STAFF type must not inherit its compatibility SUPPORT
     # scope. Teacher/student/parent are natural identity relationships and retain
     # their legacy role-library visibility during this transition.
@@ -124,12 +128,19 @@ def _visibility_filter(user, roles: set[str], memberships) -> Q:
         visible_roles = {
             natural_role_by_kind[kind] for kind in roles.account_kinds if kind in natural_role_by_kind
         }
-    for role in visible_roles:  # role visibility: allowed_roles JSON contains the role
-        q |= Q(visibility=ContentLibrary.Visibility.ROLE, allowed_roles__contains=role)
+    if read:
+        for role in visible_roles:  # role visibility: allowed_roles JSON contains the role
+            q |= Q(visibility=ContentLibrary.Visibility.ROLE, allowed_roles__contains=role)
     return q
 
 
-def scoped_libraries(*, user, roles: set[str] | None = None, memberships=None) -> QuerySet[ContentLibrary]:
+def scoped_libraries(
+    *,
+    user,
+    roles: set[str] | None = None,
+    memberships=None,
+    permission: str = "content:read",
+) -> QuerySet[ContentLibrary]:
     # select_related the labelled FKs the presenter dereferences (department/cohort
     # names) — no N+1 on the list, and harmless when this qs is used as an `__in=`
     # subquery elsewhere (Django selects only the pk there).
@@ -140,38 +151,75 @@ def scoped_libraries(*, user, roles: set[str] | None = None, memberships=None) -
     qs = ContentLibrary.objects.select_related("department", "cohort")
     if user.is_superuser:
         return qs
-    if memberships is None:
-        memberships = list(user.role_memberships.filter(revoked_at__isnull=True))
     if roles is None:
-        roles = {m.role for m in memberships}
-    if has_global_content_scope(roles):
+        roles, canonical_memberships = get_unambiguous_user_authorization_context(user)
+        if memberships is None:
+            memberships = canonical_memberships
+    elif memberships is None:
+        memberships = list(user.role_memberships.filter(revoked_at__isnull=True))
+    if has_global_content_scope(roles, permission=permission):
         return qs
-    return qs.filter(is_active=True).filter(_visibility_filter(user, roles, memberships)).distinct()
+    if permission == "content:read":
+        qs = qs.filter(is_active=True)
+    return qs.filter(_visibility_filter(user, roles, memberships, permission=permission)).distinct()
 
 
-def scoped_files(*, user, roles: set[str] | None = None, memberships=None) -> QuerySet[LessonFile]:
+def scoped_files(
+    *,
+    user,
+    roles: set[str] | None = None,
+    memberships=None,
+    permission: str = "content:read",
+) -> QuerySet[LessonFile]:
     qs = LessonFile.objects.select_related("lesson", "folder", "uploaded_by")
     if user.is_superuser:
         return qs
-    if memberships is None:
-        memberships = list(user.role_memberships.filter(revoked_at__isnull=True))
     if roles is None:
-        roles = {m.role for m in memberships}
-    if has_global_content_scope(roles):
+        roles, canonical_memberships = get_unambiguous_user_authorization_context(user)
+        if memberships is None:
+            memberships = canonical_memberships
+    elif memberships is None:
+        memberships = list(user.role_memberships.filter(revoked_at__isnull=True))
+    if has_global_content_scope(roles, permission=permission):
         return qs  # protected owner: every file tenant-wide
-    libs = scoped_libraries(user=user, roles=roles, memberships=memberships)
+    libs = scoped_libraries(
+        user=user,
+        roles=roles,
+        memberships=memberships,
+        permission=permission,
+    )
     visible = Q(lesson__module__course__library__in=libs) | Q(folder__library__in=libs)
-    if not isinstance(roles, PermissionRoleSet) and Role.HEAD_OF_DEPT in roles:
-        # Manager: own visibility scope PLUS any file still pending the manager
-        # sign-off (so they can counter-sign content anywhere) — least privilege,
-        # no blanket read of published content outside their scope (F4-5 review).
-        return qs.filter(visible | Q(is_approved_manager=False)).distinct()
+    if permission != "content:read":
+        return qs.filter(visible).distinct()
+    if isinstance(roles, PermissionRoleSet):
+        managed = Q(pk__in=[])
+        for management_permission in _CONTENT_MANAGEMENT_PERMISSIONS:
+            managed_libraries = scoped_libraries(
+                user=user,
+                roles=roles,
+                memberships=memberships,
+                permission=management_permission,
+            )
+            managed |= Q(lesson__module__course__library__in=managed_libraries) | Q(
+                folder__library__in=managed_libraries
+            )
+        published = Q(is_approved_teacher=True, is_approved_manager=True)
+        return qs.filter(visible & (published | managed)).distinct()
     if can_review_content(roles):
         # Canonical reviewer/publisher grants and legacy teacher/librarian roles
         # see drafts only within their exact library scope.
         return qs.filter(visible).distinct()
     # Learners (and any non-reviewer): only dual-approved, published files.
     return qs.filter(visible, is_approved_teacher=True, is_approved_manager=True).distinct()
+
+
+def managed_files(*, user, roles: set[str] | None = None) -> QuerySet[LessonFile]:
+    """Files covered by at least one exact content-management grant."""
+
+    scope = Q(pk__in=[])
+    for permission in _CONTENT_MANAGEMENT_PERMISSIONS:
+        scope |= Q(pk__in=scoped_files(user=user, roles=roles, permission=permission).values("pk"))
+    return LessonFile.objects.filter(scope).distinct()
 
 
 def storage_used_bytes() -> int:

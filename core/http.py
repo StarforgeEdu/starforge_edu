@@ -4,6 +4,7 @@ the way DTOs are built from it. Bad JSON / non-object bodies are a clean 400."""
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -25,6 +26,29 @@ def read_json(request: HttpRequest) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValidationException(_("Request body must be a JSON object."), code="invalid_json")
     return data
+
+
+def reject_unknown_fields(
+    data: dict[str, Any],
+    *,
+    allowed: Collection[str],
+    message: str = "Request contains unsupported fields.",
+) -> None:
+    """Reject JSON keys that are not part of an operation's explicit DTO.
+
+    Silently discarding a misspelled mutation field is dangerous: the caller can
+    receive a successful response even though the requested change never took
+    effect.  Keep this check at the request/DTO boundary so service methods never
+    receive ambiguous input.
+    """
+
+    unknown = sorted(set(data) - set(allowed))
+    if unknown:
+        raise ValidationException(
+            _(message),
+            code="validation_error",
+            fields={field: [_("This field is not supported.")] for field in unknown},
+        )
 
 
 def _bad(name: str, msg: str) -> ValidationException:
@@ -85,9 +109,15 @@ def trimmed_str_field(
 
 
 def int_field(
-    data: dict[str, Any], name: str, *, required: bool = False, default: int | None = None
+    data: dict[str, Any],
+    name: str,
+    *,
+    required: bool = False,
+    default: int | None = None,
+    min_value: int | None = None,
+    max_value: int | None = None,
 ) -> int | None:
-    """An int field (accepts an int or a numeric string). Missing -> default / 400 if required."""
+    """Parse an integer and optionally enforce inclusive bounds."""
     if name not in data or data[name] is None:
         if required:
             raise _bad(name, "This field is required.")
@@ -96,9 +126,14 @@ def int_field(
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise _bad(name, "Must be an integer.")
     try:
-        return int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
         raise _bad(name, "Must be an integer.") from None
+    if min_value is not None and parsed < min_value:
+        raise _bad(name, f"Must be at least {min_value}.")
+    if max_value is not None and parsed > max_value:
+        raise _bad(name, f"Must be at most {max_value}.")
+    return parsed
 
 
 def decimal_field(

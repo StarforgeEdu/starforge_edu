@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from apps.access.models import AccountType
 from apps.teachers.models import PayoutPolicy, TeacherProfile
+from core.permissions import Role
 
 
 def payout_policy_to_dict(policy: PayoutPolicy) -> dict[str, Any]:
@@ -22,17 +24,38 @@ def payout_policy_to_dict(policy: PayoutPolicy) -> dict[str, Any]:
     }
 
 
-def teacher_to_dict(teacher: TeacherProfile) -> dict[str, Any]:
+def teacher_to_dict(
+    teacher: TeacherProfile,
+    *,
+    include_compensation: bool = False,
+) -> dict[str, Any]:
     # Each bare FK id keeps a readable `_name` companion so a client renders the teacher
     # without a second call. `branch`/`department` are select_related on both the list
     # queryset (repository.get_queryset + selectors.list_teachers) and detail path, so
     # these add JOINs, not queries. `branch` is non-null; `department` is nullable.
     from apps.users.presenters import role_membership_to_dict
 
+    # The bridge User can legitimately own staff/student/parent profiles too.
+    # A teacher directory must never expose those unrelated memberships or a
+    # teacher assignment from another branch merely because the bridge id is
+    # shared. The repository prefetch applies the same account-kind boundary;
+    # this projection also protects callers that pass an un-prefetched model.
     memberships = [
-        membership for membership in teacher.user.role_memberships.all() if membership.revoked_at is None
+        membership
+        for membership in teacher.user.role_memberships.all()
+        if membership.revoked_at is None
+        and membership.branch_id == teacher.branch_id
+        and (
+            (
+                membership.account_type_id is not None
+                and (account_type := membership.account_type) is not None
+                and account_type.is_active
+                and account_type.account_kind == AccountType.AccountKind.TEACHER
+            )
+            or (membership.account_type_id is None and membership.role == Role.TEACHER)
+        )
     ]
-    return {
+    payload = {
         "id": teacher.id,
         "username": teacher.username,
         "is_active": teacher.is_active,
@@ -55,9 +78,15 @@ def teacher_to_dict(teacher: TeacherProfile) -> dict[str, Any]:
         "hire_date": teacher.hire_date.isoformat() if teacher.hire_date else None,
         "subjects": teacher.subjects,
         "qualifications": teacher.qualifications,
-        "salary_type": teacher.salary_type,
-        "rate": str(teacher.rate) if teacher.rate is not None else None,
         "is_substitute": teacher.is_substitute,
         "account_type_assignments": [role_membership_to_dict(membership) for membership in memberships],
         "created_at": teacher.created_at.isoformat(),
     }
+    if include_compensation:
+        payload.update(
+            {
+                "salary_type": teacher.salary_type,
+                "rate": str(teacher.rate) if teacher.rate is not None else None,
+            }
+        )
+    return payload

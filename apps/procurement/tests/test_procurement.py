@@ -28,10 +28,19 @@ def _payment_method(tenant) -> int:
         return PaymentMethod.objects.create(name="Cash", slug="cash").id
 
 
-def test_create_po_then_approve_disburse_writes_ledger(tenant_a, as_role):
-    registrar, _ = as_role(Role.REGISTRAR)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def _same_branch_clients(tenant, user_in, as_user, *roles):
+    with schema_context(tenant.schema_name):
+        from apps.org.tests.factories import BranchFactory
+
+        branch = BranchFactory()
+    users = [user_in(tenant, roles=[role], branch=branch) for role in roles]
+    return [(as_user(tenant, user), user) for user in users]
+
+
+def test_create_po_then_approve_disburse_writes_ledger(tenant_a, user_in, as_user):
+    (registrar, _), (director, _), (cashier, _) = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.REGISTRAR, Role.DIRECTOR, Role.CASHIER
+    )
     method_id = _payment_method(tenant_a)
 
     created = registrar.post(
@@ -133,12 +142,12 @@ def test_cannot_raise_po_for_another_branch(tenant_a, as_role):
     assert r.json()["code"] == "branch_out_of_scope"
 
 
-def test_disburse_cannot_override_supplier_or_direction(tenant_a, as_role):
+def test_disburse_cannot_override_supplier_or_direction(tenant_a, user_in, as_user):
     """The ledger row for a PO is pinned to the approved supplier + money-OUT; a
     cashier cannot substitute the payee or flip the sign at disburse time."""
-    registrar, _ = as_role(Role.REGISTRAR)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+    (registrar, _), (director, _), (cashier, _) = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.REGISTRAR, Role.DIRECTOR, Role.CASHIER
+    )
     method_id = _payment_method(tenant_a)
 
     rid = registrar.post(

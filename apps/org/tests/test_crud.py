@@ -132,11 +132,11 @@ def test_department_list_and_detail_branch_scoped(tenant_a, user_in, as_user):
     ids = {d["id"] for d in client.get("/api/v1/org/departments/").json()["data"]}
     assert mine.id in ids
     assert theirs.id not in ids
-    # And a cross-branch detail read is 403 (out of scope), never a leak.
-    assert client.get(f"/api/v1/org/departments/{theirs.id}/").status_code == 403
+    # A cross-branch id is indistinguishable from a nonexistent record.
+    assert client.get(f"/api/v1/org/departments/{theirs.id}/").status_code == 404
 
 
-def test_branch_payload_does_not_embed_cross_branch_departments(tenant_a, user_in, as_user):
+def test_branch_list_does_not_expose_cross_branch_rows_or_departments(tenant_a, user_in, as_user):
     from apps.org.tests.factories import BranchFactory, DepartmentFactory
 
     with schema_context(tenant_a.schema_name):
@@ -146,8 +146,72 @@ def test_branch_payload_does_not_embed_cross_branch_departments(tenant_a, user_i
     client = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=mine))
 
     branches = client.get("/api/v1/org/branches/").json()["data"]
-    other_row = next(row for row in branches if row["id"] == other.id)
-    assert other_row["departments"] == []
+    assert {row["id"] for row in branches} == {mine.id}
+    assert other.id not in {row["id"] for row in branches}
+
+
+def test_head_of_department_org_read_is_exactly_membership_scoped_and_read_only(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.org.tests.factories import BranchFactory, DepartmentFactory, RoomFactory
+
+    with schema_context(tenant_a.schema_name):
+        local_branch = BranchFactory(name="Head's campus")
+        remote_branch = BranchFactory(name="Private campus")
+        local_department = DepartmentFactory(branch=local_branch, name="Head's department")
+        remote_department = DepartmentFactory(branch=remote_branch, name="Private department")
+        local_room = RoomFactory(branch=local_branch, name="Head's room")
+        remote_room = RoomFactory(branch=remote_branch, name="Private room")
+        user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=local_branch)
+
+    client = as_user(tenant_a, user)
+
+    branches = client.get("/api/v1/org/branches/")
+    assert branches.status_code == 200, branches.content
+    assert {row["id"] for row in branches.json()["data"]} == {local_branch.pk}
+
+    departments = client.get("/api/v1/org/departments/")
+    assert departments.status_code == 200, departments.content
+    assert {row["id"] for row in departments.json()["data"]} == {local_department.pk}
+
+    rooms = client.get("/api/v1/org/rooms/")
+    assert rooms.status_code == 200, rooms.content
+    assert {row["id"] for row in rooms.json()["data"]} == {local_room.pk}
+
+    # Out-of-scope records are indistinguishable from absent records. The read
+    # grant never expands into a tenant-wide organization directory.
+    assert client.get(f"/api/v1/org/branches/{remote_branch.pk}/").status_code == 404
+    assert client.get(f"/api/v1/org/departments/{remote_department.pk}/").status_code == 404
+    assert client.get(f"/api/v1/org/rooms/{remote_room.pk}/").status_code == 404
+
+    # The migration supplies only org:read. It neither adds org:write nor lets a
+    # branch-scoped manager mint or mutate organization structure.
+    assert (
+        client.patch(
+            f"/api/v1/org/branches/{local_branch.pk}/",
+            {"name": "Unauthorized rename"},
+            format="json",
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/v1/org/departments/",
+            {"branch": local_branch.pk, "name": "Unauthorized", "slug": "unauthorized"},
+            format="json",
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/v1/org/rooms/",
+            {"branch": local_branch.pk, "name": "Unauthorized"},
+            format="json",
+        ).status_code
+        == 403
+    )
 
 
 def test_transfer_audit_is_scoped_to_permission_membership(tenant_a, user_in, as_user):
@@ -171,17 +235,18 @@ def test_transfer_audit_is_scoped_to_permission_membership(tenant_a, user_in, as
     assert client.get(f"/api/v1/org/transfers/{hidden.id}/").status_code == 404
 
 
-def test_student_transfer_updates_scope_cohorts_and_visible_audit(as_role, tenant_a):
+def test_student_transfer_updates_scope_cohorts_and_visible_audit(tenant_a, client_for):
     from apps.access.models import AccountType
     from apps.cohorts.models import CohortMembership
     from apps.cohorts.tests.factories import CohortFactory
     from apps.org.models import BranchTransfer
+    from apps.org.services import create_staff_account
     from apps.org.tests.factories import BranchFactory
     from apps.students.tests.factories import StudentProfileFactory
     from apps.users.models import RoleMembership
     from apps.users.services import ensure_role_membership
+    from core.session_auth import create_session
 
-    client, actor = as_role(Role.DIRECTOR)
     with schema_context(tenant_a.schema_name):
         source = BranchFactory(name="Source")
         target = BranchFactory(name="Target")
@@ -192,6 +257,19 @@ def test_student_transfer_updates_scope_cohorts_and_visible_audit(as_role, tenan
         CohortMembership.objects.create(cohort=second, student=student, start_date="2026-02-01")
         canonical = ensure_role_membership(student, branch=source, role=Role.STUDENT)
         assert canonical.account_type.account_kind == AccountType.AccountKind.STUDENT
+        actor = create_staff_account(
+            branch=source,
+            role=Role.DIRECTOR,
+            username="scope-transfer-director",
+        )
+        session = create_session(
+            actor.user,
+            principal_kind="staff",
+            principal_id=actor.pk,
+        )
+
+    client = client_for(tenant_a)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {session.key}")
 
     response = client.post(
         "/api/v1/org/transfers/",
@@ -200,10 +278,14 @@ def test_student_transfer_updates_scope_cohorts_and_visible_audit(as_role, tenan
     )
     assert response.status_code == 201, response.content
     payload = response.json()["data"]
-    assert payload["user"] == student.user_id
+    assert payload["student"] == student.pk
+    assert payload["student_public_id"] == student.student_id
+    assert payload["student_attribution_status"] == "resolved"
     assert payload["from_branch"] == source.pk
     assert payload["to_branch"] == target.pk
-    assert payload["actor"] == actor.pk
+    # The bridge User ids remain internal implementation details.
+    assert "user" not in payload
+    assert "actor" not in payload
 
     with schema_context(tenant_a.schema_name):
         student.refresh_from_db()
@@ -271,8 +353,8 @@ def test_student_transfer_requires_write_scope_on_both_branches(
         {"student": student.pk, "to_branch": target.pk, "reason": "not permitted"},
         format="json",
     )
-    assert response.status_code == 403
-    assert response.json()["code"] == "out_of_scope"
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
     with schema_context(tenant_a.schema_name):
         student.refresh_from_db()
         assert student.branch_id == source.pk

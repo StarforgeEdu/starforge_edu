@@ -14,7 +14,11 @@
 
 from __future__ import annotations
 
+import re
+
 from config.celery import app
+
+_STATEMENT_KEY_SUFFIX_RE = re.compile(r"^statement_[1-9][0-9]*_[0-9]{14}_[0-9a-f]{32}\.pdf$")
 
 
 def _active_schemas() -> list[str]:
@@ -30,19 +34,87 @@ def _active_schemas() -> list[str]:
 
 
 @app.task(bind=True, max_retries=3, retry_backoff=True)
-def generate_statement_pdf(self, student_id: int, *, locale: str = "en") -> str | None:
+def generate_statement_pdf(
+    self,
+    student_id: int,
+    *,
+    locale: str = "en",
+    requested_by_id: int,
+) -> str | None:
     """Render + upload one student's statement; cache the task-id -> key map."""
     from django.core.cache import cache
 
-    from apps.finance.services import generate_statement
+    from apps.finance.services import generate_statement_artifact
     from core.utils import current_schema
 
-    key = generate_statement(student_id, locale=locale)
-    cache.set(
-        f"finance:statement:{current_schema()}:{self.request.id}",
-        key,
-        timeout=3600,
+    schema = current_schema()
+    cache_key = f"finance:statement:{schema}:{self.request.id}"
+    cached_key = _trusted_cached_statement(
+        cache.get(cache_key),
+        schema=schema,
+        student_id=student_id,
+        requested_by_id=requested_by_id,
     )
+    if cached_key is not None:
+        return cached_key
+    try:
+        artifact = generate_statement_artifact(
+            student_id,
+            locale=locale,
+            requested_by_id=requested_by_id,
+        )
+        cache.set(
+            cache_key,
+            {
+                "key": artifact.key,
+                "requested_by_id": requested_by_id,
+                "student_id": student_id,
+                "invoice_ids": list(artifact.invoice_ids),
+            },
+            timeout=3600,
+        )
+        return artifact.key
+    except Exception:
+        # Provider/render exceptions can contain filesystem paths, signed URLs,
+        # or document data. Celery/DLQ receives only a stable safe error while
+        # the task's configured retry budget handles transient failures.
+        raise self.retry(exc=RuntimeError("Finance statement generation failed.")) from None
+
+
+def _trusted_cached_statement(
+    value: object,
+    *,
+    schema: str,
+    student_id: int,
+    requested_by_id: int,
+) -> str | None:
+    """Accept only the exact cache record this task writes after upload.
+
+    A late-ack redelivery keeps its Celery task id. Reusing the completed cache
+    record prevents a second expensive render and random-key storage orphan.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    if value.get("student_id") != student_id or value.get("requested_by_id") != requested_by_id:
+        return None
+    invoice_ids = value.get("invoice_ids")
+    if (
+        not isinstance(invoice_ids, list)
+        or len(invoice_ids) > 5_000
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in invoice_ids)
+        or invoice_ids != sorted(set(invoice_ids))
+    ):
+        return None
+    key = value.get("key")
+    if not isinstance(key, str):
+        return None
+    prefix = f"{schema}/documents/"
+    if not key.startswith(prefix) or not _STATEMENT_KEY_SUFFIX_RE.fullmatch(key.removeprefix(prefix)):
+        return None
+    expected_prefix = f"statement_{student_id}_"
+    if not key.removeprefix(prefix).startswith(expected_prefix):
+        return None
     return key
 
 
@@ -78,10 +150,9 @@ def refresh_fx_rates() -> int:
 def refresh_fx_rate_for_schema(self) -> str | None:
     """Cache the per-tenant CBU UZS->USD rate consumed by `issue_invoice`.
 
-    Mock-first (TD-2): with `FINANCE_FX_USE_MOCK` True (default) this writes a
-    deterministic placeholder rate so USD totals are populated in dev/tests. The
-    real branch fetches the CBU JSON feed with `requests` (lazy import) when the
-    flag is off and the source is "cbu". Per-tenant; fan out over active Centers.
+    Development/test may set `FINANCE_FX_USE_MOCK` to write a deterministic
+    placeholder. Production forces it off and fetches the CBU JSON feed when the
+    tenant source is "cbu". Per-tenant; fan out over active Centers.
     """
 
     from django.conf import settings
@@ -94,7 +165,9 @@ def refresh_fx_rate_for_schema(self) -> str | None:
         cs = get_center_settings()
         if (cs.fx_source or "cbu") != "cbu":
             return None
-        use_mock = getattr(settings, "FINANCE_FX_USE_MOCK", True)
+        # This setting is explicit in every environment; never silently fall back
+        # to a fabricated financial rate when configuration drifts.
+        use_mock = settings.FINANCE_FX_USE_MOCK
         rate = _mock_cbu_rate() if use_mock else _live_cbu_rate()
         if rate is not None:
             cache.set(f"finance:fx_rate_usd:{current_schema()}", str(rate), timeout=24 * 3600)
@@ -110,14 +183,24 @@ def _mock_cbu_rate():
 
 
 def _live_cbu_rate():
-    """Fetch the live CBU UZS->USD rate. `requests` is available; import lazily."""
-    from decimal import Decimal
-
+    """Fetch a small strict CBU UZS->USD response without following redirects."""
     import requests
 
-    resp = requests.get("https://cbu.uz/uz/arkhiv-kursov-valyut/json/USD/", timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list) and data:
-        return Decimal(str(data[0]["Rate"]))
-    return None
+    from apps.finance.services import normalize_fx_rate
+    from infrastructure.http_client import request_json_limited
+
+    data = request_json_limited(
+        requests.get,
+        "https://cbu.uz/uz/arkhiv-kursov-valyut/json/USD/",
+        allowed_hosts=("cbu.uz",),
+        timeout=(3.05, 10.0),
+        max_response_bytes=64 * 1024,
+    )
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        row = data[0]
+        if row.get("Ccy") != "USD":
+            raise ValueError("CBU rate response is not the requested USD currency")
+        rate = normalize_fx_rate(row.get("Rate"))
+        if rate is not None:
+            return rate
+    raise ValueError("CBU rate response does not contain a valid USD rate")

@@ -36,7 +36,8 @@ def require_auth(view_func: ViewFunc) -> ViewFunc:
 
     @wraps(view_func)
     def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponseBase:
-        from core.exceptions import AuthenticationException
+        from core.exceptions import AuthenticationException, ServiceUnavailableException
+        from core.rate_config import RateConfigurationError
 
         result = _authenticator.authenticate(request)
         if result is None:
@@ -53,7 +54,16 @@ def require_auth(view_func: ViewFunc) -> ViewFunc:
             from core.ratelimit import check_rate
             from core.utils import current_schema
 
-            limit, window = _parse_rate(getattr(settings, "API_RATELIMIT_USER", "1000/min"))
+            try:
+                limit, window = _parse_rate(
+                    getattr(settings, "API_RATELIMIT_USER", "1000/min"),
+                    setting_name="API_RATELIMIT_USER",
+                )
+            except RateConfigurationError as exc:
+                raise ServiceUnavailableException(
+                    "This operation is temporarily unavailable.",
+                    code="temporarily_unavailable",
+                ) from exc
             check_rate(
                 scope="api_user",
                 key=f"{current_schema()}:{request.user.pk}",

@@ -70,6 +70,13 @@ def payment_read_to_dict(payment: Payment) -> dict:
         "account_ref": payment.account_ref,
         "allocation_status": payment.allocation_status,
         "cashier_shift": payment.cashier_shift_id,
+        "branch_at_payment": payment.branch_at_payment_id,
+        "branch_at_payment_name": (payment.branch_at_payment.name if payment.branch_at_payment else None),
+        "department_at_payment": payment.department_at_payment_id,
+        "department_at_payment_name": (
+            payment.department_at_payment.name if payment.department_at_payment else None
+        ),
+        "attribution_status": payment.attribution_status,
         "payer": payment.payer_id,
         "paid_at": _iso(payment.paid_at),
         "fiscal_receipt": fiscal_receipt_to_dict(receipt) if receipt is not None else None,
@@ -84,10 +91,18 @@ def payment_list_to_dict(payment: Payment) -> dict:
         "id": payment.id,
         "provider": payment.provider,
         "amount_uzs": _money(payment.amount_uzs),
+        "currency": payment.currency,
         "status": payment.status,
         "provider_txn_id": payment.provider_txn_id,
         "account_ref": payment.account_ref,
         "allocation_status": payment.allocation_status,
+        "branch_at_payment": payment.branch_at_payment_id,
+        "branch_at_payment_name": (payment.branch_at_payment.name if payment.branch_at_payment else None),
+        "department_at_payment": payment.department_at_payment_id,
+        "department_at_payment_name": (
+            payment.department_at_payment.name if payment.department_at_payment else None
+        ),
+        "attribution_status": payment.attribution_status,
         "paid_at": _iso(payment.paid_at),
         "created_at": _iso(payment.created_at),
     }

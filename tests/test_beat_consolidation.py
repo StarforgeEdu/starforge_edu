@@ -39,6 +39,9 @@ CANONICAL_BEAT_TASKS: dict[str, str] = {
     "send-lesson-reminders": "celery_tasks.schedule_tasks.send_lesson_reminders",
     "archive-completed-terms": "celery_tasks.schedule_tasks.archive_completed_terms",
     "send-due-soon-reminders": "celery_tasks.assignment_tasks.send_due_soon_reminders",
+    "cleanup-expired-attachment-uploads": (
+        "celery_tasks.attachment_tasks.cleanup_expired_attachment_uploads"
+    ),
     # Day 3
     "late-payment-reminders": "celery_tasks.finance_tasks.late_payment_reminders",
     "refresh-fx-rates": "celery_tasks.finance_tasks.refresh_fx_rates",
@@ -50,6 +53,9 @@ CANONICAL_BEAT_TASKS: dict[str, str] = {
     "dispatch-scheduled-campaigns": "celery_tasks.campaign_tasks.dispatch_scheduled_campaigns",
     "prune-webhook-events": "celery_tasks.payment_tasks.prune_webhook_events",
     "reconcile-fiscal-receipts": "celery_tasks.payment_tasks.reconcile_fiscal_receipts",
+    "reconcile-deferred-notification-deliveries": (
+        "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries"
+    ),
 }
 
 

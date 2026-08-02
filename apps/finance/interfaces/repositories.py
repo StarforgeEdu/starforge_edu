@@ -25,11 +25,22 @@ class IFeeScheduleRepository(ABC):
 
 class IInvoiceRepository(ABC):
     @abstractmethod
-    def scoped(self, *, user, roles: set[str]) -> QuerySet[Invoice]: ...
+    def scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> QuerySet[Invoice]: ...
     @abstractmethod
-    def get_scoped(self, *, pk: int, user, roles: set[str]) -> Invoice | None: ...
-    @abstractmethod
-    def get_by_pk(self, pk: int) -> Invoice | None: ...
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> Invoice | None: ...
 
 
 class IDiscountRepository(ABC):
@@ -56,5 +67,3 @@ class IExpenseRepository(ABC):
 class ICashierShiftRepository(ABC):
     @abstractmethod
     def query(self) -> QuerySet[CashierShift]: ...
-    @abstractmethod
-    def get(self, pk: int) -> CashierShift | None: ...

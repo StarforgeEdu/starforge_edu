@@ -8,6 +8,7 @@ class MessagingConfig(AppConfig):
     verbose_name = "In-app messaging"
 
     def ready(self) -> None:
+        from apps.messaging import receivers  # noqa: F401
         from apps.messaging.interfaces.repositories import IThreadRepository
         from apps.messaging.interfaces.services import IThreadService
         from apps.messaging.repositories.thread_repository import ThreadRepository

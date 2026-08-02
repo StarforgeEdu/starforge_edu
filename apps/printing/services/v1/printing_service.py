@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from django.db.models import QuerySet
 
@@ -18,7 +19,7 @@ from apps.printing.interfaces.services import (
     IPrinterService,
     IPrintJobService,
 )
-from apps.printing.models import BranchAgent, Printer, PrintJob
+from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
 
 
 class PrintJobService(IPrintJobService):
@@ -48,11 +49,65 @@ class PrintJobService(IPrintJobService):
     def claim(self, *, agent: BranchAgent) -> PrintJob | None:
         return domain.claim_job(agent=agent)
 
+    def reject_invalid_claim(self, *, agent: BranchAgent, job_id: int) -> PrintJob:
+        return domain.reject_invalid_claim(agent=agent, job_id=job_id)
+
+    def heartbeat(
+        self,
+        *,
+        agent: BranchAgent,
+        job_id: int,
+        lease_id: UUID,
+        pages_printed: int | None,
+    ) -> PrintJob:
+        return domain.heartbeat_job(
+            agent=agent,
+            job_id=job_id,
+            lease_id=lease_id,
+            pages_printed=pages_printed,
+        )
+
     def update_status(
-        self, *, agent: BranchAgent, job_id: int, status: str, error: str, pages_printed: int | None
+        self,
+        *,
+        agent: BranchAgent,
+        job_id: int,
+        lease_id: UUID,
+        status: str,
+        error: str,
+        pages_printed: int | None,
     ) -> PrintJob:
         return domain.update_job_status(
-            agent=agent, job_id=job_id, status=status, error=error, pages_printed=pages_printed
+            agent=agent,
+            job_id=job_id,
+            lease_id=lease_id,
+            status=status,
+            error=error,
+            pages_printed=pages_printed,
+        )
+
+    def list_reconciliations(self, *, job_id: int) -> QuerySet[PrintJobReconciliation]:
+        return self.repository.list_reconciliations(job_id=job_id)
+
+    def reconcile(
+        self,
+        *,
+        job_id: int,
+        expected_branch_id: int,
+        actor,
+        actor_principal,
+        outcome: str,
+        evidence_reference: str,
+        idempotency_key: str,
+    ) -> PrintJob:
+        return domain.reconcile_print_job(
+            job_id=job_id,
+            expected_branch_id=expected_branch_id,
+            actor=actor,
+            actor_principal=actor_principal,
+            outcome=outcome,
+            evidence_reference=evidence_reference,
+            idempotency_key=idempotency_key,
         )
 
 

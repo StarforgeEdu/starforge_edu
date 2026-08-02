@@ -13,10 +13,23 @@ from apps.assignments.models import Assignment, Submission, SubmissionGrade
 
 class IAssignmentService(ABC):
     @abstractmethod
-    def scoped_list(self, *, user, roles: set[str]) -> QuerySet[Assignment]: ...
+    def scoped_list(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Assignment]: ...
 
     @abstractmethod
-    def get_visible(self, *, user, roles: set[str], pk: int) -> Assignment | None: ...
+    def get_visible(
+        self,
+        *,
+        user,
+        roles: set[str],
+        pk: int,
+        permission: str = "assignments:read",
+    ) -> Assignment | None: ...
 
     @abstractmethod
     def create(self, data: CreateAssignmentDTO, *, creator, user, roles: set[str]) -> Assignment: ...
@@ -27,7 +40,7 @@ class IAssignmentService(ABC):
     ) -> Assignment: ...
 
     @abstractmethod
-    def delete(self, assignment: Assignment) -> None: ...
+    def delete(self, assignment: Assignment, *, user, roles: set[str]) -> None: ...
 
     @abstractmethod
     def publish(self, assignment: Assignment, *, actor) -> Assignment: ...
@@ -36,7 +49,14 @@ class IAssignmentService(ABC):
     def close(self, assignment: Assignment, *, actor) -> Assignment: ...
 
     @abstractmethod
-    def submissions_of(self, assignment: Assignment, *, user, roles: set[str]) -> QuerySet[Submission]: ...
+    def submissions_of(
+        self,
+        assignment: Assignment,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Submission]: ...
 
     @abstractmethod
     def submit(
@@ -45,16 +65,29 @@ class IAssignmentService(ABC):
 
     @abstractmethod
     def upload_url(
-        self, *, filename: str, content_type: str, size_bytes: int, requested_by=None
+        self, *, filename: str, content_type: str, size_bytes: int, requested_by
     ) -> dict[str, Any]: ...
 
 
 class ISubmissionService(ABC):
     @abstractmethod
-    def scoped_list(self, *, user, roles: set[str]) -> QuerySet[Submission]: ...
+    def scoped_list(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Submission]: ...
 
     @abstractmethod
-    def get_visible(self, *, user, roles: set[str], pk: int) -> Submission | None: ...
+    def get_visible(
+        self,
+        *,
+        user,
+        roles: set[str],
+        pk: int,
+        permission: str = "assignments:read",
+    ) -> Submission | None: ...
 
     @abstractmethod
     def grade(
@@ -68,4 +101,10 @@ class ISubmissionService(ABC):
     def check_plagiarism(self, submission: Submission): ...
 
     @abstractmethod
-    def request_ai_feedback(self, submission: Submission, *, requested_by) -> None: ...
+    def request_ai_feedback(
+        self,
+        submission: Submission,
+        *,
+        requested_by,
+        requested_principal=None,
+    ) -> None: ...

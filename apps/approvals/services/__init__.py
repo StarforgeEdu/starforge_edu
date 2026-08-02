@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, NoReturn
 
 from django.db import transaction
 from django.utils import timezone
@@ -89,6 +89,13 @@ def _notify(*, event_type: str, recipient_id: int | None, req: ApprovalRequest) 
 def _disburser_ids(req: ApprovalRequest) -> list[int]:
     """Active users who may disburse — scoped to the request's branch when set."""
     qs = role_memberships_with_permission("approvals:disburse")
+    if req.kind == KIND_SALARY_PREP:
+        # Salary amounts are not an ordinary approval notification.  Require a
+        # compensation-specific disbursement grant at this exact boundary too.
+        compensation_qs = role_memberships_with_permission("compensation:disburse")
+        if req.branch_id:
+            compensation_qs = compensation_qs.filter(branch_id=req.branch_id)
+        qs = qs.filter(user_id__in=compensation_qs.values("user_id"))
     if req.branch_id:
         qs = qs.filter(branch_id=req.branch_id)
     return list(qs.values_list("user_id", flat=True).distinct())
@@ -459,6 +466,246 @@ def _validate_absence_deduction_payload(payload: dict) -> dict:
     return {"student_id": student_id, "attendance_id": attendance_id, "fixed_amount_uzs": str(fv)}
 
 
+_TARGET_BRANCH_KINDS = frozenset(
+    {
+        KIND_DISCOUNT,
+        KIND_FINE,
+        KIND_ABSENCE_DEDUCTION,
+        KIND_PAYMENT_DELAY,
+        KIND_LOAN,
+    }
+)
+
+
+def _target_branch_ids(*, kind: str, payload: dict, for_update: bool = False) -> set[int] | None:
+    """Resolve the current branch ownership of a generic approval target.
+
+    ``None`` means the kind has no structured target. An empty set means the
+    supplied target does not currently resolve. Target rows are locked during a
+    decision/disbursement so a concurrent transfer is serialized before the
+    effect is applied.
+    """
+    if kind not in _TARGET_BRANCH_KINDS:
+        return None
+
+    if kind in (KIND_DISCOUNT, KIND_FINE):
+        from apps.students.models import StudentProfile
+
+        student_id = payload.get("student_id")
+        if not isinstance(student_id, int) or isinstance(student_id, bool):
+            return set()
+        students = StudentProfile.objects.all()
+        if for_update:
+            students = students.select_for_update()
+        branch_id = students.filter(pk=student_id).values_list("branch_id", flat=True).first()
+        return {branch_id} if branch_id is not None else set()
+
+    if kind == KIND_PAYMENT_DELAY:
+        from apps.finance.models import Invoice
+        from apps.students.models import StudentProfile
+
+        invoice_id = payload.get("invoice_id")
+        if not isinstance(invoice_id, int) or isinstance(invoice_id, bool):
+            return set()
+        invoices = Invoice.objects.all()
+        if for_update:
+            invoices = invoices.select_for_update()
+        student_id = invoices.filter(pk=invoice_id).values_list("student_id", flat=True).first()
+        if student_id is None:
+            return set()
+        students = StudentProfile.objects.all()
+        if for_update:
+            students = students.select_for_update()
+        branch_id = students.filter(pk=student_id).values_list("branch_id", flat=True).first()
+        return {branch_id} if branch_id is not None else set()
+
+    if kind == KIND_ABSENCE_DEDUCTION:
+        from apps.attendance.models import AttendanceRecord
+        from apps.cohorts.models import Cohort
+        from apps.schedule.models import Lesson
+        from apps.students.models import StudentProfile
+
+        student_id = payload.get("student_id")
+        attendance_id = payload.get("attendance_id")
+        if (
+            not isinstance(student_id, int)
+            or isinstance(student_id, bool)
+            or not isinstance(attendance_id, int)
+            or isinstance(attendance_id, bool)
+        ):
+            return set()
+
+        students = StudentProfile.objects.all()
+        records = AttendanceRecord.objects.all()
+        lessons = Lesson.objects.all()
+        cohorts = Cohort.objects.all()
+        if for_update:
+            students = students.select_for_update()
+            records = records.select_for_update()
+            lessons = lessons.select_for_update()
+            cohorts = cohorts.select_for_update()
+
+        student_branch_id = students.filter(pk=student_id).values_list("branch_id", flat=True).first()
+        record_target = records.filter(pk=attendance_id).values_list("student_id", "lesson_id").first()
+        if student_branch_id is None or record_target is None:
+            return set()
+        record_student_id, lesson_id = record_target
+        if for_update and record_student_id != student_id:
+            return set()
+        record_student_branch_id = (
+            students.filter(pk=record_student_id).values_list("branch_id", flat=True).first()
+        )
+        cohort_id = lessons.filter(pk=lesson_id).values_list("cohort_id", flat=True).first()
+        cohort_branch_id = (
+            cohorts.filter(pk=cohort_id).values_list("branch_id", flat=True).first()
+            if cohort_id is not None
+            else None
+        )
+        return {
+            branch_id
+            for branch_id in (student_branch_id, record_student_branch_id, cohort_branch_id)
+            if branch_id is not None
+        }
+
+    # Staff loans are branch-specific even when one employee has responsibilities
+    # in several branches. The selected request branch must remain one of the
+    # borrower's current active staff/teacher assignments.
+    from apps.access.models import AccountType
+    from apps.users.models import RoleMembership, User
+    from core.permissions import role_memberships_for_account_kinds
+
+    borrower_id = payload.get("borrower_id")
+    if not isinstance(borrower_id, int) or isinstance(borrower_id, bool):
+        return set()
+    users = User.objects.all()
+    if for_update:
+        users = users.select_for_update()
+    if not users.filter(pk=borrower_id, is_active=True).exists():
+        return set()
+    memberships = role_memberships_for_account_kinds(
+        (AccountType.AccountKind.STAFF, AccountType.AccountKind.TEACHER)
+    ).filter(user_id=borrower_id)
+    if not for_update:
+        return set(memberships.values_list("branch_id", flat=True))
+
+    # Lock the concrete membership rows without carrying the resolver's DISTINCT
+    # into SELECT FOR UPDATE (PostgreSQL forbids FOR UPDATE with DISTINCT). Re-read
+    # active membership ids after waiting so a concurrent revoke/delete wins cleanly.
+    candidate_ids = list(memberships.values_list("pk", flat=True))
+    list(
+        RoleMembership.objects.select_for_update()
+        .filter(pk__in=candidate_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    return set(
+        role_memberships_for_account_kinds((AccountType.AccountKind.STAFF, AccountType.AccountKind.TEACHER))
+        .filter(user_id=borrower_id)
+        .values_list("branch_id", flat=True)
+    )
+
+
+def _not_found_for_target_scope() -> NoReturn:
+    # Keep cross-branch target guesses indistinguishable from missing resources.
+    raise NotFoundException(code="not_found")
+
+
+def _assert_known_target_scope(
+    *,
+    kind: str,
+    payload: dict,
+    branch,
+    allowed_branch_ids: set[int] | None,
+) -> None:
+    """Fail closed on resolvable target guesses before detailed validation."""
+    target_branch_ids = _target_branch_ids(kind=kind, payload=payload)
+    if target_branch_ids is None or not target_branch_ids:
+        return
+    branch_id = getattr(branch, "pk", None)
+    if kind == KIND_LOAN:
+        permitted_targets = (
+            target_branch_ids if allowed_branch_ids is None else target_branch_ids & allowed_branch_ids
+        )
+        if not permitted_targets or (branch_id is not None and branch_id not in permitted_targets):
+            _not_found_for_target_scope()
+        return
+    if len(target_branch_ids) != 1:
+        _not_found_for_target_scope()
+    target_branch_id = next(iter(target_branch_ids))
+    if (allowed_branch_ids is not None and target_branch_id not in allowed_branch_ids) or (
+        branch_id is not None and branch_id != target_branch_id
+    ):
+        _not_found_for_target_scope()
+
+
+def _bind_canonical_branch(
+    *,
+    kind: str,
+    payload: dict,
+    branch,
+    allowed_branch_ids: set[int] | None,
+):
+    """Bind one authoritative request branch and enforce the caller's write scope."""
+    from apps.org.models import Branch
+
+    if allowed_branch_ids is not None and not allowed_branch_ids:
+        _not_found_for_target_scope()
+    branch_id = getattr(branch, "pk", None)
+    if branch_id is not None and (allowed_branch_ids is not None and branch_id not in allowed_branch_ids):
+        _not_found_for_target_scope()
+
+    target_branch_ids = _target_branch_ids(kind=kind, payload=payload)
+    if target_branch_ids is not None:
+        if not target_branch_ids:
+            _not_found_for_target_scope()
+        candidates = target_branch_ids
+        if allowed_branch_ids is not None:
+            candidates &= allowed_branch_ids
+        if branch_id is not None:
+            if branch_id not in candidates:
+                _not_found_for_target_scope()
+            if kind != KIND_LOAN and target_branch_ids != {branch_id}:
+                _not_found_for_target_scope()
+            return branch
+        if len(candidates) != 1:
+            raise ValidationException(
+                _("Choose the branch for this request."),
+                code="validation_error",
+                fields={"branch": [_("This field is required when the target has multiple branches.")]},
+            )
+        branch_id = next(iter(candidates))
+    elif branch_id is None and allowed_branch_ids is not None:
+        if len(allowed_branch_ids) != 1:
+            raise ValidationException(
+                _("Choose the branch for this request."),
+                code="validation_error",
+                fields={"branch": [_("This field is required when you can access multiple branches.")]},
+            )
+        branch_id = next(iter(allowed_branch_ids))
+
+    if branch_id is None:
+        return None
+    resolved = Branch.objects.filter(pk=branch_id).first()
+    if resolved is None:
+        _not_found_for_target_scope()
+    return resolved
+
+
+def _assert_locked_target_still_in_request_branch(req: ApprovalRequest) -> None:
+    """Lock and re-check a request target immediately before its effect."""
+    target_branch_ids = _target_branch_ids(
+        kind=req.kind,
+        payload=dict(req.payload or {}),
+        for_update=True,
+    )
+    if target_branch_ids is None:
+        return
+    if req.branch_id is None or req.branch_id not in target_branch_ids:
+        _not_found_for_target_scope()
+    if req.kind != KIND_LOAN and target_branch_ids != {req.branch_id}:
+        _not_found_for_target_scope()
+
+
 @transaction.atomic
 def create_request(
     *,
@@ -469,13 +716,26 @@ def create_request(
     description: str = "",
     branch=None,
     payload: dict | None = None,
+    allowed_branch_ids: set[int] | None = None,
+    idempotency_key_hash: str | None = None,
+    operation_fingerprint: str = "",
+    domain_dedupe_key: str | None = None,
 ) -> ApprovalRequest:
-    payload = payload or {}
+    payload = {} if payload is None else payload
     # The serializer's JSONField accepts any JSON value (a string/array/number is valid
     # JSON), so a non-object payload would reach a kind validator's .get() and 500 with an
     # AttributeError. Reject a non-object payload here as a clean 400 for every kind.
     if not isinstance(payload, dict):
         raise ValidationException(_("payload must be a JSON object."), code="payload_invalid")
+    # Check resolvable target ownership before returning kind-specific validation
+    # details. This avoids turning another branch's student/invoice/employee ids
+    # into a validation oracle.
+    _assert_known_target_scope(
+        kind=kind,
+        payload=payload,
+        branch=branch,
+        allowed_branch_ids=allowed_branch_ids,
+    )
     if kind == KIND_DISCOUNT:
         # A discount is decision-only (the Discount it grants is the effect, not a
         # cash payout) — it never disburses, so drop any amount the caller passed.
@@ -508,6 +768,12 @@ def create_request(
                 _("A salary request must have a computed amount."), code="salary_amount_required"
             )
         payload = _validate_salary_prep_payload(payload)
+    branch = _bind_canonical_branch(
+        kind=kind,
+        payload=payload,
+        branch=branch,
+        allowed_branch_ids=allowed_branch_ids,
+    )
     return ApprovalRequest.objects.create(
         kind=kind,
         title=title,
@@ -516,6 +782,9 @@ def create_request(
         description=description,
         branch=branch,
         payload=payload,
+        idempotency_key_hash=idempotency_key_hash,
+        operation_fingerprint=operation_fingerprint,
+        domain_dedupe_key=domain_dedupe_key,
     )
 
 
@@ -1027,6 +1296,7 @@ def approve(*, request_id: int, actor=None, note: str = "") -> ApprovalRequest:
         raise UnprocessableEntity(_("Only a pending request can be approved."), code="approval_not_pending")
     _assert_not_self_approval(req, actor)
     _assert_not_beneficiary_self_dealing(req, actor)
+    _assert_locked_target_still_in_request_branch(req)
     req.status = ApprovalRequest.Status.APPROVED
     req.decided_by = actor
     req.decided_at = timezone.now()
@@ -1051,6 +1321,10 @@ def reject(*, request_id: int, actor=None, note: str = "") -> ApprovalRequest:
         raise UnprocessableEntity(
             _("This request can no longer be rejected."), code="approval_not_rejectable"
         )
+    # Rejecting an approved target-bearing request reverses its materialized
+    # effect.  Lock and revalidate the target before any state transition so an
+    # old-branch approver cannot modify a student/invoice after it has moved.
+    _assert_locked_target_still_in_request_branch(req)
     was_approved = req.status == ApprovalRequest.Status.APPROVED
     req.status = ApprovalRequest.Status.REJECTED
     req.decided_by = actor
@@ -1105,6 +1379,7 @@ def disburse(
             _("Only an approved request can be disbursed."), code="approval_not_approved"
         )
     _assert_not_beneficiary_self_dealing(req, actor)
+    _assert_locked_target_still_in_request_branch(req)
     if req.amount_uzs is None:
         raise UnprocessableEntity(_("This request has no amount to disburse."), code="approval_no_amount")
     _assert_separate_disburser(req, actor)

@@ -91,6 +91,30 @@ def test_student_reads_their_own_wallet(tenant_a, user_in, as_user):
     assert body["wallet"]["student"] == s["student"].id
 
 
+def test_get_and_head_never_provision_missing_staff_or_self_wallets(tenant_a, user_in, as_user):
+    """Reads are observational; only a top-up/spend/refund write may provision."""
+    from apps.cards.models import Wallet
+
+    s = _setup(tenant_a, user_in, as_user)
+    staff_url = f"/api/v1/cards/wallets/{s['student'].id}/"
+
+    with schema_context(tenant_a.schema_name):
+        assert Wallet.objects.count() == 0
+
+    staff_get = s["cashier"].get(staff_url)
+    staff_head = s["cashier"].head(staff_url)
+    self_get = s["student_c"].get(ME)
+    self_head = s["student_c"].head(ME)
+
+    for response in (staff_get, staff_head, self_get, self_head):
+        assert response.status_code == 200, response.content
+    for response in (staff_get, self_get):
+        assert response.json()["data"] == {"wallet": None, "transactions": []}
+
+    with schema_context(tenant_a.schema_name):
+        assert Wallet.objects.count() == 0
+
+
 def test_a_student_cannot_read_another_students_wallet(tenant_a, user_in, as_user):
     """A student has no wallet:read, so they can't pull a classmate's wallet by id (the
     /me/ self route is the only one open to them)."""

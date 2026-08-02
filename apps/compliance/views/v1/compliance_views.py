@@ -27,7 +27,7 @@ from core.permissions import get_user_roles, has_permission_code
 from core.responses import created, error, no_content, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_branch_ids,
 )
 
@@ -243,7 +243,10 @@ def penalty_waive_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "penalty:waive")
-    is_director, can_waive, can_write, waive_branch_ids, write_branch_ids = _penalty_scope(request)
+    is_director, can_waive, can_write, waive_branch_ids, write_branch_ids = _penalty_scope(
+        request,
+        visibility_permission="penalty:waive",
+    )
     penalty = _penalty_service().get_visible(
         is_director=is_director,
         user=request.user,
@@ -268,10 +271,14 @@ def penalty_waive_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 # --- helpers ---------------------------------------------------------------
-def _penalty_scope(request: HttpRequest) -> tuple[bool, bool, bool, set[int], set[int]]:
+def _penalty_scope(
+    request: HttpRequest,
+    *,
+    visibility_permission: str = "penalty:read",
+) -> tuple[bool, bool, bool, set[int], set[int]]:
     req: Any = request
     roles = get_user_roles(req)
-    is_director = is_unscoped(req)
+    is_director = is_permission_unscoped(req, permission=visibility_permission)
     can_waive = has_permission_code(roles, "penalty:waive")
     can_write = has_permission_code(roles, "penalty:write")
     waive_branch_ids = permission_membership_branch_ids(roles=roles, permission="penalty:waive")

@@ -23,14 +23,16 @@ from apps.notifications.dto.notification_dto import (
 from apps.notifications.interfaces.services import INotificationService, INotificationTemplateService
 from apps.notifications.models import Channel, EventType, Locale
 from apps.notifications.presenters import notification_to_dict, preference_to_dict, template_to_dict
+from apps.notifications.principals import request_notification_principal
 from core.api_auth import check_perm, deny_read_only_token, require_auth
 from core.container import container
-from core.exceptions import NotFoundException, PermissionException, ValidationException
+from core.exceptions import NotFoundException, ValidationException
 from core.http import bool_field, int_field, read_json, str_field
 from core.listing import apply_filters, cursor_paginate, paginate
+from core.permissions import get_user_roles
 from core.ratelimit import check_rate
 from core.responses import created, error, no_content, paginated, success
-from core.scoping import branch_ids, is_unscoped
+from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 from core.utils import current_schema
 
 _RESOURCE = "notifications"
@@ -51,12 +53,19 @@ def _template_service() -> INotificationTemplateService:
 @csrf_exempt
 @require_auth
 def notifications_collection_view(request: HttpRequest) -> HttpResponse:
+    principal = request_notification_principal(request)
     if request.method in ("GET", "HEAD"):
         # Preserve the old feed filters (filterset_fields=("event_type","read_at")); the
         # cursor paginator owns the ordering, so pass no ordering_fields and keep the
         # queryset ordered (-created_at,-id).
         qs = apply_filters(
-            request, _service().feed(user=request.user), filter_fields=("event_type", "read_at")
+            request,
+            _service().feed(
+                user=request.user,
+                recipient_principal_kind=principal.kind,
+                recipient_principal_id=principal.principal_id,
+            ),
+            filter_fields=("event_type", "read_at"),
         )
         rows, next_link, previous_link = cursor_paginate(request, qs)
         return JsonResponse(
@@ -75,44 +84,83 @@ def notifications_collection_view(request: HttpRequest) -> HttpResponse:
 @csrf_exempt
 @require_auth
 def notification_unread_count_view(request: HttpRequest) -> HttpResponse:
+    principal = request_notification_principal(request)
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
-    return success({"count": _service().unread_count(user=request.user)})
+    return success(
+        {
+            "count": _service().unread_count(
+                user=request.user,
+                recipient_principal_kind=principal.kind,
+                recipient_principal_id=principal.principal_id,
+            )
+        }
+    )
 
 
 @csrf_exempt
 @require_auth
 def notification_read_view(request: HttpRequest, pk: int) -> HttpResponse:
+    principal = request_notification_principal(request)
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     deny_read_only_token(request)  # a read-only impersonation token may not mutate
-    notification = _service().get_own(user=request.user, pk=pk)
+    notification = _service().get_own(
+        user=request.user,
+        recipient_principal_kind=principal.kind,
+        recipient_principal_id=principal.principal_id,
+        pk=pk,
+    )
     if notification is None:  # someone else's pk -> 404 (own-rows read scoping)
         raise NotFoundException(code="not_found")
-    _service().mark_read(user=request.user, notification_id=notification.pk)
+    _service().mark_read(
+        user=request.user,
+        recipient_principal_kind=principal.kind,
+        recipient_principal_id=principal.principal_id,
+        notification_id=notification.pk,
+    )
     return success({"read": True})
 
 
 @csrf_exempt
 @require_auth
 def notification_read_all_view(request: HttpRequest) -> HttpResponse:
+    principal = request_notification_principal(request)
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     deny_read_only_token(request)
-    return success({"updated": _service().mark_all_read(user=request.user)})
+    return success(
+        {
+            "updated": _service().mark_all_read(
+                user=request.user,
+                recipient_principal_kind=principal.kind,
+                recipient_principal_id=principal.principal_id,
+            )
+        }
+    )
 
 
 # --- preferences (own rows; notifications:read) ----------------------------
 @csrf_exempt
 @require_auth
 def preferences_view(request: HttpRequest) -> HttpResponse:
+    principal = request_notification_principal(request)
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:read")
-        prefs = _service().preferences(user=request.user)
+        prefs = _service().preferences(
+            user=request.user,
+            recipient_principal_kind=principal.kind,
+            recipient_principal_id=principal.principal_id,
+        )
         return success([preference_to_dict(p) for p in prefs])
     if request.method == "PUT":
         check_perm(request, f"{_RESOURCE}:read")  # non-SAFE -> also denies a read-only token
-        updated = _service().upsert_preferences(user=request.user, rows=_pref_rows(read_json(request)))
+        updated = _service().upsert_preferences(
+            user=request.user,
+            recipient_principal_kind=principal.kind,
+            recipient_principal_id=principal.principal_id,
+            rows=_pref_rows(read_json(request)),
+        )
         return success([preference_to_dict(p) for p in updated])
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
@@ -174,22 +222,18 @@ def announcement_view(request: HttpRequest) -> HttpResponse:
     # cohort that does not exist.
     from apps.cohorts.models import Cohort
 
-    cohort_branch_id = Cohort.objects.filter(pk=dto.cohort_id).values_list("branch_id", flat=True).first()
+    visible_cohorts = Cohort.objects.filter(pk=dto.cohort_id)
+    if not is_permission_unscoped(request, permission=f"{_RESOURCE}:write"):
+        visible_cohorts = visible_cohorts.filter(
+            branch_id__in=permission_membership_branch_ids(
+                roles=get_user_roles(request),
+                permission=f"{_RESOURCE}:write",
+            )
+        )
+    cohort_branch_id = visible_cohorts.values_list("branch_id", flat=True).first()
     if cohort_branch_id is None:
-        raise ValidationException(
-            "cohort does not exist.",
-            code="validation_error",
-            fields={"cohort": ["Object does not exist."]},
-        )
-    # Object-level scope: an announcement fans out to every member of the target cohort, so a
-    # branch-scoped writer (if a center A-2-grants notifications:write to one, e.g. a registrar)
-    # must not blast ANOTHER branch's cohort. Mirrors the achievements/cards/sales student-write
-    # guards; a no-op for a director/superuser. A non-existent cohort resolves the same 403 as a
-    # foreign one, so it is not a cohort-existence oracle across the branch boundary.
-    if not is_unscoped(request) and cohort_branch_id not in branch_ids(request):
-        raise PermissionException(
-            "You can only announce to a cohort in your own branch.", code="branch_out_of_scope"
-        )
+        # Missing and out-of-scope identifiers are deliberately indistinguishable.
+        raise NotFoundException(code="not_found")
     # Mass messaging is expensive (per-recipient fan-out); cap per (schema, user).
     check_rate(scope="announcement", key=f"{current_schema()}:{actor.pk}", limit=10, window=60)
     result = _service().announce(dto, actor=request.user)

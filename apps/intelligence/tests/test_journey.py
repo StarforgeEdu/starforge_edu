@@ -78,6 +78,116 @@ def test_journey_invoices_are_finance_gated(tenant_a, as_role):
     assert "invoice" not in types  # ...but not the family's billing
 
 
+def test_journey_cannot_borrow_finance_grant_from_another_branch(
+    tenant_a,
+    user_in,
+    client_for,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.users.models import RoleMembership
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
+
+    student_branch = _branch(tenant_a)
+    finance_branch = _branch(tenant_a)
+    student = _student_with_events(tenant_a, student_branch)
+    with schema_context(tenant_a.schema_name):
+        student_reader = AccountType.objects.create(
+            name="Journey reader",
+            slug="journey-reader",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        finance_reader = AccountType.objects.create(
+            name="Remote finance reader",
+            slug="remote-finance-reader",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=student_reader,
+            permission="students:read",
+        )
+        AccountTypePermission.objects.create(
+            account_type=finance_reader,
+            permission="finance:read",
+        )
+        viewer = user_in(tenant_a)
+        staff = ensure_role_principal(viewer, roles=[Role.SUPPORT], branch=student_branch)
+        RoleMembership.objects.create(
+            user=viewer,
+            branch=student_branch,
+            role=student_reader.compatibility_role,
+            account_type=student_reader,
+        )
+        RoleMembership.objects.create(
+            user=viewer,
+            branch=finance_branch,
+            role=finance_reader.compatibility_role,
+            account_type=finance_reader,
+        )
+        viewer.refresh_from_db()
+
+    client = exact_session_client(
+        client_for,
+        tenant_a,
+        viewer,
+        principal_kind="staff",
+        principal_id=staff.pk,
+    )
+    response = client.get(_journey_url(student.pk))
+
+    assert response.status_code == 200
+    assert "invoice" not in {event["type"] for event in response.json()["data"]["events"]}
+
+
+def test_staff_session_on_shared_student_bridge_is_not_treated_as_family(
+    tenant_a,
+    client_for,
+):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.org.models import StaffProfile
+    from apps.users.models import RoleMembership
+    from apps.users.tests.factories import UserFactory
+    from tests.role_principal_helpers import exact_session_client
+
+    branch = _branch(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        shared_user = UserFactory()
+    student = _student_with_events(tenant_a, branch, user=shared_user)
+    with schema_context(tenant_a.schema_name):
+        staff = StaffProfile.objects.create(
+            user=shared_user,
+            username=f"staff-{shared_user.username}",
+            password=shared_user.password,
+        )
+        account_type = AccountType.objects.create(
+            name="Student records only",
+            slug="student-records-only",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.create(
+            account_type=account_type,
+            permission="students:read",
+        )
+        RoleMembership.objects.create(
+            user=shared_user,
+            branch=branch,
+            role=account_type.compatibility_role,
+            account_type=account_type,
+        )
+        shared_user.refresh_from_db()
+
+    client = exact_session_client(
+        client_for,
+        tenant_a,
+        shared_user,
+        principal_kind="staff",
+        principal_id=staff.pk,
+    )
+    response = client.get(_journey_url(student.pk))
+
+    assert response.status_code == 200
+    assert "invoice" not in {event["type"] for event in response.json()["data"]["events"]}
+
+
 def test_student_sees_own_journey_including_invoices(tenant_a, user_in, as_user):
     branch = _branch(tenant_a)
     student_user = user_in(tenant_a, roles=[Role.STUDENT], branch=branch)

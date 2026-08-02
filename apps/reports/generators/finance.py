@@ -15,7 +15,13 @@ from typing import Any
 from django.db.models import Count, Sum
 
 from apps.finance.models import Invoice
-from apps.reports.generators.base import ReportGenerator, is_full_scope, staff_report_scope_q
+from apps.reports.generators.base import (
+    ReportGenerator,
+    assert_report_generation_authorized,
+    is_full_scope,
+    staff_report_scope_q,
+)
+from core.historical_scope import ATTRIBUTED_SCOPE_STATUSES
 
 _ZERO = Decimal("0")
 _OPEN = (Invoice.Status.ISSUED, Invoice.Status.PARTIALLY_PAID, Invoice.Status.OVERDUE)
@@ -40,16 +46,18 @@ class FinanceGenerator(ReportGenerator):
     template_base = "finance"
 
     def collect(self, params: dict[str, Any], *, user, roles: set[str]) -> dict[str, Any]:
-        qs = Invoice.objects.all()
+        assert_report_generation_authorized(report_key=self.key, user=user, roles=roles)
+        qs = Invoice.objects.filter(attribution_status__in=ATTRIBUTED_SCOPE_STATUSES)
         if params.get("branch_id"):
-            qs = qs.filter(student__branch_id=params["branch_id"])
-        if not is_full_scope(user=user, roles=roles):
+            qs = qs.filter(branch_at_issue_id=params["branch_id"])
+        if not is_full_scope(user=user, roles=roles, report_key=self.key):
             qs = qs.filter(
                 staff_report_scope_q(
+                    report_key=self.key,
                     roles=roles,
                     user=user,
-                    branch_field="student__branch_id",
-                    department_field="student__current_cohort__department_id",
+                    branch_field="branch_at_issue_id",
+                    department_field="department_at_issue_id",
                 )
             )
         date_from = _parse_date(params.get("date_from"))

@@ -6,7 +6,7 @@ from typing import Any
 
 from django.db.models import QuerySet
 
-from apps.printing.models import BranchAgent, Printer, PrintJob
+from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
 from core.interfaces import IBaseRepository
 
 
@@ -15,6 +15,9 @@ class IPrintJobRepository(IBaseRepository[PrintJob]):
         raise NotImplementedError
 
     def get(self, *, pk: int) -> PrintJob | None:
+        raise NotImplementedError
+
+    def list_reconciliations(self, *, job_id: int) -> QuerySet[PrintJobReconciliation]:
         raise NotImplementedError
 
 

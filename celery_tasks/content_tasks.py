@@ -9,11 +9,23 @@ from config.celery import app
 
 
 @app.task(bind=True, max_retries=3, retry_backoff=True)
-def validate_uploaded_file(self, file_id: int) -> str:
+def validate_uploaded_file(
+    self,
+    file_id: int,
+    *,
+    requested_by: int | None = None,
+    requested_principal_kind: str | None = None,
+    requested_principal_id: int | None = None,
+) -> str:
     from apps.content.services import validate_uploaded_file as _validate
 
     try:
-        return _validate(file_id)
+        return _validate(
+            file_id,
+            requested_by=requested_by,
+            requested_principal_kind=requested_principal_kind,
+            requested_principal_id=requested_principal_id,
+        )
     except Exception as exc:
         raise self.retry(exc=exc) from exc
 
@@ -32,14 +44,15 @@ def generate_thumbnail(self, file_id: int) -> str | None:
 def delete_content_objects(self, keys: list[str]) -> int:
     """Idempotently delete tenant-owned objects after their DB rows commit."""
 
+    from apps.content.storage_keys import parse_content_key
     from core.utils import current_schema
     from infrastructure.storage.s3_client import delete_object
 
-    prefix = f"{current_schema()}/"
+    schema = current_schema()
     safe_keys: set[str] = set()
     for key in keys:
-        if not isinstance(key, str) or not key.startswith(prefix):
-            raise ValueError("Refusing to delete an object outside the active tenant prefix")
+        if parse_content_key(key, schema=schema) is None:
+            raise ValueError("Refusing to delete an object outside the content key grammar")
         safe_keys.add(key)
 
     try:

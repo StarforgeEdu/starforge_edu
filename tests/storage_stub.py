@@ -36,10 +36,24 @@ class InMemoryS3:
         self.objects[key] = data
 
     # --- helper-shaped methods (match s3_client signatures) ----------------
-    def presign_upload(self, key, *, expires_in=600, content_type="application/octet-stream"):
+    def presign_upload(
+        self,
+        key,
+        *,
+        expires_in=600,
+        content_type="application/octet-stream",
+        size_bytes=None,
+    ):
         return f"memory://put/{key}"
 
-    def presign_download(self, key, *, expires_in=600):
+    def presign_download(
+        self,
+        key,
+        *,
+        expires_in=600,
+        download_filename=None,
+        response_content_type=None,
+    ):
         return f"memory://get/{key}"
 
     def upload_bytes(self, key, data, *, content_type="application/octet-stream"):
@@ -57,8 +71,13 @@ class InMemoryS3:
             raise FileNotFoundError(key)
         return self.objects[key][start : end + 1]
 
-    def download_bytes(self, key):
-        return self.objects[key]
+    def download_bytes(self, key, *, max_bytes=None):
+        data = self.objects[key]
+        if max_bytes is not None and len(data) > max_bytes:
+            from infrastructure.storage.s3_client import StorageObjectTooLarge
+
+            raise StorageObjectTooLarge("Storage object exceeds the permitted size")
+        return data
 
     def copy_object(self, *, src_key, dest_key):
         self.objects[dest_key] = self.objects[src_key]

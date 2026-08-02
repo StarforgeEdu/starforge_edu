@@ -23,7 +23,7 @@ from apps.auth.dto.auth_dto import (
 )
 from apps.auth.interfaces.auth_service import IAuthService
 from apps.auth.interfaces.repositories import ISessionRepository, IUserRepository
-from apps.users.models import Device, User
+from apps.users.models import Device, Session, User
 from core.exceptions import AuthenticationException, ValidationException
 
 
@@ -33,10 +33,16 @@ class AuthService(IAuthService):
         self._sessions = sessions
 
     def login(self, credentials: LoginDTO, ctx: SessionContextDTO) -> dict[str, str]:
+        from django_tenants.utils import get_public_schema_name
+
         from apps.auth.services import _dummy_hash, _fire_login_failed
         from apps.auth.signals import login_succeeded
         from apps.users.services import register_device
+        from core.exceptions import NotFoundException
         from core.utils import current_schema
+
+        if current_schema() != get_public_schema_name():
+            raise NotFoundException(code="not_found")
 
         username = credentials.username.strip()
         user = self._users.get_by_username(username)
@@ -46,7 +52,11 @@ class AuthService(IAuthService):
             check_password(credentials.password, _dummy_hash())
             _fire_login_failed(username, ctx.ip, ctx.user_agent, reason="unknown_username")
             raise AuthenticationException(_("Invalid username or password."), code="invalid_credentials")
-        if not user.check_password(credentials.password) or not user.is_active:
+        if (
+            not user.check_password(credentials.password)
+            or not user.is_active
+            or not (user.is_staff or user.is_superuser)
+        ):
             reason = "wrong_password" if user.is_active else "inactive_user"
             _fire_login_failed(username, ctx.ip, ctx.user_agent, reason=reason)
             raise AuthenticationException(_("Invalid username or password."), code="invalid_credentials")
@@ -95,9 +105,21 @@ class AuthService(IAuthService):
             platform=credentials.platform,
         )
 
-    def logout(self, user: User) -> None:
-        # Revoke the signed iCal credential (token_version) together with every
-        # opaque session, using the domain's single logout path.
+    def logout(self, session: Session) -> None:
+        """Revoke only the credential used by this request."""
+
+        if not self._sessions.revoke(session.pk):
+            return
+        from apps.audit.services import audit_log
+
+        audit_log(
+            actor=session.user,
+            action="logout",
+            resource_type="users.Session",
+            resource_id=str(session.pk),
+        )
+
+    def logout_all(self, user: User) -> None:
         from apps.auth.services import logout_everywhere
 
         logout_everywhere(user)
@@ -125,7 +147,11 @@ class AuthService(IAuthService):
             if account is None:
                 raise AuthenticationException(_("Invalid account session."), code="authentication_failed")
             if not account.check_password(data.old_password):
-                raise ValidationException(_("Current password is incorrect."), code="wrong_password")
+                raise ValidationException(
+                    _("The current password is incorrect."),
+                    code="wrong_password",
+                    fields={"old_password": [_("The current password is incorrect.")]},
+                )
             _validate_new_password(data.new_password, account)
             set_role_account_password(account, data.new_password, must_change=False)
             session = self._sessions.create_for(
@@ -139,7 +165,11 @@ class AuthService(IAuthService):
             return {"access": session.key}
 
         if not user.check_password(data.old_password):
-            raise ValidationException(_("Current password is incorrect."), code="wrong_password")
+            raise ValidationException(
+                _("The current password is incorrect."),
+                code="wrong_password",
+                fields={"old_password": [_("The current password is incorrect.")]},
+            )
         _validate_new_password(data.new_password, user)
         current_device = None
         if device_id:

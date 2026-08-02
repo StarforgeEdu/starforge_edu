@@ -34,17 +34,44 @@ class IFinanceService(ABC):
 
     # --- invoices ---
     @abstractmethod
-    def invoices(self, *, user, roles: set[str]) -> QuerySet[Invoice]: ...
+    def invoices(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> QuerySet[Invoice]: ...
     @abstractmethod
-    def invoice(self, *, pk: int, user, roles: set[str]) -> Invoice | None: ...
+    def invoice(
+        self,
+        *,
+        pk: int,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> Invoice | None: ...
     @abstractmethod
     def issue_invoice(
-        self, *, student_id: int, fee_schedule_id, lines, period: str, created_by
+        self,
+        *,
+        student_id: int,
+        fee_schedule_id,
+        lines,
+        period: str,
+        created_by,
+        allowed_scope_pairs: set[tuple[int, int | None]] | None = None,
     ) -> Invoice: ...
     @abstractmethod
     def void_invoice(self, *, invoice: Invoice, actor) -> Invoice: ...
     @abstractmethod
-    def reload_invoice(self, *, pk: int, user, roles: set[str]) -> Invoice | None: ...
+    def reload_invoice(
+        self,
+        *,
+        pk: int,
+        user,
+        roles: set[str],
+        permission: str = "finance:read",
+    ) -> Invoice | None: ...
     @abstractmethod
     def create_payment_plan(
         self, *, invoice: Invoice, installments: list[dict], created_by
@@ -99,8 +126,6 @@ class IFinanceService(ABC):
     # --- cashier shifts ---
     @abstractmethod
     def cashier_shifts(self) -> QuerySet[CashierShift]: ...
-    @abstractmethod
-    def cashier_shift(self, pk: int) -> CashierShift | None: ...
     @abstractmethod
     def open_cashier_shift(self, *, cashier, branch, opening_cash_uzs, notes: str) -> CashierShift: ...
     @abstractmethod

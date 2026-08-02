@@ -126,8 +126,17 @@ def test_cross_branch_group_create_blocked(tenant_a, user_in, as_user):
     teacher_a = _teacher_in_branch(tenant_a, user_in, as_user, branch_a)
     # a teacher can't pin a group achievement to another branch's cohort
     r = teacher_a.post(ACH, {"name": "x", "scope": "group", "cohort": cohort_b.id}, format="json")
-    assert r.status_code == 403
-    assert r.json()["code"] == "cross_branch"
+    assert r.status_code == 400
+    assert r.json()["code"] == "validation_error"
+    assert r.json()["errors"] == {"cohort": ["Not found."]}
+
+    missing = teacher_a.post(
+        ACH,
+        {"name": "Invisible group", "scope": "group", "cohort": 2_147_483_647},
+        format="json",
+    )
+    assert missing.status_code == 400
+    assert missing.json()["errors"] == {"cohort": ["Not found."]}
 
 
 def test_grants_list_is_query_bounded(tenant_a, as_role, django_assert_max_num_queries):
@@ -151,8 +160,8 @@ def test_grants_list_is_query_bounded(tenant_a, as_role, django_assert_max_num_q
 
 def test_cross_branch_global_grant_blocked(tenant_a, user_in, as_user, as_role):
     """R2-07: a branch-scoped teacher must not grant a GLOBAL achievement to another
-    branch's student (cross-branch write + student-pk oracle). The recipient is
-    resolved unscoped, so the view must branch-check it like sales/cards/compliance."""
+    branch's student. Existing foreign and unknown ids must be indistinguishable
+    so the endpoint cannot serve as a student primary-key oracle."""
     from apps.org.tests.factories import BranchFactory
     from apps.students.tests.factories import StudentProfileFactory
 
@@ -165,8 +174,16 @@ def test_cross_branch_global_grant_blocked(tenant_a, user_in, as_user, as_role):
     aid = director.post(ACH, {"name": "School Star", "scope": "global"}, format="json").json()["data"]["id"]
     teacher_a = _teacher_in_branch(tenant_a, user_in, as_user, branch_a)
     r = teacher_a.post(f"{ACH}{aid}/grant/", {"student": student_b.id}, format="json")
-    assert r.status_code == 403, r.content
-    assert r.json()["code"] == "branch_out_of_scope"
+    assert r.status_code == 404, r.content
+    assert r.json()["code"] == "not_found"
+
+    missing = teacher_a.post(
+        f"{ACH}{aid}/grant/",
+        {"student": 2_147_483_647},
+        format="json",
+    )
+    assert missing.status_code == 404, missing.content
+    assert missing.json()["code"] == "not_found"
 
 
 def test_grant_guards(tenant_a, user_in, as_user, as_role):

@@ -248,7 +248,14 @@ class Session(models.Model):
 
     @property
     def is_active(self) -> bool:
-        return self.revoked_at is None and self.expires_at > timezone.now()
+        from core.session_auth import session_idle_timeout
+
+        now = timezone.now()
+        return (
+            self.revoked_at is None
+            and self.expires_at > now
+            and self.last_used_at + session_idle_timeout() > now
+        )
 
 
 class RoleMembership(models.Model):

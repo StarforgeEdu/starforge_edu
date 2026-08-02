@@ -73,6 +73,7 @@ def seed_open_invoice(
     *,
     number: str = "INV-2026-000001",
     amount_uzs: str = "150000.00",
+    branch=None,
 ):
     """Create an issued invoice the webhook account can resolve to.
 
@@ -83,9 +84,10 @@ def seed_open_invoice(
     from apps.finance.models import Invoice
     from apps.org.tests.factories import BranchFactory
     from apps.students.tests.factories import StudentProfileFactory
+    from core.historical_scope import ScopeAttributionStatus
 
     with schema_context(center.schema_name):
-        branch = BranchFactory()
+        branch = branch or BranchFactory()
         cohort = CohortFactory(branch=branch)
         student = StudentProfileFactory(branch=branch)
         CohortMembershipFactory(cohort=cohort, student=student)
@@ -95,6 +97,9 @@ def seed_open_invoice(
             number=number,
             student=student,
             cohort=cohort,
+            branch_at_issue=branch,
+            department_at_issue=cohort.department,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
             status="issued",
             issue_date=date(2026, 6, 1),
             due_date=date(2026, 6, 30),

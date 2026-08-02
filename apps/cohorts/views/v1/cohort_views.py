@@ -39,7 +39,7 @@ from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
 from core.scoping import (
     assert_permission_membership_scope,
-    is_unscoped,
+    is_permission_unscoped,
     permission_membership_scope_q,
 )
 
@@ -290,7 +290,11 @@ def cohort_unarchive_view(request: HttpRequest, pk: int) -> HttpResponse:
 # --- helpers ---------------------------------------------------------------
 def _list(request: HttpRequest) -> HttpResponse:
     qs = _service().list()
-    if not is_unscoped(request):
+    if not is_permission_unscoped(
+        request,
+        permission=f"{_RESOURCE}:read",
+        account_kinds={"staff", "teacher"},
+    ):
         qs = qs.filter(
             permission_membership_scope_q(
                 roles=get_user_roles(request),

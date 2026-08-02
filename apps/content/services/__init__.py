@@ -11,16 +11,28 @@ from __future__ import annotations
 
 import io
 import uuid
+import warnings
 from pathlib import PurePosixPath
 
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
+from django.utils.html import escape
 from django.utils.translation import gettext_lazy as _
 
 from apps.content.models import FileView, LessonFile, LibraryMaterial
 from apps.content.selectors import can_publish_content
 from apps.content.signals import file_upload_confirmed
+from apps.content.storage_keys import (
+    is_safe_storage_filename,
+    pending_key,
+    primary_key,
+    thumbnail_key,
+    trusted_pending_key,
+    trusted_primary_key,
+    trusted_thumbnail_key,
+)
+from apps.org.models import CenterSettings
 from apps.org.selectors import get_center_settings
 from core.exceptions import (
     ConflictException,
@@ -54,6 +66,7 @@ _EXT_MIME: dict[str, set[str]] = {
 }
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 _THUMB_MAX_EDGE = 320
+_IMAGE_MAX_PIXELS = 25_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -71,16 +84,27 @@ def _safe_basename(filename: str) -> str:
     and, via _filename_of, into the later final_key.
     """
     name = PurePosixPath((filename or "").replace("\\", "/")).name
-    if not name or name in {".", ".."}:
+    if not is_safe_storage_filename(name):
         raise UnprocessableEntity(
             _("That filename is not allowed."),
             code="invalid_filename",
-            fields={"filename": ["Filename must be a non-empty basename."]},
+            fields={
+                "filename": [
+                    "Filename must be a non-empty ASCII basename containing only letters, "
+                    "digits, dots, underscores, or hyphens."
+                ]
+            },
         )
     return name
 
 
 def _validate_upload_inputs(*, filename: str, content_type: str, size_bytes: int, settings) -> None:
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 1:
+        raise UnprocessableEntity(
+            _("The file size is invalid."),
+            code="invalid_file_size",
+            fields={"size_bytes": ["File size must be a positive integer."]},
+        )
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in {e.lower() for e in settings.allowed_file_types}:
         raise UnprocessableEntity(
@@ -127,9 +151,15 @@ def request_upload(
     )
     if lesson is None and folder is None and previous is not None:
         lesson, folder = previous.lesson, previous.folder
+    if (lesson is None) == (folder is None):
+        raise UnprocessableEntity(
+            _("Choose exactly one content location."),
+            code="invalid_file_location",
+            fields={"lesson": ["Choose either a lesson or a folder, but not both."]},
+        )
 
     schema = current_schema()
-    s3_key = f"{schema}/tmp/{uuid.uuid4().hex}/{filename}"
+    s3_key = pending_key(schema=schema, upload_id=uuid.uuid4().hex, filename=filename)
     lesson_file = LessonFile.objects.create(
         lesson=lesson,
         folder=folder,
@@ -143,36 +173,57 @@ def request_upload(
         uploaded_by=user,
     )
     expires_in = 600
-    url = presign_upload(s3_key, expires_in=expires_in, content_type=content_type)
+    url = presign_upload(
+        s3_key,
+        expires_in=expires_in,
+        content_type=content_type,
+        size_bytes=size_bytes,
+    )
     return {"file": lesson_file, "url": url, "key": s3_key, "expires_in": expires_in}
 
 
 @transaction.atomic
-def confirm_upload(*, file: LessonFile) -> LessonFile:
+def confirm_upload(*, file: LessonFile, requested_by=None, requested_principal=None) -> LessonFile:
     """Mark a pending upload ready and enqueue async validation. 409 if not
-    pending. No S3 call here — just enqueue. Emits ``file_upload_confirmed`` on
-    commit (D4-A AI content summary consumes it)."""
+    pending. No S3 call here — just enqueue. The content-summary signal is sent
+    only after validation commits a CLEAN file, so rejected/missing objects do
+    not consume AI budget."""
     if file.status != LessonFile.Status.PENDING:
         raise ConflictException(_("This file has already been processed."), code="file_not_pending")
     schema = current_schema()
     file_id = file.pk
-    requested_by = file.uploaded_by_id
-    transaction.on_commit(lambda: _enqueue_validate(file_id, schema))
+    requested_by_id = getattr(requested_by, "pk", None)
+    principal_kind = getattr(requested_principal, "kind", None)
+    principal_id = getattr(requested_principal, "principal_id", None)
     transaction.on_commit(
-        lambda: file_upload_confirmed.send(
-            sender=LessonFile,
-            file_id=file_id,
-            requested_by=requested_by,
-            schema_name=schema,
+        lambda: _enqueue_validate(
+            file_id,
+            schema,
+            requested_by_id=requested_by_id,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
         )
     )
     return file
 
 
-def _enqueue_validate(file_id: int, schema: str) -> None:
+def _enqueue_validate(
+    file_id: int,
+    schema: str,
+    *,
+    requested_by_id: int | None = None,
+    principal_kind: str | None = None,
+    principal_id: int | None = None,
+) -> None:
     from celery_tasks.content_tasks import validate_uploaded_file
 
-    validate_uploaded_file.delay(file_id, _schema_name=schema)
+    validate_uploaded_file.delay(
+        file_id,
+        requested_by=requested_by_id,
+        requested_principal_kind=principal_kind,
+        requested_principal_id=principal_id,
+        _schema_name=schema,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,18 +258,35 @@ def _sniff_matches(*, sniffed: str, declared: str, ext: str) -> bool:
     return sniffed.split("/")[0] == declared.split("/")[0]
 
 
-def validate_uploaded_file(file_id: int) -> str:
-    """Task body: sniff the uploaded object, reject on mismatch/oversize, else
-    move tmp→content and mark clean (enqueuing a thumbnail for images).
-    Idempotent: a non-pending file short-circuits. Runs under the tenant schema."""
-    file = LessonFile.objects.get(pk=file_id)
-    if file.status != LessonFile.Status.PENDING:
-        return file.status
+def _bounded_image_payload(key: str, *, max_bytes: int) -> bytes:
+    """Download and structurally verify an image within byte and pixel bounds."""
 
+    from PIL import Image, UnidentifiedImageError
+
+    raw = download_bytes(key, max_bytes=max_bytes)
     try:
-        head = head_object(file.s3_key)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as image:
+                width, height = image.size
+                if width < 1 or height < 1 or width * height > _IMAGE_MAX_PIXELS:
+                    raise ValueError("Image dimensions exceed the permitted limit")
+                image.verify()
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+    ) as exc:
+        raise ValueError("Image payload is invalid or exceeds the permitted dimensions") from exc
+    return raw
+
+
+def _head_or_none(key: str) -> dict | None:
+    try:
+        return head_object(key)
     except FileNotFoundError:
-        return _reject(file, "Uploaded object was not found.")
+        return None
     except Exception as exc:
         # S3 reports a missing key as ClientError; transient/network errors must
         # still bubble so Celery retries instead of permanently rejecting a file.
@@ -229,51 +297,139 @@ def validate_uploaded_file(file_id: int) -> str:
             "NoSuchKey",
             "NotFound",
         }:
-            return _reject(file, "Uploaded object was not found.")
+            return None
         raise
-    actual_size = int(head.get("ContentLength", file.size_bytes))
-    settings = get_center_settings()
-    if actual_size > settings.max_upload_mb * 1024 * 1024:
-        return _reject(file, "Uploaded object exceeds the size limit.")
-    file.size_bytes = actual_size
 
-    # Re-validate the quota at the authoritative chokepoint: `file` is still
-    # PENDING so storage_used_bytes() (CLEAN only) excludes it, making
-    # `current_clean + actual_size` the correct prospective total. This closes
-    # the sequential-batch / concurrent bypass that request_upload alone misses.
+
+@transaction.atomic
+def validate_uploaded_file(
+    file_id: int,
+    *,
+    requested_by: int | None = None,
+    requested_principal_kind: str | None = None,
+    requested_principal_id: int | None = None,
+) -> str:
+    """Task body: sniff the uploaded object, reject on mismatch/oversize, else
+    move tmp→content and mark clean (enqueuing a thumbnail for images).
+    Idempotent: a non-pending file short-circuits. Runs under the tenant schema."""
+    file = LessonFile.objects.select_for_update().get(pk=file_id)
+    if file.status != LessonFile.Status.PENDING:
+        return file.status
+
+    schema = current_schema()
+    source_key = trusted_pending_key(file.s3_key, schema=schema)
+    if source_key is None:
+        return _reject(file, "The upload storage reference is invalid.", delete_source=False)
+    filename = _filename_of(source_key)
+    final_key = primary_key(schema=schema, file_id=file.pk, filename=filename)
+
+    # A previous attempt may have copied and deleted the tmp object immediately
+    # before its DB transaction failed.  The deterministic record-bound final
+    # path lets the retry recover without rejecting a valid upload.
+    head = _head_or_none(source_key)
+    already_copied = False
+    if head is None:
+        head = _head_or_none(final_key)
+        if head is None:
+            return _reject(file, "Uploaded object was not found.")
+        already_copied = True
+    initial_size = int(head.get("ContentLength", file.size_bytes))
+    settings = get_center_settings()
+    max_upload_bytes = settings.max_upload_mb * 1024 * 1024
+    if initial_size < 1:
+        return _reject(file, "Uploaded object is empty.")
+    if initial_size > max_upload_bytes:
+        return _reject(file, "Uploaded object exceeds the size limit.")
+
+    # Serialize quota admission on the tenant singleton before the final copy.
+    # Without this lock, two validation workers can each observe capacity and
+    # jointly exceed it.
+    if settings.storage_quota_gb is not None:
+        settings = CenterSettings.objects.select_for_update().get(pk=settings.pk)
+
+    if not already_copied:
+        initial_sniff = _sniff_mime(get_object_range(source_key, start=0, end=8191))
+        if not _sniff_matches(
+            sniffed=initial_sniff,
+            declared=file.content_type,
+            ext=_ext_of(filename),
+        ):
+            return _reject(file, "Uploaded content does not match its declared file type.")
+        copy_object(src_key=source_key, dest_key=final_key)
+
+    # Validate the immutable, record-bound destination, not merely the tmp
+    # object observed before copy. A still-valid upload URL can race metadata
+    # inspection; rechecking the destination prevents a swapped payload from
+    # becoming downloadable.
+    final_head = _head_or_none(final_key)
+    if final_head is None:
+        raise RuntimeError("Content copy completed without a readable destination object")
+    actual_size = int(final_head.get("ContentLength", initial_size))
+    if actual_size < 1 or actual_size > max_upload_bytes:
+        delete_object(final_key)
+        reason = "Uploaded object is empty." if actual_size < 1 else "Uploaded object exceeds the size limit."
+        return _reject(file, reason)
+
+    sniffed = _sniff_mime(get_object_range(final_key, start=0, end=8191))
+    if not _sniff_matches(sniffed=sniffed, declared=file.content_type, ext=_ext_of(filename)):
+        delete_object(final_key)
+        return _reject(file, "Uploaded content does not match its declared file type.")
+
+    if file.content_type in _IMAGE_TYPES:
+        try:
+            _bounded_image_payload(final_key, max_bytes=max_upload_bytes)
+        except ValueError:
+            delete_object(final_key)
+            return _reject(file, "Uploaded image is invalid or exceeds the dimension limit.")
+
+    # `file` is still PENDING so storage_used_bytes() (CLEAN only) excludes it,
+    # making current_clean + actual_size the authoritative prospective total.
     if settings.storage_quota_gb is not None:
         from apps.content.selectors import storage_used_bytes
 
         quota_bytes = settings.storage_quota_gb * 1024 * 1024 * 1024
         if storage_used_bytes() + actual_size > quota_bytes:
+            delete_object(final_key)
             return _reject(file, "Uploaded object would exceed the storage quota.")
 
-    filename = _filename_of(file.s3_key)
-    sniffed = _sniff_mime(get_object_range(file.s3_key, start=0, end=8191))
-    if not _sniff_matches(sniffed=sniffed, declared=file.content_type, ext=_ext_of(filename)):
-        return _reject(file, f"Content sniff '{sniffed}' does not match declared '{file.content_type}'.")
-
-    final_key = f"{current_schema()}/content/{file.pk}/{filename}"
-    copy_object(src_key=file.s3_key, dest_key=final_key)
-    delete_object(file.s3_key)
-
     file.s3_key = final_key
+    file.size_bytes = actual_size
     file.status = LessonFile.Status.CLEAN
     file.save(update_fields=["s3_key", "size_bytes", "status", "updated_at"])
+    if not already_copied:
+        # Deletion is deliberately after the durable row update. If this call
+        # fails the transaction rolls back and a retry can use the tmp object;
+        # if a commit later fails, the deterministic final object is recoverable.
+        delete_object(source_key)
 
     if file.content_type in _IMAGE_TYPES:
-        schema = current_schema()
         transaction.on_commit(lambda: _enqueue_thumbnail(file.pk, schema))
+    # HTTP confirmation supplies the exact session principal. Compatibility
+    # callers may omit it; in that case the AI layer still resolves the uploader
+    # only when the bridge identity is unambiguous and otherwise fails closed.
+    requested_by = requested_by or file.uploaded_by_id
+    transaction.on_commit(
+        lambda: file_upload_confirmed.send(
+            sender=LessonFile,
+            file_id=file.pk,
+            requested_by=requested_by,
+            requested_principal_kind=requested_principal_kind,
+            requested_principal_id=requested_principal_id,
+            schema_name=schema,
+        )
+    )
     return file.status
 
 
-def _reject(file: LessonFile, reason: str) -> str:
+def _reject(file: LessonFile, reason: str, *, delete_source: bool = True) -> str:
     file.status = LessonFile.Status.REJECTED
     file.reject_reason = reason[:255]
     file.save(update_fields=["status", "reject_reason", "size_bytes", "updated_at"])
     # Mirror the happy path: drop the orphaned tmp object so rejected blobs do
     # not accumulate in the shared bucket (the lifecycle rule is a placeholder).
-    delete_object(file.s3_key)
+    source_key = trusted_pending_key(file.s3_key, schema=current_schema())
+    if delete_source and source_key:
+        delete_object(source_key)
     return file.status
 
 
@@ -291,16 +447,27 @@ def generate_thumbnail(file_id: int) -> str | None:
     file = LessonFile.objects.get(pk=file_id)
     if file.status != LessonFile.Status.CLEAN or file.content_type not in _IMAGE_TYPES:
         return None
+    schema = current_schema()
+    primary = trusted_primary_key(file, schema=schema)
+    if primary is None:
+        return None
+    trusted_thumbnail = trusted_thumbnail_key(file, schema=schema)
+    if trusted_thumbnail:
+        return trusted_thumbnail
     if file.thumbnail_key:
-        return file.thumbnail_key
+        # A poisoned reference must never be signed or used as an idempotency
+        # marker. Clear it and regenerate only from the row-bound primary object.
+        LessonFile.objects.filter(pk=file.pk).update(thumbnail_key="")
+        file.thumbnail_key = ""
 
-    raw = download_bytes(file.s3_key)
+    settings = get_center_settings()
+    raw = _bounded_image_payload(primary, max_bytes=settings.max_upload_mb * 1024 * 1024)
     image = Image.open(io.BytesIO(raw))
     image.thumbnail((_THUMB_MAX_EDGE, _THUMB_MAX_EDGE))
     buffer = io.BytesIO()
     image.convert("RGB").save(buffer, format="JPEG")
 
-    thumb_key = f"{current_schema()}/content/{file.pk}/thumb.jpg"
+    thumb_key = thumbnail_key(schema=schema, file_id=file.pk)
     upload_bytes(thumb_key, buffer.getvalue(), content_type="image/jpeg")
     file.thumbnail_key = thumb_key
     file.save(update_fields=["thumbnail_key", "updated_at"])
@@ -321,12 +488,17 @@ def download_url(*, file: LessonFile, user, actor_is_staff: bool = False) -> dic
         raise ConflictException(_("This file is not available for download."), code="file_not_clean")
     if not file.is_downloadable and not actor_is_staff:
         raise ConflictException(_("This file is view-only and cannot be downloaded."), code="file_view_only")
+    storage_key = trusted_primary_key(file, schema=current_schema())
+    if storage_key is None:
+        raise ConflictException(_("This file is temporarily unavailable."), code="file_unavailable")
     LessonFile.objects.filter(pk=file.pk).update(download_count=F("download_count") + 1)
     FileView.objects.create(file=file, user=user, action=FileView.Action.DOWNLOAD)
-    return {"url": presign_download(file.s3_key, expires_in=300), "expires_in": 300}
+    return {"url": presign_download(storage_key, expires_in=300), "expires_in": 300}
 
 
 def track_view(*, file: LessonFile, user) -> None:
+    if file.status != LessonFile.Status.CLEAN:
+        raise ConflictException(_("This file is not available to view."), code="file_not_clean")
     LessonFile.objects.filter(pk=file.pk).update(view_count=F("view_count") + 1)
     FileView.objects.create(file=file, user=user, action=FileView.Action.VIEW)
 
@@ -428,23 +600,23 @@ def create_material(*, library, title, topic="", created_by=None) -> LibraryMate
     )
 
 
-def request_material_generation(*, material: LibraryMaterial, requested_by=None):
+def request_material_generation(*, material: LibraryMaterial, requested_by=None, requested_principal=None):
     """Ask the AI to draft the material's body from its topic. Budget-reserved and
     enqueued on commit; the task fills the body, which the manager then reviews +
     publishes. Only a DRAFT can be (re)drafted — a published material is frozen."""
     from apps.ai.models import AIFeature
-    from apps.ai.services import active_prompt, check_and_reserve_budget
+    from apps.ai.services import check_and_reserve_budget
     from core.utils import current_schema
 
     if material.status != LibraryMaterial.Status.DRAFT:
         raise UnprocessableEntity(_("Only a draft material can be AI-drafted."), code="material_not_draft")
-    prompt = active_prompt(AIFeature.MATERIAL_GENERATION)
     ai_request = check_and_reserve_budget(
         feature=AIFeature.MATERIAL_GENERATION,
-        estimated_tokens=prompt.token_cost_cap,
         requested_by=requested_by,
+        requested_principal=requested_principal,
         source_app="content",
         source_id=material.id,
+        params={"title": material.title, "topic": material.topic},
     )
     if getattr(ai_request, "_should_enqueue", False):
         schema = current_schema()
@@ -467,7 +639,10 @@ def apply_generated_material(*, material_id: int, output_text: str) -> bool:
     material = LibraryMaterial.objects.select_for_update().filter(pk=material_id).first()
     if material is None or material.status != LibraryMaterial.Status.DRAFT:
         return False
-    material.body = (output_text or "").strip()[:_MAX_MATERIAL_CHARS]
+    # Raw provider output is untrusted. Preserve Markdown structure while
+    # neutralizing embedded HTML; a renderer must still apply its own safe-link
+    # policy, but scripts/iframes never enter the stored material as active tags.
+    material.body = str(escape((output_text or "").strip()[:_MAX_MATERIAL_CHARS]))
     material.save(update_fields=["body", "updated_at"])
     return True
 

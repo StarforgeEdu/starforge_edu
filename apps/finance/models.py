@@ -17,6 +17,12 @@ from decimal import Decimal
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+from core.historical_scope import (
+    ATTRIBUTED_SCOPE_STATUSES,
+    ScopeAttributionStatus,
+    guard_immutable_scope_snapshot,
+)
+
 # Money columns are uniformly Decimal(18, 2) in UZS (DAY-3 Lane A spec).
 
 
@@ -89,6 +95,26 @@ class Invoice(models.Model):
         blank=True,
         related_name="invoices",
     )
+    branch_at_issue = models.ForeignKey(
+        "org.Branch",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    department_at_issue = models.ForeignKey(
+        "org.Department",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    attribution_status = models.CharField(
+        max_length=12,
+        choices=ScopeAttributionStatus.choices,
+        default=ScopeAttributionStatus.UNRESOLVED,
+        db_index=True,
+    )
     period = models.CharField(
         max_length=16,
         blank=True,
@@ -114,8 +140,17 @@ class Invoice(models.Model):
         indexes = [
             models.Index(fields=("student", "status")),
             models.Index(fields=("status", "due_date")),
+            models.Index(fields=("branch_at_issue", "issue_date"), name="invoice_branch_issue_idx"),
+            models.Index(
+                fields=("department_at_issue", "issue_date"),
+                name="invoice_dept_issue_idx",
+            ),
         ]
         constraints = [
+            models.CheckConstraint(
+                condition=models.Q(currency="UZS"),
+                name="invoice_currency_uzs",
+            ),
             models.CheckConstraint(
                 condition=models.Q(total_uzs__gte=Decimal("0")),
                 name="invoice_total_non_negative",
@@ -127,10 +162,40 @@ class Invoice(models.Model):
                 condition=~models.Q(period="") & models.Q(fee_schedule__isnull=False),
                 name="invoice_one_per_student_schedule_period",
             ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+                        branch_at_issue__isnull=False,
+                    )
+                    | models.Q(
+                        attribution_status__in=(
+                            ScopeAttributionStatus.UNRESOLVED,
+                            ScopeAttributionStatus.CONFLICTING,
+                            ScopeAttributionStatus.QUARANTINED,
+                        ),
+                        branch_at_issue__isnull=True,
+                        department_at_issue__isnull=True,
+                    )
+                ),
+                name="invoice_scope_attribution_valid",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover
         return self.number
+
+    def save(self, *args, **kwargs) -> None:
+        guard_immutable_scope_snapshot(
+            self,
+            field_attnames=(
+                "branch_at_issue_id",
+                "department_at_issue_id",
+                "attribution_status",
+            ),
+            update_fields=kwargs.get("update_fields"),
+        )
+        super().save(*args, **kwargs)
 
 
 class InvoiceLine(models.Model):

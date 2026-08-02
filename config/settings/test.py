@@ -31,6 +31,14 @@ STORAGES = {
 
 # Always mock SMS in tests.
 ESKIZ_USE_MOCK = True
+SMS_MOCK_CAPTURE_OUTBOX = True
+FCM_MOCK_CAPTURE_OUTBOX = True
+ALLOW_LEGACY_PRINCIPAL_UNION_FOR_TESTS = True
+ALLOW_LEGACY_TENANT_SESSIONS_FOR_TESTS = True
+
+# Compatibility coverage for the retired mock-era Uzum callback. Production
+# explicitly disables it because it is not the current official Merchant API.
+UZUM_LEGACY_INTEGRATION_ENABLED = True
 
 # Faster password hashing in tests.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]

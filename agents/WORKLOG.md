@@ -928,7 +928,15 @@ birthdays `?days` DoS + param validation, duplicate holiday/weekday, non-numeric
 `set_user_password` now ends refresh sessions, not just access; apex/public-schema 404 gap
 closed (`public_tenant` fixture + seed_dev public Domain row).
 
-**AUTH PIVOT (owner decision — the new contract):**
+**HISTORICAL AUTH PIVOT (superseded 2026-08-02):** The generic tenant
+`/auth/login/` and refresh-token contract recorded below no longer applies. Tenant
+authentication is role-native through `/api/v1/auth/role-login/` and returns one
+opaque, revocable session key; `/api/v1/auth/login/` is restricted to the public/apex
+platform-admin URLConf. Password reset also accepts `account_type` so a duplicated
+contact cannot select the wrong role account. See `agents/API-CONTRACT.md` section 3
+for the current executable contract.
+
+**AUTH PIVOT (historical owner decision at that time):**
 - **Login is `POST /api/v1/auth/login/ {username, password}`** → `{access, refresh}`,
   401 `invalid_credentials` (indistinguishable + timing-equalized), throttles `login_user`
   5/min + `login_ip` 10/min. `User.username` is `USERNAME_FIELD` (unique, required,

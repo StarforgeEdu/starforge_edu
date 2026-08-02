@@ -77,16 +77,42 @@ class IRecurrenceRuleRepository(IBaseRepository[RecurrenceRule]):
     def get(self, *, pk: int) -> RecurrenceRule | None:
         raise NotImplementedError
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[RecurrenceRule]:
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[RecurrenceRule]:
         raise NotImplementedError
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> RecurrenceRule | None:
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> RecurrenceRule | None:
         raise NotImplementedError
 
 
 class ILessonRepository(IBaseRepository[Lesson]):
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[Lesson]:
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> QuerySet[Lesson]:
         raise NotImplementedError
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> Lesson | None:
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str = "schedule:read",
+    ) -> Lesson | None:
         raise NotImplementedError

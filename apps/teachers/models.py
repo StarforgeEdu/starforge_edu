@@ -124,13 +124,15 @@ class PayoutPolicy(models.Model):
     class Method(models.TextChoices):
         HOURLY = "hourly", _("Per taught hour")
         PERCENT_OF_TUITION = "percent_of_collected_tuition", _("% of collected tuition")
-        FLAT_MONTHLY = "flat_monthly", _("Flat amount per period")
+        FLAT_MONTHLY = "flat_monthly", _("Flat amount per calendar month")
 
-    teacher = models.OneToOneField(TeacherProfile, on_delete=models.CASCADE, related_name="payout_policy")
+    # Compensation evidence must outlive ordinary directory cleanup. Operators
+    # deactivate a teacher account; they may not cascade-delete its pay rule.
+    teacher = models.OneToOneField(TeacherProfile, on_delete=models.PROTECT, related_name="payout_policy")
     method = models.CharField(max_length=32, choices=Method.choices)
     # Per taught hour (HOURLY).
     hourly_rate_uzs = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
-    # Flat amount for the whole period (FLAT_MONTHLY).
+    # Flat amount for one completed calendar month (FLAT_MONTHLY).
     flat_amount_uzs = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
     # 0-100 % of tuition collected from the teacher's students (PERCENT_OF_TUITION).
     tuition_percent = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)

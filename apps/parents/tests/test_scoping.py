@@ -13,6 +13,7 @@ from django_tenants.utils import schema_context
 from apps.org.tests.factories import BranchFactory
 from apps.parents.models import Guardian, ParentProfile, PickupAuthorization
 from apps.students.tests.factories import StudentProfileFactory
+from core.historical_scope import ScopeAttributionStatus
 from core.permissions import Role
 
 pytestmark = pytest.mark.django_db
@@ -142,8 +143,16 @@ def test_registrar_parent_surfaces_and_write_targets_are_department_scoped(tenan
             full_name="Foreign pickup",
             phone="+998905559003",
         )
-        orphan_for_own = ParentProfileFactory()
-        orphan_for_foreign = ParentProfileFactory()
+        orphan_for_own = ParentProfileFactory(
+            branch_at_creation=branch,
+            department_at_creation=own_department,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
+        )
+        orphan_for_foreign = ParentProfileFactory(
+            branch_at_creation=other_branch,
+            department_at_creation=foreign_department,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
+        )
 
         RoleMembership.objects.create(
             user=registrar,
@@ -161,7 +170,7 @@ def test_registrar_parent_surfaces_and_write_targets_are_department_scoped(tenan
 
     client = as_user(tenant_a, registrar)
     parent_ids = {row["id"] for row in client.get("/api/v1/parents/").json()["data"]}
-    assert parent_ids == {own_parent.id, shared_parent.id}
+    assert parent_ids == {own_parent.id, shared_parent.id, orphan_for_own.id}
     assert client.get(f"/api/v1/parents/{sibling_parent.id}/").status_code == 404
 
     guardian_ids = {row["id"] for row in client.get("/api/v1/parents/guardians/").json()["data"]}
@@ -201,7 +210,7 @@ def test_registrar_parent_surfaces_and_write_targets_are_department_scoped(tenan
         format="json",
     )
     assert denied_guardian.status_code == 400
-    assert denied_guardian.json()["code"] == "invalid_student"
+    assert denied_guardian.json()["code"] == "invalid_parent"
 
     denied_pickup = client.post(
         "/api/v1/parents/pickups/",
@@ -220,9 +229,128 @@ def test_registrar_parent_surfaces_and_write_targets_are_department_scoped(tenan
         format="json",
     )
     assert denied_move.status_code == 400
-    assert denied_move.json()["code"] == "invalid_student"
+    assert denied_move.json()["code"] == "validation_error"
+    assert set(denied_move.json()["errors"]) == {"student"}
 
     branch_client = as_user(tenant_a, branch_registrar)
     branch_parent_ids = {row["id"] for row in branch_client.get("/api/v1/parents/").json()["data"]}
     assert {own_parent.id, sibling_parent.id, shared_parent.id} <= branch_parent_ids
     assert foreign_parent.id not in branch_parent_ids
+
+
+def test_parent_grant_cannot_borrow_an_unrelated_membership_scope(tenant_a, user_in, as_user):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.parents.tests.factories import GuardianFactory, ParentProfileFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        local = BranchFactory(name="Parent grant branch", slug="parent-grant-branch")
+        remote = BranchFactory(name="Parent unrelated branch", slug="parent-unrelated-branch")
+        local_student = StudentProfileFactory(branch=local)
+        remote_student = StudentProfileFactory(branch=remote)
+        local_parent = ParentProfileFactory()
+        remote_parent = ParentProfileFactory()
+        GuardianFactory(parent=local_parent, student=local_student)
+        GuardianFactory(parent=remote_parent, student=remote_student)
+
+        granting_type = AccountType.objects.create(
+            name="Scoped parent operator",
+            slug="scoped-parent-operator",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.bulk_create(
+            [
+                AccountTypePermission(account_type=granting_type, permission="parents:read"),
+                AccountTypePermission(account_type=granting_type, permission="parents:write"),
+            ]
+        )
+        unrelated_type = AccountType.objects.create(
+            name="Unrelated parent membership",
+            slug="unrelated-parent-membership",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=local,
+            account_type=granting_type,
+            role=granting_type.compatibility_role,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=remote,
+            account_type=unrelated_type,
+            role=unrelated_type.compatibility_role,
+        )
+        actor.refresh_from_db()
+
+    client = as_user(tenant_a, actor)
+    listing = client.get("/api/v1/parents/")
+    assert listing.status_code == 200, listing.content
+    assert {row["id"] for row in listing.json()["data"]} == {local_parent.pk}
+    assert client.get(f"/api/v1/parents/{remote_parent.pk}/").status_code == 404
+    denied = client.post(
+        "/api/v1/parents/pickups/",
+        {
+            "student": remote_student.pk,
+            "full_name": "Denied",
+            "phone": "+998905559099",
+        },
+        format="json",
+    )
+    assert denied.status_code == 400
+    assert denied.json()["code"] == "invalid_student"
+
+
+def test_family_directory_grant_does_not_reveal_or_write_custody_notes(tenant_a, user_in, as_user):
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.parents.tests.factories import GuardianFactory, ParentProfileFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Family directory branch", slug="family-directory-branch")
+        student = StudentProfileFactory(branch=branch)
+        second_student = StudentProfileFactory(branch=branch)
+        parent = ParentProfileFactory()
+        second_parent = ParentProfileFactory()
+        guardian = GuardianFactory(
+            parent=parent,
+            student=student,
+            custody_notes="Restricted court-order details",
+        )
+        directory_type = AccountType.objects.create(
+            name="Family directory operator",
+            slug="family-directory-operator",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.bulk_create(
+            [
+                AccountTypePermission(account_type=directory_type, permission="parents:read"),
+                AccountTypePermission(account_type=directory_type, permission="parents:write"),
+            ]
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=branch,
+            account_type=directory_type,
+            role=directory_type.compatibility_role,
+        )
+        actor.refresh_from_db()
+
+    client = as_user(tenant_a, actor)
+    detail = client.get(f"/api/v1/parents/guardians/{guardian.pk}/")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["custody_notes"] is None
+
+    denied = client.post(
+        "/api/v1/parents/guardians/",
+        {
+            "parent": second_parent.pk,
+            "student": second_student.pk,
+            "relationship": "guardian",
+            "custody_notes": "Attempted restricted note",
+        },
+        format="json",
+    )
+    assert denied.status_code == 403

@@ -14,7 +14,15 @@ from apps.academics.interfaces.repositories import (
     ISubjectRepository,
     ITranscriptRepository,
 )
-from apps.academics.models import Exam, ExamResult, ExamType, Grade, Subject, Transcript
+from apps.academics.models import (
+    Exam,
+    ExamLifecycleEvent,
+    ExamResult,
+    ExamType,
+    Grade,
+    Subject,
+    Transcript,
+)
 from core.repositories import BaseRepository
 
 
@@ -41,7 +49,13 @@ class ExamTypeRepository(BaseRepository[ExamType], IExamTypeRepository):
         exam_type.delete()
 
     def slug_taken(self, *, slug: str, exclude_pk: int | None = None) -> bool:
-        qs = ExamType.objects.filter(slug=slug)
+        qs = ExamType.objects.filter(slug__iexact=slug)
+        if exclude_pk is not None:
+            qs = qs.exclude(pk=exclude_pk)
+        return qs.exists()
+
+    def name_taken(self, *, name: str, exclude_pk: int | None = None) -> bool:
+        qs = ExamType.objects.filter(name__iexact=name)
         if exclude_pk is not None:
             qs = qs.exclude(pk=exclude_pk)
         return qs.exists()
@@ -70,7 +84,13 @@ class SubjectRepository(BaseRepository[Subject], ISubjectRepository):
         subject.delete()
 
     def code_taken(self, *, code: str, exclude_pk: int | None = None) -> bool:
-        qs = Subject.objects.filter(code=code)
+        qs = Subject.objects.filter(code__iexact=code)
+        if exclude_pk is not None:
+            qs = qs.exclude(pk=exclude_pk)
+        return qs.exists()
+
+    def name_taken(self, *, name: str, exclude_pk: int | None = None) -> bool:
+        qs = Subject.objects.filter(name__iexact=name)
         if exclude_pk is not None:
             qs = qs.exclude(pk=exclude_pk)
         return qs.exists()
@@ -79,11 +99,32 @@ class SubjectRepository(BaseRepository[Subject], ISubjectRepository):
 class ExamRepository(BaseRepository[Exam], IExamRepository):
     model = Exam
 
-    def scoped(self, *, user: Any, roles: set[str] | None) -> QuerySet[Exam]:
-        return selectors.scoped_exams(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user: Any,
+        roles: set[str] | None,
+        permission: str,
+    ) -> QuerySet[Exam]:
+        return selectors.scoped_exams(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None) -> Exam | None:
-        return selectors.scoped_exams(user=user, roles=roles).filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        pk: int,
+        user: Any,
+        roles: set[str] | None,
+        permission: str,
+    ) -> Exam | None:
+        return (
+            selectors.scoped_exams(
+                user=user,
+                roles=roles,
+                permission=permission,
+            )
+            .filter(pk=pk)
+            .first()
+        )
 
     def add(self, *, data: dict[str, Any]) -> Exam:
         return Exam.objects.create(**data)
@@ -99,7 +140,10 @@ class ExamRepository(BaseRepository[Exam], IExamRepository):
         exam.delete()
 
     def results_for(self, exam: Exam) -> QuerySet[ExamResult]:
-        return exam.results.select_related("student__user")
+        return exam.results.select_related("student__user", "graded_by")
+
+    def history_for(self, exam: Exam) -> QuerySet[ExamLifecycleEvent]:
+        return exam.lifecycle_events.select_related("actor")
 
 
 class GradeRepository(BaseRepository[Grade], IGradeRepository):

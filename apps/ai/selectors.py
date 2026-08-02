@@ -11,11 +11,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 
-from django.db.models import BigIntegerField, F, IntegerField, QuerySet, Sum, Value
+from django.db.models import BigIntegerField, BooleanField, Case, F, Q, QuerySet, Sum, Value, When
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from apps.ai.authorization import scope_query_for_permission
 from apps.ai.models import AIRequest
+from core.role_principals import RolePrincipal
 
 
 def _day_bounds(start: date, end: date) -> tuple[datetime, datetime]:
@@ -38,7 +40,11 @@ def tokens_consumed(start: date, end: date) -> int:
     """
     lo, hi = _day_bounds(start, end)
     agg = AIRequest.objects.filter(created_at__gte=lo, created_at__lt=hi).aggregate(
-        total=Coalesce(Sum(F("input_tokens") + F("output_tokens")), Value(0), output_field=IntegerField())
+        total=Coalesce(
+            Sum(F("input_tokens") + F("output_tokens") + F("cache_read_tokens") + F("cache_creation_tokens")),
+            Value(0),
+            output_field=BigIntegerField(),
+        )
     )
     return int(agg["total"] or 0)
 
@@ -73,10 +79,43 @@ def cost_used_current_month() -> int:
     return cost_consumed(today.replace(day=1), today)
 
 
-def list_requests() -> QuerySet[AIRequest]:
-    """All AI requests in the tenant, newest first, with the prompt eager-loaded
-    (the read serializer reports the prompt feature/version)."""
-    return AIRequest.objects.select_related("prompt", "requested_by").all()
+def list_requests(*, roles, principal: RolePrincipal, is_superuser: bool = False) -> QuerySet[AIRequest]:
+    """AI requests visible to one exact role-native account.
+
+    Legacy rows without immutable principal/scope attribution are deliberately
+    excluded even for an owner: exposing them through a guessed bridge identity
+    would recreate the cross-role leak this selector closes.  Operations can
+    inspect quarantine counts through the dedicated management command.
+    """
+
+    attributable = Q(
+        attribution_status=AIRequest.AttributionStatus.RESOLVED,
+    ) & ~Q(scope_status=AIRequest.ScopeStatus.UNRESOLVED)
+    permission_scope = (
+        Q(pk__isnull=False) if is_superuser else scope_query_for_permission(roles=roles, permission="ai:read")
+    )
+    return (
+        AIRequest.objects.select_related("branch_at_request", "department_at_request")
+        .annotate(
+            _has_content=Case(
+                When(
+                    Q(content_purged_at__isnull=True) & ~Q(output_ciphertext=""),
+                    then=Value(True),
+                ),
+                default=Value(False),
+                output_field=BooleanField(),
+            )
+        )
+        # Register pages never need generated text, reversible PII maps, or
+        # historical internal failure codes. Deferring them prevents decryption
+        # and avoids pulling high-volume sensitive ciphertext into process memory.
+        .defer("output_ciphertext", "output_text", "redaction_map", "error_detail")
+        # The endpoint itself is an ``ai:read`` register. Exact ownership must
+        # not bypass the caller's current read scope: a multi-branch account
+        # could otherwise keep reading an old branch after membership revocation.
+        .filter(attributable & permission_scope)
+        .distinct()
+    )
 
 
 def usage_report(*, start: date, end: date) -> list[dict]:
@@ -91,6 +130,8 @@ def usage_report(*, start: date, end: date) -> list[dict]:
             requests=Count("id"),
             input_tokens=Coalesce(Sum("input_tokens"), Value(0)),
             output_tokens=Coalesce(Sum("output_tokens"), Value(0)),
+            cache_read_tokens=Coalesce(Sum("cache_read_tokens"), Value(0)),
+            cache_creation_tokens=Coalesce(Sum("cache_creation_tokens"), Value(0)),
             cost_microusd=Coalesce(Sum("cost_microusd"), Value(0)),
         )
         .order_by("feature")
@@ -101,6 +142,11 @@ def usage_report(*, start: date, end: date) -> list[dict]:
             "requests": int(r["requests"]),
             "input_tokens": int(r["input_tokens"]),
             "output_tokens": int(r["output_tokens"]),
+            "cache_read_tokens": int(r["cache_read_tokens"]),
+            "cache_creation_tokens": int(r["cache_creation_tokens"]),
+            "total_tokens": int(
+                r["input_tokens"] + r["output_tokens"] + r["cache_read_tokens"] + r["cache_creation_tokens"]
+            ),
             "cost_microusd": int(r["cost_microusd"]),
         }
         for r in rows

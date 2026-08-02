@@ -1,16 +1,24 @@
 """Printing endpoints — plain Django views over the layered architecture.
 
-Two surfaces: STAFF (JWT, printing:read/write) manage jobs/printers/agents (branch object-
-scoped: create + detail scoped to the actor's branch, list is whole-tenant operational data);
-AGENT (a BranchAgent token, NOT a User — via @require_branch_agent) claims jobs + reports
-status. No PUT/DELETE on jobs; printers allow PATCH; agents add a revoke action.
+Two surfaces: STAFF (JWT, printing:read/write) manage jobs/printers/agents within the
+branches covered by the exact membership granting that permission; DIRECTOR/superuser
+remain organization-wide. AGENT (a BranchAgent token, NOT a User — via
+``@require_branch_agent``) claims jobs + reports status. No PUT/DELETE on jobs; printers
+allow PATCH; agents add a revoke action.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from typing import Any
+from uuid import UUID
 
+from botocore.exceptions import BotoCoreError
+from django.core.exceptions import ImproperlyConfigured
+from django.db import transaction
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.org.models import Branch
@@ -20,20 +28,42 @@ from apps.printing.interfaces.services import (
     IPrinterService,
     IPrintJobService,
 )
-from apps.printing.models import PrintJob
+from apps.printing.models import PrintJob, PrintJobReconciliation
+from apps.printing.openapi_contracts import (
+    AGENT_CLAIM_CONTRACTS,
+    AGENT_JOB_HEARTBEAT_CONTRACTS,
+    AGENT_JOB_STATUS_CONTRACTS,
+    JOB_RECONCILE_CONTRACTS,
+    JOB_RECONCILIATIONS_CONTRACTS,
+    JOBS_COLLECTION_CONTRACTS,
+)
 from apps.printing.presenters import (
+    agent_print_job_to_dict,
     branch_agent_created_to_dict,
     branch_agent_to_dict,
+    print_job_reconciliation_to_dict,
     print_job_to_dict,
     printer_to_dict,
 )
+from apps.printing.source_resolver import (
+    is_print_job_source_valid,
+    resolve_print_source,
+    source_read_permission,
+)
 from core.api_auth import check_perm, require_auth
 from core.container import container
-from core.exceptions import NotFoundException, PermissionException, ValidationException
+from core.exceptions import (
+    ConflictException,
+    NotFoundException,
+    ServiceUnavailableException,
+    ValidationException,
+)
 from core.http import bool_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
-from core.permissions import Role, get_role_memberships
+from core.openapi_contracts import openapi_contract
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import request_role_principal
+from core.scoping import assert_permission_membership_scope, scope_to_permission_memberships
 from core.tenant_context import assert_tenant_context
 from infrastructure.storage.s3_client import presign_download
 
@@ -43,6 +73,8 @@ _AGENT_STATUSES = {
     PrintJob.Status.DONE.value,
     PrintJob.Status.FAILED.value,
 }
+_RECONCILIATION_OUTCOMES = set(PrintJobReconciliation.Outcome.values)
+logger = logging.getLogger("starforge.printing")
 
 
 def _job_service() -> IPrintJobService:
@@ -58,6 +90,10 @@ def _agent_service() -> IBranchAgentService:
 
 
 # --- staff: print jobs -----------------------------------------------------
+@openapi_contract(
+    path="/api/v1/printing/jobs/",
+    operations=JOBS_COLLECTION_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def jobs_collection_view(request: HttpRequest) -> HttpResponse:
@@ -65,7 +101,7 @@ def jobs_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "printing:read")
         qs = apply_filters(
             request,
-            _job_service().list_jobs(),
+            _visible_jobs(request, permission="printing:read"),
             filter_fields=("status", "source", "branch"),
             ordering_fields=("created_at",),
         )
@@ -73,7 +109,11 @@ def jobs_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([print_job_to_dict(j) for j in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, "printing:write")
-        return _create_job(request)
+        # Parse the declared JSON request at the registered transport boundary.
+        # Besides keeping malformed/non-object input fail-closed, this makes the
+        # executable callback independently agree with its critical OpenAPI
+        # request-body contract; the helper only validates the closed DTO below.
+        return _create_job(request, body=read_json(request))
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
 
@@ -83,11 +123,79 @@ def job_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "printing:read")
-    job = _job_service().get(pk=pk)
+    job = _visible_jobs(request, permission="printing:read").filter(pk=pk).first()
     if job is None:
         raise NotFoundException(code="not_found")
-    _assert_in_branch(request, job.branch_id)
     return success(print_job_to_dict(job))
+
+
+@openapi_contract(
+    path="/api/v1/printing/jobs/{pk}/reconciliations/",
+    operations=JOB_RECONCILIATIONS_CONTRACTS,
+)
+@csrf_exempt
+@require_auth
+def job_reconciliations_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method not in ("GET", "HEAD"):
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, "printing:read")
+    job = _visible_jobs(request, permission="printing:read").filter(pk=pk).first()
+    if job is None:
+        raise NotFoundException(code="not_found")
+    items, total, page, size = paginate(
+        request,
+        _job_service().list_reconciliations(job_id=job.pk),
+    )
+    return paginated(
+        [print_job_reconciliation_to_dict(record) for record in items],
+        total=total,
+        page=page,
+        page_size=size,
+    )
+
+
+@openapi_contract(
+    path="/api/v1/printing/jobs/{pk}/reconcile/",
+    operations=JOB_RECONCILE_CONTRACTS,
+)
+@csrf_exempt
+@require_auth
+def job_reconcile_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method != "POST":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, "printing:write")
+    job = _visible_jobs(request, permission="printing:write").filter(pk=pk).first()
+    if job is None:
+        raise NotFoundException(code="not_found")
+    body = read_json(request)
+    unknown_fields = sorted(set(body) - {"outcome", "evidence_reference"})
+    if unknown_fields:
+        raise ValidationException(
+            "The reconciliation request contains unsupported fields.",
+            code="validation_error",
+            fields={field: ["This field is unsupported."] for field in unknown_fields},
+        )
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key is None:
+        raise ValidationException(
+            "Idempotency-Key is required.",
+            code="validation_error",
+            fields={"Idempotency-Key": ["This header is required."]},
+        )
+    reconciled = _job_service().reconcile(
+        job_id=job.pk,
+        expected_branch_id=job.branch_id,
+        actor=request.user,
+        actor_principal=request_role_principal(
+            request,
+            allowed_kinds={"staff"},
+            error_code="printing_principal_unavailable",
+        ),
+        outcome=_choice(body, "outcome", _RECONCILIATION_OUTCOMES),
+        evidence_reference=str_field(body, "evidence_reference", max_length=200),
+        idempotency_key=idempotency_key,
+    )
+    return success(print_job_to_dict(reconciled))
 
 
 # --- staff: printers -------------------------------------------------------
@@ -98,7 +206,7 @@ def printers_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "printing:read")
         qs = apply_filters(
             request,
-            _printer_service().list_printers(),
+            _visible_printers(request, permission="printing:read"),
             filter_fields=("branch", "is_active"),
             ordering_fields=("name",),
         )
@@ -114,11 +222,11 @@ def printers_collection_view(request: HttpRequest) -> HttpResponse:
 @require_auth
 def printer_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     read = request.method in ("GET", "HEAD")
-    check_perm(request, "printing:read" if read else "printing:write")
-    printer = _printer_service().get(pk=pk)
+    permission = "printing:read" if read else "printing:write"
+    check_perm(request, permission)
+    printer = _visible_printers(request, permission=permission).filter(pk=pk).first()
     if printer is None:
         raise NotFoundException(code="not_found")
-    _assert_in_branch(request, printer.branch_id)
     if read:
         return success(printer_to_dict(printer))
     if request.method == "PATCH":
@@ -134,7 +242,7 @@ def agents_collection_view(request: HttpRequest) -> HttpResponse:
         check_perm(request, "printing:read")
         qs = apply_filters(
             request,
-            _agent_service().list_agents(),
+            _visible_agents(request, permission="printing:read"),
             filter_fields=("branch",),
             ordering_fields=("name",),
         )
@@ -152,10 +260,9 @@ def agent_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "printing:read")
-    agent = _agent_service().get(pk=pk)
+    agent = _visible_agents(request, permission="printing:read").filter(pk=pk).first()
     if agent is None:
         raise NotFoundException(code="not_found")
-    _assert_in_branch(request, agent.branch_id)
     return success(branch_agent_to_dict(agent))
 
 
@@ -165,26 +272,71 @@ def agent_revoke_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "printing:write")
-    agent = _agent_service().get(pk=pk)
+    agent = _visible_agents(request, permission="printing:write").filter(pk=pk).first()
     if agent is None:
         raise NotFoundException(code="not_found")
-    _assert_in_branch(request, agent.branch_id)
     return success(branch_agent_to_dict(_agent_service().revoke(agent)))
 
 
 # --- agent surface (BranchAgent token, no JWT) -----------------------------
+@openapi_contract(
+    path="/api/v1/printing/agent/claim/",
+    operations=AGENT_CLAIM_CONTRACTS,
+)
 @csrf_exempt
 @require_branch_agent
+@transaction.atomic
 def agent_claim_view(request: HttpRequest) -> HttpResponseBase:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     assert_tenant_context()
+    body = read_json(request)
+    if body:
+        raise ValidationException(
+            "The claim request does not accept fields.",
+            code="validation_error",
+            fields={field: ["This field is unsupported."] for field in sorted(body)},
+        )
     job = _job_service().claim(agent=request.auth)  # type: ignore[attr-defined]
     if job is None:
         return no_content()  # queue empty -> 204
-    return success({"job": print_job_to_dict(job), "download_url": presign_download(job.payload_s3_key)})
+    if not is_print_job_source_valid(job):
+        _job_service().reject_invalid_claim(agent=request.auth, job_id=job.pk)  # type: ignore[attr-defined]
+        return error(
+            "The print source is no longer available.",
+            code="print_source_invalid",
+            status=409,
+        )
+    try:
+        if job.lease_expires_at is None:
+            raise ImproperlyConfigured("Claimed print job has no lease expiry.")
+        remaining_lease_seconds = max(
+            1,
+            math.ceil((job.lease_expires_at - timezone.now()).total_seconds()),
+        )
+        # The storage capability never outlives the physical-attempt lease.
+        # A heartbeat can extend processing time after the document is already
+        # downloaded, but it does not mint another download capability.
+        download_url = presign_download(
+            job.payload_s3_key,
+            expires_in=remaining_lease_seconds,
+        )
+    except (BotoCoreError, ImproperlyConfigured, KeyError, ValueError) as exc:
+        # The enclosing transaction rolls back PICKED/agent/printer state. Never
+        # log the object key or exception text: storage configuration can contain
+        # endpoint or credential material and the request id is enough to correlate.
+        logger.error("Unable to issue a branch-agent print download capability.")
+        raise ServiceUnavailableException(
+            "The print document is temporarily unavailable.",
+            code="print_download_unavailable",
+        ) from exc
+    return success({"job": agent_print_job_to_dict(job), "download_url": download_url})
 
 
+@openapi_contract(
+    path="/api/v1/printing/agent/jobs/{job_id}/status/",
+    operations=AGENT_JOB_STATUS_CONTRACTS,
+)
 @csrf_exempt
 @require_branch_agent
 def agent_job_status_view(request: HttpRequest, job_id: int) -> HttpResponseBase:
@@ -192,69 +344,120 @@ def agent_job_status_view(request: HttpRequest, job_id: int) -> HttpResponseBase
         return error("Method not allowed.", code="method_not_allowed", status=405)
     assert_tenant_context()
     body = read_json(request)
+    unknown_fields = sorted(set(body) - {"lease_id", "status", "error", "pages_printed"})
+    if unknown_fields:
+        raise ValidationException(
+            "The status report contains unsupported fields.",
+            code="validation_error",
+            fields={field: ["This field is unsupported."] for field in unknown_fields},
+        )
+    status = _choice(body, "status", _AGENT_STATUSES)
+    if "error" in body and body["error"] is None:
+        raise ValidationException(
+            "error may not be null.",
+            code="validation_error",
+            fields={"error": ["This field may not be null."]},
+        )
+    reported_error = str_field(body, "error", max_length=2000)
+    if reported_error and status != PrintJob.Status.FAILED:
+        raise ValidationException(
+            "An error may be reported only with failed status.",
+            code="validation_error",
+            fields={"error": ["This field is allowed only when status is failed."]},
+        )
     job = _job_service().update_status(
         agent=request.auth,  # type: ignore[attr-defined]
         job_id=job_id,
-        status=_choice(body, "status", _AGENT_STATUSES),
-        error=str_field(body, "error", max_length=2000),
+        lease_id=_required_uuid(body, "lease_id"),
+        status=status,
+        error=reported_error,
         pages_printed=_optional_nonneg_int(body, "pages_printed"),
     )
-    return success(print_job_to_dict(job))
+    if job.status == PrintJob.Status.RECONCILIATION_REQUIRED:
+        raise ConflictException(
+            "The print attempt requires operator reconciliation.",
+            code="print_reconciliation_required",
+        )
+    return success(agent_print_job_to_dict(job))
+
+
+@openapi_contract(
+    path="/api/v1/printing/agent/jobs/{job_id}/heartbeat/",
+    operations=AGENT_JOB_HEARTBEAT_CONTRACTS,
+)
+@csrf_exempt
+@require_branch_agent
+def agent_job_heartbeat_view(request: HttpRequest, job_id: int) -> HttpResponseBase:
+    if request.method != "POST":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    assert_tenant_context()
+    body = read_json(request)
+    unknown_fields = sorted(set(body) - {"lease_id", "pages_printed"})
+    if unknown_fields:
+        raise ValidationException(
+            "The heartbeat contains unsupported fields.",
+            code="validation_error",
+            fields={field: ["This field is unsupported."] for field in unknown_fields},
+        )
+    job = _job_service().heartbeat(
+        agent=request.auth,  # type: ignore[attr-defined]
+        job_id=job_id,
+        lease_id=_required_uuid(body, "lease_id"),
+        pages_printed=_optional_nonneg_int(body, "pages_printed"),
+    )
+    if job.status == PrintJob.Status.RECONCILIATION_REQUIRED:
+        raise ConflictException(
+            "The print attempt requires operator reconciliation.",
+            code="print_reconciliation_required",
+        )
+    return success(agent_print_job_to_dict(job))
 
 
 # --- helpers ---------------------------------------------------------------
-def _create_job(request: HttpRequest) -> HttpResponse:
-    from core.utils import current_schema
-
-    body = read_json(request)
-    payload_key = str_field(body, "payload_s3_key", max_length=512).strip()
-    if not payload_key:
-        raise ValidationException(
-            "payload_s3_key is required.",
-            code="validation_error",
-            fields={"payload_s3_key": ["This field is required."]},
-        )
-    # Tenant isolation: this key is echoed into a presigned S3 GET at agent-claim time
-    # (agent_claim_view -> presign_download), against the ONE shared bucket keyed only by
-    # a "{schema}/..." prefix convention. An unvalidated client key lets a branch-scoped
-    # staffer mint a working presigned download URL for ANY object in the bucket —
-    # cross-tenant AND cross-permission file exfiltration. Require the caller's own tenant
-    # prefix, mirroring the assignments attachment-key guard. (Internal transcript/receipt/
-    # report hand-offs call enqueue_print at the service layer, bypassing this HTTP path.)
-    prefix = f"{current_schema()}/"
-    if not payload_key.startswith(prefix):
-        raise ValidationException(
-            "payload_s3_key is not valid for this tenant.",
-            code="validation_error",
-            fields={"payload_s3_key": [f"Key must start with '{prefix}'."]},
-        )
-    branch_id = _required_pos_int(body, "branch")
-    _assert_branch_write(request, branch_id)
-    source = _choice(body, "source", _SOURCES)
-    # Cross-permission guard (R4/PLAUS1): the payload key is echoed into a presigned
-    # download at claim time, so a print job for a sensitive server-generated document
-    # (transcript / payment receipt / report) discloses that document to whoever claims
-    # it. Require the caller to hold the OWNING resource's READ permission — printing:write
-    # alone must not let e.g. a registrar/security/librarian pull finance receipts or
-    # academic transcripts they cannot otherwise read. (Object-level scope + deriving the
-    # key from source_id instead of trusting the client key is the tracked follow-up.)
-    _source_read_perm: dict[str, str] = {
-        PrintJob.Source.TRANSCRIPT: "academics:read",
-        PrintJob.Source.REPORT: "reports:read",
-        PrintJob.Source.RECEIPT: "finance:read",
-        PrintJob.Source.ASSIGNMENT: "assignments:read",
+def _create_job(request: HttpRequest, *, body: dict[str, Any]) -> HttpResponse:
+    allowed_fields = {
+        "source",
+        "source_id",
+        "attachment_index",
+        "pages",
+        "copies",
+        "color",
+        "duplex",
     }
-    check_perm(request, _source_read_perm[source])
+    unknown_fields = sorted(set(body) - allowed_fields)
+    if unknown_fields:
+        raise ValidationException(
+            "The print request contains unsupported fields.",
+            code="validation_error",
+            fields={name: ["This field is server-managed or unsupported."] for name in unknown_fields},
+        )
+    source = _choice(body, "source", _SOURCES)
+    source_permission = source_read_permission(source)
+    check_perm(request, source_permission)
+    resolved = resolve_print_source(
+        request=request,
+        source=source,
+        source_id=_required_pos_int(body, "source_id"),
+        attachment_index=_optional_nonneg_int(body, "attachment_index"),
+    )
+    # The source query proves read scope. Independently require that the exact
+    # membership supplying printing:write covers the source's authoritative branch.
+    assert_permission_membership_scope(
+        request,
+        permission="printing:write",
+        branch_id=resolved.branch_id,
+        enforce_department=False,
+    )
     data = {
-        "source": source,
-        "source_id": _required_pos_int(body, "source_id"),
-        "payload_s3_key": payload_key,
-        "branch": branch_id,
+        "source": resolved.source,
+        "source_id": resolved.source_id,
+        "payload_s3_key": resolved.payload_s3_key,
+        "branch": resolved.branch_id,
         "pages": _required_pos_int(body, "pages"),
         "copies": _positive_default(body, "copies", 1),
         "color": bool_field(body, "color", default=False),
         "duplex": bool_field(body, "duplex", default=False),
-        "cohort": _optional_pos_int(body, "cohort"),
+        "cohort": resolved.cohort_id,
     }
     return created(print_job_to_dict(_job_service().enqueue(data=data, requested_by=request.user)))
 
@@ -262,6 +465,7 @@ def _create_job(request: HttpRequest) -> HttpResponse:
 def _create_printer(request: HttpRequest) -> HttpResponse:
     body = read_json(request)
     branch_id = _required_pos_int(body, "branch")
+    _assert_branch_write(request, branch_id)
     if Branch.objects.filter(pk=branch_id).first() is None:
         raise ValidationException(
             "Unknown branch.", code="validation_error", fields={"branch": ["No such branch."]}
@@ -271,7 +475,6 @@ def _create_printer(request: HttpRequest) -> HttpResponse:
         raise ValidationException(
             "name is required.", code="validation_error", fields={"name": ["This field is required."]}
         )
-    _assert_branch_write(request, branch_id)
     printer = _printer_service().create(
         data={
             "branch_id": branch_id,
@@ -327,21 +530,45 @@ def _register_agent(request: HttpRequest) -> HttpResponse:
 
 
 def _assert_branch_write(request: HttpRequest, branch_id: int) -> None:
-    """Branch object-scope on a write: superuser/DIRECTOR unscoped; else the branch must be
-    one of the actor's role-membership branches (mirrors the old _assert_create_branch /
-    ObjectScopedPermission -> 403 out_of_scope)."""
-    if getattr(request.user, "is_superuser", False):
-        return
-    req: Any = request
-    memberships = list(get_role_memberships(req))
-    if any(m.role == Role.DIRECTOR for m in memberships):
-        return
-    if branch_id not in {m.branch_id for m in memberships}:
-        raise PermissionException(code="out_of_scope")
+    """Require the exact active membership supplying ``printing:write``.
+
+    Printing resources only carry a branch relationship. A department-scoped printing
+    membership therefore resolves to that membership's branch, the narrowest boundary
+    the model can enforce. Reads use the equivalent query-level scope below.
+    """
+    assert_permission_membership_scope(
+        request,
+        permission="printing:write",
+        branch_id=branch_id,
+        enforce_department=False,
+    )
 
 
-def _assert_in_branch(request: HttpRequest, branch_id: int) -> None:
-    _assert_branch_write(request, branch_id)
+def _visible_jobs(request: HttpRequest, *, permission: str):
+    return scope_to_permission_memberships(
+        request,
+        _job_service().list_jobs(),
+        permission=permission,
+        branch_field="branch_id",
+    )
+
+
+def _visible_printers(request: HttpRequest, *, permission: str):
+    return scope_to_permission_memberships(
+        request,
+        _printer_service().list_printers(),
+        permission=permission,
+        branch_field="branch_id",
+    )
+
+
+def _visible_agents(request: HttpRequest, *, permission: str):
+    return scope_to_permission_memberships(
+        request,
+        _agent_service().list_agents(),
+        permission=permission,
+        branch_field="branch_id",
+    )
 
 
 def _choice(body: dict[str, Any], name: str, valid: set[str]) -> str:
@@ -377,23 +604,42 @@ def _positive_default(body: dict[str, Any], name: str, default: int) -> int:
     return value
 
 
-def _optional_pos_int(body: dict[str, Any], name: str) -> int | None:
-    if body.get(name) is None:
-        return None
-    return _required_pos_int(body, name)
-
-
 def _optional_nonneg_int(body: dict[str, Any], name: str) -> int | None:
-    if body.get(name) is None:
+    if name not in body:
         return None
-    value = int_field(body, name, required=True)
-    if value is None or value < 0:
+    value = body[name]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValidationException(
             f"{name} must be a non-negative integer.",
             code="validation_error",
             fields={name: ["Must be an integer >= 0."]},
         )
     return value
+
+
+def _required_uuid(body: dict[str, Any], name: str) -> UUID:
+    value = body.get(name)
+    if not isinstance(value, str):
+        raise ValidationException(
+            f"{name} must be a UUID string.",
+            code="validation_error",
+            fields={name: ["This field is required and must be a UUID."]},
+        )
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise ValidationException(
+            f"{name} must be a UUID string.",
+            code="validation_error",
+            fields={name: ["Must be a canonical UUID."]},
+        ) from exc
+    if str(parsed) != value:
+        raise ValidationException(
+            f"{name} must be a canonical UUID string.",
+            code="validation_error",
+            fields={name: ["Must be a lowercase hyphenated UUID."]},
+        )
+    return parsed
 
 
 def _capabilities(body: dict[str, Any]) -> dict:

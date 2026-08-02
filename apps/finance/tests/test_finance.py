@@ -15,7 +15,9 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+import time_machine
 from django.core.cache import cache
+from django.utils import timezone
 from django_tenants.utils import schema_context
 
 from apps.audit.models import AuditLog
@@ -38,10 +40,42 @@ from apps.org.models import CenterSettings
 from apps.parents.tests.factories import GuardianFactory, ParentProfileFactory
 from apps.students.models import StudentProfile
 from apps.students.tests.factories import StudentProfileFactory
-from core.exceptions import ConflictException, ValidationException
+from core.exceptions import (
+    ConflictException,
+    PermissionException,
+    UnprocessableEntity,
+    ValidationException,
+)
 from core.permissions import Role
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        True,
+        "",
+        "NaN",
+        "Infinity",
+        "-1",
+        "0",
+        "0.00001",
+        "100000000",
+        "1000000001",
+    ],
+)
+def test_fx_rate_validation_rejects_non_finite_or_out_of_range_values(raw):
+    assert services.normalize_fx_rate(raw) is None
+
+
+def test_fx_rate_validation_normalizes_valid_precision():
+    assert services.normalize_fx_rate("12500.123456") == Decimal("12500.1235")
+
+
+def test_usd_snapshot_omits_values_that_cannot_fit_the_money_column():
+    assert services._usd_total(Decimal("9999999999999999.99"), Decimal("0.0001")) is None
 
 
 def _settings(**kwargs):
@@ -54,6 +88,22 @@ def _settings(**kwargs):
     cs.save()
     cache.clear()
     return cs
+
+
+def _captured_payment(invoice: Invoice, *, amount: str, key: str):
+    from apps.payments.models import Payment
+
+    return Payment.objects.create(
+        provider=Payment.Method.CASH,
+        amount_uzs=Decimal(amount),
+        status=Payment.Status.COMPLETED,
+        idempotency_key=key,
+        account_ref=invoice.number,
+        branch_at_payment_id=invoice.branch_at_issue_id,
+        department_at_payment_id=invoice.department_at_issue_id,
+        attribution_status="captured",
+        metadata={"invoice_id": invoice.pk, "student_id": invoice.student_id},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +135,87 @@ def test_issue_invoice_happy_path_numbering_and_lines(tenant_a, django_capture_o
         assert len(captured) == 1
         assert captured[0]["invoice_id"] == inv.pk
         assert captured[0]["student_id"] == student.pk
+
+
+def test_issue_invoice_never_relabels_uzs_columns_as_presentation_currency(tenant_a):
+    """A configurable display currency is not a ledger conversion rate."""
+    with schema_context(tenant_a.schema_name):
+        settings = CenterSettings.load()
+        settings.currency_primary = "USD"
+        settings.currency_secondary = "UZS"
+        settings.save(update_fields=["currency_primary", "currency_secondary", "updated_at"])
+        cache.clear()
+        student = StudentProfileFactory()
+        schedule = FeeScheduleFactory(amount_uzs=Decimal("15000.00"))
+
+        invoice = services.issue_invoice(student_id=student.pk, fee_schedule_id=schedule.pk)
+
+        assert invoice.total_uzs == Decimal("15000.00")
+        assert invoice.currency == "UZS"
+
+
+def test_issue_invoice_locks_unassigned_student_without_locking_nullable_cohort(tenant_a):
+    """PostgreSQL must lock the student, not the nullable side of its cohort join."""
+    with schema_context(tenant_a.schema_name):
+        from django.db import connection
+
+        student = StudentProfileFactory(current_cohort=None)
+        fs = FeeScheduleFactory(amount_uzs=Decimal("1500000.00"))
+        lock_queries: list[str] = []
+
+        def capture_student_lock(execute, sql, params, many, context):
+            if 'FROM "students_studentprofile"' in sql and "FOR UPDATE" in sql:
+                lock_queries.append(sql)
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(capture_student_lock):
+            invoice = services.issue_invoice(student_id=student.pk, fee_schedule_id=fs.pk)
+
+        assert invoice.student_id == student.pk
+        assert invoice.cohort_id is None
+        assert invoice.branch_at_issue_id == student.branch_id
+        assert len(lock_queries) == 1
+        assert 'FOR UPDATE OF "students_studentprofile"' in lock_queries[0]
+
+
+def test_issue_invoice_rejects_fee_schedule_from_another_cohort_in_same_branch(tenant_a):
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        student_cohort = CohortFactory(branch=branch)
+        other_cohort = CohortFactory(branch=branch)
+        student = StudentProfileFactory(branch=branch, current_cohort=student_cohort)
+        fee_schedule = FeeScheduleFactory(cohort=other_cohort)
+
+        with pytest.raises(ValidationException) as exc:
+            services.issue_invoice(
+                student_id=student.pk,
+                fee_schedule_id=fee_schedule.pk,
+            )
+        assert exc.value.code == "fee_schedule_cohort_mismatch"
+
+
+def test_issue_invoice_rechecks_locked_snapshot_against_authorized_scope(tenant_a):
+    """The write service must fail closed if placement changes after HTTP scope lookup."""
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        authorized_branch = BranchFactory()
+        current_branch = BranchFactory()
+        cohort = CohortFactory(branch=current_branch)
+        student = StudentProfileFactory(branch=current_branch, current_cohort=cohort)
+        fee_schedule = FeeScheduleFactory(cohort=cohort)
+
+        with pytest.raises(PermissionException) as exc:
+            services.issue_invoice(
+                student_id=student.pk,
+                fee_schedule_id=fee_schedule.pk,
+                allowed_scope_pairs={(authorized_branch.pk, None)},
+            )
+
+        assert exc.value.code == "out_of_scope"
+        assert not Invoice.objects.filter(student=student).exists()
 
 
 def test_issue_invoice_number_is_sequential_per_year(tenant_a):
@@ -251,15 +382,9 @@ def test_stacked_discounts_are_capped_at_the_charge(tenant_a):
         assert line_sum == inv.total_uzs  # invariant holds: no negative persisted balance
 
 
-def test_partial_payment_on_past_due_invoice_reaches_overdue_via_beat(tenant_a):
-    """R2-P2: a past-due invoice that takes a partial payment must still be able to
-    reach OVERDUE. Previously the beat's overdue flip targeted only ISSUED, so a
-    partially-paid delinquent invoice was stuck at PARTIALLY_PAID forever and dropped
-    out of every ?status=overdue aging/dunning view. The beat now includes past-due
-    PARTIALLY_PAID."""
+def test_partial_payment_on_past_due_invoice_is_immediately_overdue(tenant_a):
+    """A payment refresh must not hide a delinquent balance until the next beat."""
     from datetime import timedelta
-
-    from django.utils import timezone
 
     from apps.payments.models import Payment
 
@@ -283,14 +408,50 @@ def test_partial_payment_on_past_due_invoice_reaches_overdue_via_beat(tenant_a):
             amount_uzs=Decimal("300000.00"),
             status="completed",
             idempotency_key="r2p2-partial-overdue",
+            branch_at_payment_id=inv.branch_at_issue_id,
+            department_at_payment_id=inv.department_at_issue_id,
+            attribution_status="captured",
         )
         services.allocate_payment(payment_id=pay.pk, invoice_ids=[inv.pk], amount_uzs=Decimal("300000.00"))
         inv.refresh_from_db()
-        assert inv.status == Invoice.Status.PARTIALLY_PAID  # payment-time semantics unchanged
-        # The dunning beat re-flips a still-owing past-due partially-paid bill to overdue.
+        assert inv.status == Invoice.Status.OVERDUE
+        # The reminder job remains idempotently compatible with the status that
+        # the write transaction has already derived.
         services.emit_payment_reminders()
         inv.refresh_from_db()
         assert inv.status == Invoice.Status.OVERDUE
+
+
+@time_machine.travel("2026-06-05 12:30:00 +00:00", tick=False)
+def test_invoice_refresh_uses_organization_local_calendar_day(tenant_a):
+    """UTC is still June 5 while Pacific/Kiritimati is already June 6."""
+    from apps.payments.models import Payment
+
+    with schema_context(tenant_a.schema_name), timezone.override("UTC"):
+        settings = CenterSettings.load()
+        settings.organization_timezone = "Pacific/Kiritimati"
+        settings.save(update_fields=["organization_timezone", "updated_at"])
+        cache.clear()
+        invoice = InvoiceFactory(due_date=date(2026, 6, 5), total_uzs=Decimal("100.00"))
+        payment = Payment.objects.create(
+            provider=Payment.Method.CASH,
+            amount_uzs=Decimal("10.00"),
+            status=Payment.Status.COMPLETED,
+            idempotency_key="organization-local-overdue",
+            branch_at_payment_id=invoice.branch_at_issue_id,
+            department_at_payment_id=invoice.department_at_issue_id,
+            attribution_status="captured",
+        )
+
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[invoice.pk],
+            amount_uzs=Decimal("10.00"),
+        )
+
+        invoice.refresh_from_db()
+        assert timezone.localdate() == date(2026, 6, 5)  # caller context remains UTC
+        assert invoice.status == Invoice.Status.OVERDUE  # organization day is June 6
 
 
 # --------------------------------------------------------------------------- #
@@ -314,10 +475,48 @@ def test_auto_issue_on_enrollment_creates_one_invoice(tenant_a):
         assert Invoice.objects.filter(student=student).count() == 1
 
 
+def test_auto_issue_locks_student_before_idempotency_check(tenant_a):
+    """A repeated callback must serialize before its dedupe read.
+
+    The existing-invoice path never reaches ``issue_invoice``, so any student
+    ``FOR UPDATE`` observed here belongs to ``auto_issue_on_enrollment`` itself.
+    This prevents two callbacks from both observing an empty dedupe key.
+    """
+    with schema_context(tenant_a.schema_name):
+        from django.db import connection
+
+        cohort = CohortFactory()
+        student = StudentProfileFactory(current_cohort=cohort, branch=cohort.branch)
+        FeeScheduleFactory(cohort=cohort, amount_uzs=Decimal("800000.00"))
+        first = services.auto_issue_on_enrollment(
+            student_id=student.pk,
+            cohort_id=cohort.pk,
+        )
+        assert first is not None
+
+        lock_queries: list[str] = []
+
+        def capture_student_lock(execute, sql, params, many, context):
+            if 'FROM "students_studentprofile"' in sql and "FOR UPDATE" in sql:
+                lock_queries.append(sql)
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(capture_student_lock):
+            repeated = services.auto_issue_on_enrollment(
+                student_id=student.pk,
+                cohort_id=cohort.pk,
+            )
+
+        assert repeated is not None
+        assert repeated.pk == first.pk
+        assert len(lock_queries) == 1
+        assert 'FOR UPDATE OF "students_studentprofile"' in lock_queries[0]
+
+
 def test_auto_issue_falls_back_to_center_wide_schedule(tenant_a):
     with schema_context(tenant_a.schema_name):
         cohort = CohortFactory()
-        student = StudentProfileFactory(current_cohort=cohort)
+        student = StudentProfileFactory(current_cohort=cohort, branch=cohort.branch)
         FeeScheduleFactory(cohort=None, amount_uzs=Decimal("700000.00"))  # center-wide
         inv = services.auto_issue_on_enrollment(student_id=student.pk, cohort_id=cohort.pk)
         assert inv is not None
@@ -327,7 +526,7 @@ def test_auto_issue_falls_back_to_center_wide_schedule(tenant_a):
 def test_auto_issue_no_matching_schedule_returns_none(tenant_a):
     with schema_context(tenant_a.schema_name):
         cohort = CohortFactory()
-        student = StudentProfileFactory(current_cohort=cohort)
+        student = StudentProfileFactory(current_cohort=cohort, branch=cohort.branch)
         assert services.auto_issue_on_enrollment(student_id=student.pk, cohort_id=cohort.pk) is None
         assert Invoice.objects.filter(student=student).count() == 0
 
@@ -363,16 +562,42 @@ def test_enrollment_signal_receiver_issues_once(tenant_a, django_capture_on_comm
 def test_allocate_payment_single_invoice_marks_paid(tenant_a):
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("1000000.00"))
-        allocs = services.allocate_payment(payment_id=1, amount_uzs=Decimal("1000000.00"))
+        payment = _captured_payment(inv, amount="1000000.00", key="allocate-single")
+        allocs = services.allocate_payment(
+            payment_id=payment.pk,
+            amount_uzs=Decimal("1000000.00"),
+        )
         assert len(allocs) == 1
         inv.refresh_from_db()
         assert inv.status == Invoice.Status.PAID
 
 
+def test_allocate_payment_rejects_unconfirmed_payment(tenant_a):
+    with schema_context(tenant_a.schema_name):
+        from apps.payments.models import Payment
+
+        invoice = InvoiceFactory(total_uzs=Decimal("100000.00"))
+        payment = _captured_payment(invoice, amount="100000.00", key="allocate-pending")
+        payment.status = Payment.Status.PENDING
+        payment.save(update_fields=["status", "updated_at"])
+
+        with pytest.raises(UnprocessableEntity) as exc:
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("100000.00"),
+            )
+
+        assert exc.value.code == "payment_not_completed"
+        assert not PaymentAllocation.objects.filter(payment_id=payment.pk).exists()
+        invoice.refresh_from_db()
+        assert invoice.status == Invoice.Status.ISSUED
+
+
 def test_allocate_payment_partial_marks_partially_paid(tenant_a):
     with schema_context(tenant_a.schema_name):
-        inv = InvoiceFactory(total_uzs=Decimal("1000000.00"))
-        services.allocate_payment(payment_id=2, amount_uzs=Decimal("400000.00"))
+        inv = InvoiceFactory(total_uzs=Decimal("1000000.00"), due_date=date(2099, 6, 5))
+        payment = _captured_payment(inv, amount="400000.00", key="allocate-partial")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("400000.00"))
         inv.refresh_from_db()
         assert inv.status == Invoice.Status.PARTIALLY_PAID
 
@@ -384,7 +609,8 @@ def test_allocate_payment_oldest_due_first(tenant_a):
         student = StudentProfileFactory()
         old = InvoiceFactory(student=student, due_date=date(2026, 1, 1), total_uzs=Decimal("300000.00"))
         new = InvoiceFactory(student=student, due_date=date(2026, 6, 1), total_uzs=Decimal("300000.00"))
-        services.allocate_payment(payment_id=3, amount_uzs=Decimal("300000.00"))
+        payment = _captured_payment(old, amount="300000.00", key="allocate-oldest")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("300000.00"))
         old.refresh_from_db()
         new.refresh_from_db()
         assert old.status == Invoice.Status.PAID
@@ -396,10 +622,10 @@ def test_allocate_payment_three_way_odd_split_is_exact(tenant_a):
     rounding loss), Decimal throughout."""
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory()
-        for _ in range(3):
-            InvoiceFactory(student=student, total_uzs=Decimal("333333.34"))
+        invoices = [InvoiceFactory(student=student, total_uzs=Decimal("333333.34")) for _ in range(3)]
         amount = Decimal("1000000.01")
-        allocs = services.allocate_payment(payment_id=4, amount_uzs=amount)
+        payment = _captured_payment(invoices[0], amount=str(amount), key="allocate-three-way")
+        allocs = services.allocate_payment(payment_id=payment.pk, amount_uzs=amount)
         total = sum((a.amount_uzs for a in allocs), Decimal("0"))
         assert total == amount
         for a in allocs:
@@ -408,19 +634,62 @@ def test_allocate_payment_three_way_odd_split_is_exact(tenant_a):
 
 def test_allocate_payment_over_allocation_raises(tenant_a):
     with schema_context(tenant_a.schema_name):
-        InvoiceFactory(total_uzs=Decimal("100000.00"))
+        invoice = InvoiceFactory(total_uzs=Decimal("100000.00"))
+        payment = _captured_payment(invoice, amount="200000.00", key="allocate-over")
         with pytest.raises(ValidationException) as exc:
-            services.allocate_payment(payment_id=5, amount_uzs=Decimal("200000.00"))
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("200000.00"),
+            )
         assert exc.value.code == "over_allocation"
 
 
 def test_allocate_payment_idempotent_on_payment_id(tenant_a):
     with schema_context(tenant_a.schema_name):
-        InvoiceFactory(total_uzs=Decimal("100000.00"))
-        first = services.allocate_payment(payment_id=6, amount_uzs=Decimal("100000.00"))
-        again = services.allocate_payment(payment_id=6, amount_uzs=Decimal("100000.00"))
+        invoice = InvoiceFactory(total_uzs=Decimal("100000.00"))
+        payment = _captured_payment(invoice, amount="100000.00", key="allocate-idempotent")
+        first = services.allocate_payment(
+            payment_id=payment.pk,
+            amount_uzs=Decimal("100000.00"),
+        )
+        again = services.allocate_payment(
+            payment_id=payment.pk,
+            amount_uzs=Decimal("100000.00"),
+        )
         assert {a.pk for a in first} == {a.pk for a in again}
-        assert PaymentAllocation.objects.filter(payment_id=6).count() == 1
+        assert PaymentAllocation.objects.filter(payment_id=payment.pk).count() == 1
+
+
+def test_allocate_payment_rejects_more_than_received_and_mismatched_retry(tenant_a):
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(total_uzs=Decimal("200000.00"))
+        payment = _captured_payment(invoice, amount="100000.00", key="allocate-intent-bound")
+        with pytest.raises(ValidationException) as exceeds:
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("150000.00"),
+            )
+        assert exceeds.value.code == "allocation_exceeds_payment"
+
+        with pytest.raises(ValidationException) as partial:
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("90000.00"),
+            )
+        assert partial.value.code == "allocation_total_mismatch"
+
+        services.allocate_payment(
+            payment_id=payment.pk,
+            amount_uzs=Decimal("100000.00"),
+            invoice_ids=[invoice.pk],
+        )
+        with pytest.raises(ConflictException) as mismatch:
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("90000.00"),
+                invoice_ids=[invoice.pk],
+            )
+        assert mismatch.value.code == "allocation_intent_mismatch"
 
 
 # --------------------------------------------------------------------------- #
@@ -524,8 +793,13 @@ def test_payment_plan_happy(tenant_a):
 def test_refund_illegal_transition_raises(tenant_a):
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=20, amount_uzs=Decimal("100000.00"))
-        refund = services.request_refund(invoice=inv, amount_uzs=Decimal("100000.00"), payment_id=20)
+        payment = _captured_payment(inv, amount="100000.00", key="refund-illegal")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("100000.00"))
+        refund = services.request_refund(
+            invoice=inv,
+            amount_uzs=Decimal("100000.00"),
+            payment_id=payment.pk,
+        )
         with pytest.raises(ValidationException) as exc:
             services.transition_refund(refund_id=refund.pk, to_state=Refund.State.COMPLETED)
         assert exc.value.code == "invalid_refund_transition"
@@ -536,39 +810,85 @@ def test_register_refund_completion_idempotent(tenant_a):
 
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=21, amount_uzs=Decimal("100000.00"))
+        payment = _captured_payment(inv, amount="100000.00", key="refund-idempotent")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("100000.00"))
         refund = services.request_refund(invoice=inv, amount_uzs=Decimal("100000.00"))
         done = services.register_refund_completion(
-            refund.pk, payment_id=21, provider="payme", provider_refund_id="payme-21"
+            refund.pk,
+            payment_id=payment.pk,
+            provider="payme",
+            provider_refund_id=f"payme-{payment.pk}",
         )
         assert done.state == Refund.State.COMPLETED
-        assert done.payment_id == 21
+        assert done.payment_id == payment.pk
         assert done.provider == "payme"
         assert done.provider_confirmed_at is not None
         assert done.ledger_entry_id is not None
         ledger_entry_id = done.ledger_entry_id
         again = services.register_refund_completion(
-            refund.pk, payment_id=21, provider="payme", provider_refund_id="payme-21"
+            refund.pk,
+            payment_id=payment.pk,
+            provider="payme",
+            provider_refund_id=f"payme-{payment.pk}",
         )
         assert again.state == Refund.State.COMPLETED
         assert again.ledger_entry_id == ledger_entry_id
         assert LedgerEntry.objects.filter(source_kind="refund", source_id=refund.pk).count() == 1
 
 
+def test_register_refund_completion_rejects_reused_provider_reference(tenant_a):
+    with schema_context(tenant_a.schema_name):
+        student = StudentProfileFactory()
+        first_invoice = InvoiceFactory(student=student, total_uzs=Decimal("100.00"))
+        second_invoice = InvoiceFactory(student=student, total_uzs=Decimal("100.00"))
+        first_payment = _captured_payment(first_invoice, amount="100.00", key="refund-ref-first")
+        second_payment = _captured_payment(second_invoice, amount="100.00", key="refund-ref-second")
+        services.allocate_payment(payment_id=first_payment.pk, amount_uzs=Decimal("100.00"))
+        services.allocate_payment(payment_id=second_payment.pk, amount_uzs=Decimal("100.00"))
+        first_refund = services.request_refund(
+            invoice=first_invoice,
+            amount_uzs=Decimal("100.00"),
+            payment_id=first_payment.pk,
+        )
+        second_refund = services.request_refund(
+            invoice=second_invoice,
+            amount_uzs=Decimal("100.00"),
+            payment_id=second_payment.pk,
+        )
+        services.register_refund_completion(
+            first_refund.pk,
+            provider="payme",
+            provider_refund_id="provider-ref-once",
+        )
+
+        with pytest.raises(ConflictException) as exc:
+            services.register_refund_completion(
+                second_refund.pk,
+                provider="payme",
+                provider_refund_id="provider-ref-once",
+            )
+
+        assert exc.value.code == "refund_confirmation_reused"
+        second_refund.refresh_from_db()
+        assert second_refund.state == Refund.State.REQUESTED
+        assert second_refund.ledger_entry_id is None
+
+
 def test_register_refund_completion_requires_matching_provider_confirmation(tenant_a):
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=210, amount_uzs=Decimal("100000.00"))
+        payment = _captured_payment(inv, amount="100000.00", key="refund-provider-match")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("100000.00"))
         refund = services.request_refund(
             invoice=inv,
             amount_uzs=Decimal("100000.00"),
-            payment_id=210,
+            payment_id=payment.pk,
             provider="click",
         )
         with pytest.raises(ValidationException) as missing:
             services.register_refund_completion(
                 refund.pk,
-                payment_id=210,
+                payment_id=payment.pk,
                 provider="click",
                 provider_refund_id="",
             )
@@ -576,7 +896,7 @@ def test_register_refund_completion_requires_matching_provider_confirmation(tena
         with pytest.raises(ValidationException) as mismatch:
             services.register_refund_completion(
                 refund.pk,
-                payment_id=210,
+                payment_id=payment.pk,
                 provider="payme",
                 provider_refund_id="payme-210",
             )
@@ -586,10 +906,36 @@ def test_register_refund_completion_requires_matching_provider_confirmation(tena
         assert refund.ledger_entry_id is None
 
 
+def test_register_refund_completion_requires_a_source_payment(tenant_a):
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(total_uzs=Decimal("100000.00"))
+        payment = _captured_payment(invoice, amount="100000.00", key="refund-source-required")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            amount_uzs=Decimal("100000.00"),
+        )
+        refund = services.request_refund(
+            invoice=invoice,
+            amount_uzs=Decimal("100000.00"),
+        )
+
+        with pytest.raises(ValidationException) as exc:
+            services.register_refund_completion(
+                refund.pk,
+                provider="payme",
+                provider_refund_id="missing-source-payment",
+            )
+        assert exc.value.code == "refund_payment_required"
+        refund.refresh_from_db()
+        assert refund.state == Refund.State.REQUESTED
+        assert refund.ledger_entry_id is None
+
+
 def test_refund_exceeds_paid_rejected(tenant_a):
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=22, amount_uzs=Decimal("50000.00"))
+        payment = _captured_payment(inv, amount="50000.00", key="refund-exceeds-paid")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("50000.00"))
         with pytest.raises(ValidationException) as exc:
             services.request_refund(invoice=inv, amount_uzs=Decimal("90000.00"))
         assert exc.value.code == "refund_exceeds_paid"
@@ -600,14 +946,24 @@ def test_refund_exceeds_single_payment_contribution_rejected(tenant_a):
     contributed, even though the invoice-level paid total would allow it."""
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=70, amount_uzs=Decimal("50000.00"))
-        services.allocate_payment(payment_id=71, amount_uzs=Decimal("50000.00"))
+        payment_a = _captured_payment(inv, amount="50000.00", key="refund-part-a")
+        payment_b = _captured_payment(inv, amount="50000.00", key="refund-part-b")
+        services.allocate_payment(payment_id=payment_a.pk, amount_uzs=Decimal("50000.00"))
+        services.allocate_payment(payment_id=payment_b.pk, amount_uzs=Decimal("50000.00"))
         # Invoice net_paid is 100000, but payment 70 only contributed 50000.
         with pytest.raises(ValidationException) as exc:
-            services.request_refund(invoice=inv, amount_uzs=Decimal("80000.00"), payment_id=70)
+            services.request_refund(
+                invoice=inv,
+                amount_uzs=Decimal("80000.00"),
+                payment_id=payment_a.pk,
+            )
         assert exc.value.code == "refund_exceeds_payment"
         # A refund up to the payment's own contribution still succeeds.
-        ok = services.request_refund(invoice=inv, amount_uzs=Decimal("50000.00"), payment_id=70)
+        ok = services.request_refund(
+            invoice=inv,
+            amount_uzs=Decimal("50000.00"),
+            payment_id=payment_a.pk,
+        )
         assert ok.amount_uzs == Decimal("50000.00")
 
 
@@ -625,7 +981,13 @@ def test_refund_reversal_is_scoped_to_the_named_invoice(tenant_a):
         inv_a = InvoiceFactory(student=student, total_uzs=Decimal("100000.00"), due_date=date(2026, 1, 1))
         inv_b = InvoiceFactory(student=student, total_uzs=Decimal("60000.00"), due_date=date(2026, 2, 1))
         pay = Payment.objects.create(
-            provider="cash", amount_uzs=Decimal("160000.00"), status="completed", idempotency_key="r5c1"
+            provider="cash",
+            amount_uzs=Decimal("160000.00"),
+            status="completed",
+            idempotency_key="r5c1",
+            branch_at_payment_id=inv_a.branch_at_issue_id,
+            department_at_payment_id=inv_a.department_at_issue_id,
+            attribution_status="captured",
         )
         services.allocate_payment(
             payment_id=pay.pk, invoice_ids=[inv_a.pk, inv_b.pk], amount_uzs=Decimal("160000.00")
@@ -666,10 +1028,22 @@ def test_refund_ceiling_is_payment_intersect_invoice_not_payment_wide(tenant_a):
         inv_a = InvoiceFactory(student=student, total_uzs=Decimal("150000.00"), due_date=date(2026, 1, 1))
         inv_b = InvoiceFactory(student=student, total_uzs=Decimal("60000.00"), due_date=date(2026, 2, 1))
         p = Payment.objects.create(
-            provider="cash", amount_uzs=Decimal("160000.00"), status="completed", idempotency_key="r6p"
+            provider="cash",
+            amount_uzs=Decimal("160000.00"),
+            status="completed",
+            idempotency_key="r6p",
+            branch_at_payment_id=inv_a.branch_at_issue_id,
+            department_at_payment_id=inv_a.department_at_issue_id,
+            attribution_status="captured",
         )
         q = Payment.objects.create(
-            provider="cash", amount_uzs=Decimal("50000.00"), status="completed", idempotency_key="r6q"
+            provider="cash",
+            amount_uzs=Decimal("50000.00"),
+            status="completed",
+            idempotency_key="r6q",
+            branch_at_payment_id=inv_a.branch_at_issue_id,
+            department_at_payment_id=inv_a.department_at_issue_id,
+            attribution_status="captured",
         )
         # Manual split: P 100000 -> A, 60000 -> B; Q 50000 -> A. Invoice A is PAID (150000).
         services.allocate_payment_lines(
@@ -698,20 +1072,36 @@ def test_register_refund_completion_reverses_allocation_and_status(tenant_a):
     flip the invoice off PAID, restoring the outstanding balance."""
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory()
-        inv = InvoiceFactory(student=student, total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=50, invoice_ids=[inv.pk], amount_uzs=Decimal("100000.00"))
+        inv = InvoiceFactory(
+            student=student,
+            total_uzs=Decimal("100000.00"),
+            due_date=date(2099, 6, 5),
+        )
+        payment = _captured_payment(inv, amount="100000.00", key="refund-reversal")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[inv.pk],
+            amount_uzs=Decimal("100000.00"),
+        )
         inv.refresh_from_db()
         assert inv.status == Invoice.Status.PAID
         assert selectors.outstanding_balance(student.pk) == Decimal("0.00")
 
-        refund = services.request_refund(invoice=inv, amount_uzs=Decimal("100000.00"), payment_id=50)
+        refund = services.request_refund(
+            invoice=inv,
+            amount_uzs=Decimal("100000.00"),
+            payment_id=payment.pk,
+        )
         services.register_refund_completion(
-            refund.pk, payment_id=50, provider="payme", provider_refund_id="payme-50"
+            refund.pk,
+            payment_id=payment.pk,
+            provider="payme",
+            provider_refund_id=f"payme-{payment.pk}",
         )
 
         inv.refresh_from_db()
         assert inv.status == Invoice.Status.ISSUED
-        assert PaymentAllocation.objects.filter(payment_id=50).count() == 0
+        assert PaymentAllocation.objects.filter(payment_id=payment.pk).count() == 0
         assert selectors.outstanding_balance(student.pk) == Decimal("100000.00")
 
 
@@ -720,12 +1110,28 @@ def test_partial_refund_reverses_only_refunded_amount(tenant_a):
     PARTIALLY_PAID and the balance reflects the still-paid remainder."""
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory()
-        inv = InvoiceFactory(student=student, total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=51, invoice_ids=[inv.pk], amount_uzs=Decimal("100000.00"))
+        inv = InvoiceFactory(
+            student=student,
+            total_uzs=Decimal("100000.00"),
+            due_date=date(2099, 6, 5),
+        )
+        payment = _captured_payment(inv, amount="100000.00", key="refund-partial")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[inv.pk],
+            amount_uzs=Decimal("100000.00"),
+        )
 
-        refund = services.request_refund(invoice=inv, amount_uzs=Decimal("30000.00"), payment_id=51)
+        refund = services.request_refund(
+            invoice=inv,
+            amount_uzs=Decimal("30000.00"),
+            payment_id=payment.pk,
+        )
         services.register_refund_completion(
-            refund.pk, payment_id=51, provider="payme", provider_refund_id="payme-51"
+            refund.pk,
+            payment_id=payment.pk,
+            provider="payme",
+            provider_refund_id=f"payme-{payment.pk}",
         )
 
         inv.refresh_from_db()
@@ -734,8 +1140,42 @@ def test_partial_refund_reverses_only_refunded_amount(tenant_a):
         assert selectors.outstanding_balance(student.pk) == Decimal("30000.00")
         from django.db.models import Sum
 
-        remaining = PaymentAllocation.objects.filter(payment_id=51).aggregate(s=Sum("amount_uzs"))["s"]
+        remaining = PaymentAllocation.objects.filter(payment_id=payment.pk).aggregate(s=Sum("amount_uzs"))[
+            "s"
+        ]
         assert remaining == Decimal("70000.00")
+
+
+@time_machine.travel("2026-06-10 12:00:00 +05:00", tick=False)
+def test_refund_reopens_past_due_invoice_as_overdue_in_same_transaction(tenant_a):
+    """A refund race must not briefly turn delinquent receivables into current ones."""
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(
+            total_uzs=Decimal("100000.00"),
+            due_date=date(2026, 6, 5),
+        )
+        payment = _captured_payment(invoice, amount="100000.00", key="refund-overdue-refresh")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[invoice.pk],
+            amount_uzs=Decimal("100000.00"),
+        )
+        refund = services.request_refund(
+            invoice=invoice,
+            amount_uzs=Decimal("30000.00"),
+            payment_id=payment.pk,
+        )
+
+        services.register_refund_completion(
+            refund.pk,
+            payment_id=payment.pk,
+            provider="payme",
+            provider_refund_id="past-due-refund-confirmed",
+        )
+
+        invoice.refresh_from_db()
+        assert invoice.status == Invoice.Status.OVERDUE
+        assert selectors.outstanding_balance(invoice.student_id) == Decimal("30000.00")
 
 
 def test_second_refund_after_completion_rejected(tenant_a):
@@ -743,15 +1183,31 @@ def test_second_refund_after_completion_rejected(tenant_a):
     second full refund on the same invoice is rejected — the net paid is gone."""
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=52, invoice_ids=[inv.pk], amount_uzs=Decimal("100000.00"))
+        payment = _captured_payment(inv, amount="100000.00", key="refund-second")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[inv.pk],
+            amount_uzs=Decimal("100000.00"),
+        )
 
-        refund = services.request_refund(invoice=inv, amount_uzs=Decimal("100000.00"), payment_id=52)
+        refund = services.request_refund(
+            invoice=inv,
+            amount_uzs=Decimal("100000.00"),
+            payment_id=payment.pk,
+        )
         services.register_refund_completion(
-            refund.pk, payment_id=52, provider="payme", provider_refund_id="payme-52"
+            refund.pk,
+            payment_id=payment.pk,
+            provider="payme",
+            provider_refund_id=f"payme-{payment.pk}",
         )
 
         with pytest.raises(ValidationException) as exc:
-            services.request_refund(invoice=inv, amount_uzs=Decimal("100000.00"), payment_id=52)
+            services.request_refund(
+                invoice=inv,
+                amount_uzs=Decimal("100000.00"),
+                payment_id=payment.pk,
+            )
         assert exc.value.code == "refund_exceeds_paid"
 
 
@@ -760,11 +1216,24 @@ def test_in_flight_refund_blocks_a_second_request(tenant_a):
     same gross paid amount — the second is rejected as over the net paid."""
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=53, invoice_ids=[inv.pk], amount_uzs=Decimal("100000.00"))
+        payment = _captured_payment(inv, amount="100000.00", key="refund-in-flight")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[inv.pk],
+            amount_uzs=Decimal("100000.00"),
+        )
 
-        services.request_refund(invoice=inv, amount_uzs=Decimal("60000.00"), payment_id=53)
+        services.request_refund(
+            invoice=inv,
+            amount_uzs=Decimal("60000.00"),
+            payment_id=payment.pk,
+        )
         with pytest.raises(ValidationException) as exc:
-            services.request_refund(invoice=inv, amount_uzs=Decimal("60000.00"), payment_id=53)
+            services.request_refund(
+                invoice=inv,
+                amount_uzs=Decimal("60000.00"),
+                payment_id=payment.pk,
+            )
         assert exc.value.code == "refund_exceeds_paid"
 
 
@@ -776,7 +1245,8 @@ def test_in_flight_refund_blocks_a_second_request(tenant_a):
 def test_void_invoice_with_payments_rejected(tenant_a):
     with schema_context(tenant_a.schema_name):
         inv = InvoiceFactory(total_uzs=Decimal("100000.00"))
-        services.allocate_payment(payment_id=30, amount_uzs=Decimal("100000.00"))
+        payment = _captured_payment(inv, amount="100000.00", key="void-with-payment")
+        services.allocate_payment(payment_id=payment.pk, amount_uzs=Decimal("100000.00"))
         with pytest.raises(ConflictException):
             services.void_invoice(invoice=inv)
 
@@ -800,7 +1270,12 @@ def test_outstanding_balance_math(tenant_a):
         InvoiceFactory(student=student, total_uzs=Decimal("100000.00"))
         inv2 = InvoiceFactory(student=student, total_uzs=Decimal("100000.00"))
         # pay one fully
-        services.allocate_payment(payment_id=40, invoice_ids=[inv2.pk], amount_uzs=Decimal("100000.00"))
+        payment = _captured_payment(inv2, amount="100000.00", key="outstanding-math")
+        services.allocate_payment(
+            payment_id=payment.pk,
+            invoice_ids=[inv2.pk],
+            amount_uzs=Decimal("100000.00"),
+        )
         assert selectors.outstanding_balance(student.pk) == Decimal("100000.00")
 
 

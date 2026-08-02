@@ -53,7 +53,14 @@ class PenaltyRepository(BaseRepository[Penalty], IPenaltyRepository):
             return qs
         # The SUBJECT always sees their own record: a student their demerits (+ a parent
         # their children's), a staff member their own discipline.
-        scope = Q(student__user=user) | Q(student__guardians__parent__user=user) | Q(staff=user)
+        scope = (
+            Q(student__user=user)
+            | Q(
+                student__guardians__parent__user=user,
+                student__guardians__revoked_at__isnull=True,
+            )
+            | Q(staff=user)
+        )
         if can_waive:
             # A manager (waive-capable) handles ALL their branch's penalties — student
             # demerits AND staff discipline.

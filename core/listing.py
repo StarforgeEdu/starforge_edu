@@ -5,23 +5,135 @@ composable functions a plain ``list_view`` calls before handing the page to a pr
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
+from datetime import date, datetime, time
 from typing import Any
 
-from django.core.exceptions import FieldError
+from django.core.exceptions import FieldDoesNotExist, FieldError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models
 from django.db.models import Q, QuerySet
 from django.http import HttpRequest
+from django.utils import timezone
 
 from core.exceptions import ValidationException
 from core.http import parse_bool
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
+MAX_SEARCH_LENGTH = 200
 # A page whose offset would exceed this is treated as past-the-end (empty) rather
 # than passed to the DB — Postgres OFFSET is a bigint and a giant ?page overflows it.
 _MAX_OFFSET = 1_000_000_000
+_MAX_BIGINT_ID = 9_223_372_036_854_775_807
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+
+
+def positive_int_filter(request: HttpRequest, name: str) -> int | None:
+    """Parse an optional positive-integer query filter without silent fallback.
+
+    An absent or empty filter remains optional. Any supplied non-integer, zero, or
+    negative value is a field-scoped 400 so a mistyped CEO filter cannot quietly
+    show an unintended register.
+    """
+    raw = _single_query_value(request, name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _bad_filter(name) from None
+    if value < 1:
+        raise _bad_filter(name)
+    return value
+
+
+def validate_pagination_filters(
+    request: HttpRequest,
+    *,
+    max_page_size: int = MAX_PAGE_SIZE,
+) -> None:
+    """Reject malformed or oversized explicit pagination values.
+
+    ``paginate`` retains its compatibility fallback for legacy endpoints. New
+    decision-critical registers call this first so ``?page=oops``, ``?page=0``,
+    and an unsupported page size cannot silently turn into a different request.
+    """
+
+    _bounded_positive_query(request, "page")
+    _bounded_positive_query(request, "page_size", maximum=max_page_size)
+
+
+def _bounded_positive_query(
+    request: HttpRequest,
+    name: str,
+    *,
+    maximum: int | None = None,
+) -> int | None:
+    raw = _single_query_value(request, name)
+    if raw is None:
+        return None
+    if raw == "":
+        raise _bad_filter(name)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _bad_filter(name) from None
+    if value < 1:
+        raise _bad_filter(name)
+    if maximum is not None and value > maximum:
+        raise _filter_error(name, f"Must be at most {maximum}.")
+    return value
+
+
+def parse_date_range_filters(request: HttpRequest) -> tuple[date | None, date | None]:
+    """Parse optional inclusive ``date_from`` / ``date_to`` ISO-date filters."""
+    date_from = _parse_date_filter(_single_query_value(request, "date_from"), "date_from")
+    date_to = _parse_date_filter(_single_query_value(request, "date_to"), "date_to")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise _filter_error("date_to", "Must be on or after date_from.")
+    return date_from, date_to
+
+
+def date_range_datetime_bounds(
+    date_from: date | None, date_to: date | None
+) -> tuple[datetime | None, datetime | None]:
+    """Convert local inclusive dates to timezone-aware datetime boundaries."""
+    current_timezone = timezone.get_current_timezone()
+    lower = (
+        timezone.make_aware(datetime.combine(date_from, time.min), current_timezone)
+        if date_from is not None
+        else None
+    )
+    upper = (
+        timezone.make_aware(datetime.combine(date_to, time.max), current_timezone)
+        if date_to is not None
+        else None
+    )
+    return lower, upper
+
+
+def apply_date_range_filters(
+    queryset: QuerySet,
+    *,
+    field: str,
+    date_from: date | None,
+    date_to: date | None,
+    datetime_field: bool = False,
+) -> QuerySet:
+    """Intersect a queryset with an inclusive date range on a date/datetime field."""
+    lower: date | datetime | None
+    upper: date | datetime | None
+    if datetime_field:
+        lower, upper = date_range_datetime_bounds(date_from, date_to)
+    else:
+        lower, upper = date_from, date_to
+    if lower is not None:
+        queryset = queryset.filter(**{f"{field}__gte": lower})
+    if upper is not None:
+        queryset = queryset.filter(**{f"{field}__lte": upper})
+    return queryset
 
 
 def apply_filters(
@@ -35,18 +147,16 @@ def apply_filters(
 ) -> QuerySet:
     """Apply ``?<field>=`` exact filters, ``?search=`` (icontains across
     ``search_fields``), and ``?ordering=`` (whitelisted to ``ordering_fields``,
-    leading ``-`` for desc). Unknown ordering falls back to ``default_ordering``."""
+    leading ``-`` for desc). An explicitly unsupported search or ordering value
+    is a field-scoped 400 rather than a misleading default result."""
     for field in filter_fields:
-        raw = request.GET.get(field)
+        raw = _single_query_value(request, field)
         if not raw:
             continue
         value: Any = raw
         # Coerce a boolean query param ("true"/"false"/"1"/"0") — Django's model
         # BooleanField rejects lowercase "true" and would raise ValidationError.
-        try:
-            model_field = queryset.model._meta.get_field(field.split("__")[0])
-        except Exception:
-            model_field = None
+        model_field = _resolve_filter_model_field(queryset.model, field)
         if isinstance(model_field, models.BooleanField):
             try:
                 value = parse_bool(raw, field)
@@ -54,6 +164,10 @@ def apply_filters(
                 raise _bad_filter(field) from None
         elif "\x00" in raw:
             raise _bad_filter(field)  # NUL bytes crash psycopg at bind time
+        elif model_field is not None and model_field.choices:
+            allowed_values = {str(choice) for choice, _label in model_field.flatchoices}
+            if raw not in allowed_values:
+                raise _bad_filter(field)
         # A bad value for a typed field raises at query-build time — ValueError for an
         # int/FK, Django's ValidationError for a date/datetime/uuid — turn either into a
         # clean 400 instead of a leaked 500.
@@ -62,16 +176,18 @@ def apply_filters(
         except (ValueError, FieldError, ValidationException, DjangoValidationError):
             raise _bad_filter(field) from None
 
-    term = request.GET.get("search")
-    if term and search_fields:
-        if "\x00" in term:
+    term = _single_query_value(request, "search")
+    if term and not search_fields:
+        raise _bad_filter("search")
+    if term:
+        if "\x00" in term or len(term) > MAX_SEARCH_LENGTH:
             raise _bad_filter("search")
         clause = Q()
         for field in search_fields:
             clause |= Q(**{f"{field}__icontains": term})
         queryset = queryset.filter(clause)
 
-    ordering = request.GET.get("ordering")
+    ordering = _single_query_value(request, "ordering")
     if ordering:
         # Strip at most ONE leading "-" (descending). ``lstrip("-")`` would strip every
         # dash, so "--field" would pass the whitelist yet reach order_by() as "--field"
@@ -79,6 +195,7 @@ def apply_filters(
         field_name = ordering[1:] if ordering.startswith("-") else ordering
         if field_name in ordering_fields:
             return queryset.order_by(ordering)
+        raise _bad_filter("ordering")
     if default_ordering is not None:
         return queryset.order_by(default_ordering)
     return queryset
@@ -105,14 +222,40 @@ def _ensure_total_order(queryset: QuerySet) -> QuerySet:
     return queryset.order_by(*ordering, "pk")
 
 
+def _resolve_filter_model_field(model: type[models.Model], lookup: str) -> Any:
+    """Resolve the concrete field at the end of a whitelisted ORM traversal."""
+    current_model = model
+    resolved = None
+    for part in lookup.split("__"):
+        try:
+            resolved = current_model._meta.get_field(part)
+        except FieldDoesNotExist:
+            # A lookup suffix (``__date``, ``__gte``) is not itself a model
+            # field; validation still applies to the last concrete field.
+            return resolved
+        related_model = getattr(resolved, "related_model", None)
+        if related_model is None:
+            return resolved
+        current_model = related_model
+    return resolved
+
+
 def paginate(
     request: HttpRequest, queryset: QuerySet, *, default_size: int = DEFAULT_PAGE_SIZE
 ) -> tuple[list[Any], int, int, int]:
-    """Slice ``queryset`` by ``?page`` / ``?page_size`` (size capped at MAX_PAGE_SIZE).
+    """Slice ``queryset`` by ``?page`` / ``?page_size`` (size bounded by MAX_PAGE_SIZE).
+
+    Malformed, non-positive, or oversized values are rejected explicitly; the
+    API never claims success after silently substituting a different page.
     Returns ``(items, total, page, page_size)``; counts before slicing for the meta.
     Pass the result to ``core.responses.paginated`` after mapping items to dicts."""
-    page = _positive_int(request.GET.get("page"), 1)
-    size = min(_positive_int(request.GET.get("page_size"), default_size), MAX_PAGE_SIZE)
+    page = _positive_int(_single_query_value(request, "page"), 1, field="page")
+    size = _positive_int(
+        _single_query_value(request, "page_size"),
+        default_size,
+        field="page_size",
+        max_value=MAX_PAGE_SIZE,
+    )
     total = queryset.count()
     start = (page - 1) * size
     if start > _MAX_OFFSET:
@@ -129,8 +272,13 @@ def paginate_sequence(
     """Bound an already-computed ordered result sequence with the same public paging
     contract as :func:`paginate`. Useful for transparent analytics whose ranking must
     be computed globally before a page can be selected."""
-    page = _positive_int(request.GET.get("page"), 1)
-    size = min(_positive_int(request.GET.get("page_size"), default_size), MAX_PAGE_SIZE)
+    page = _positive_int(_single_query_value(request, "page"), 1, field="page")
+    size = _positive_int(
+        _single_query_value(request, "page_size"),
+        default_size,
+        field="page_size",
+        max_value=MAX_PAGE_SIZE,
+    )
     total = len(items)
     start = (page - 1) * size
     if start > _MAX_OFFSET:
@@ -152,9 +300,14 @@ def cursor_paginate(
     ``(rows, next_link, previous_link)`` — the links are absolute URLs (or ``None``)
     carrying the ``?cursor`` and preserving the request's other query params (filters).
     """
-    size = min(_positive_int(request.GET.get("page_size"), page_size), max_page_size)
+    size = _positive_int(
+        _single_query_value(request, "page_size"),
+        page_size,
+        field="page_size",
+        max_value=max_page_size,
+    )
     direction, ts, obj_id = "f", None, None
-    token = request.GET.get("cursor")
+    token = _single_query_value(request, "cursor")
     if token:
         direction, ts, obj_id = _decode_cursor(token)
 
@@ -208,28 +361,85 @@ def _decode_cursor(token: str) -> tuple[str, Any, int]:
 
     from django.utils.dateparse import parse_datetime
 
+    if len(token) > 512:
+        raise _bad_filter("cursor")
     try:
-        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        # ``urlsafe_b64decode`` silently discards non-alphabet bytes by default.
+        # Cursor input is untrusted, so require a canonical URL-safe alphabet and
+        # reject whitespace/junk instead of accepting multiple spellings of the
+        # same database position.
+        raw = base64.b64decode(
+            token.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
         direction, iso, raw_id = raw.split("|")
         created_at = parse_datetime(iso)
-        if direction not in ("f", "b") or created_at is None:
+        obj_id = int(raw_id)
+        if (
+            direction not in ("f", "b")
+            or created_at is None
+            or not timezone.is_aware(created_at)
+            or obj_id < 1
+            or obj_id > _MAX_BIGINT_ID
+        ):
             raise ValueError
-        return direction, created_at, int(raw_id)
-    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+        return direction, created_at, obj_id
+    except (ValueError, binascii.Error, UnicodeDecodeError, UnicodeEncodeError) as exc:
         raise _bad_filter("cursor") from exc
 
 
-def _positive_int(raw: str | None, fallback: int) -> int:
-    try:
-        value = int(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+def _positive_int(
+    raw: str | None,
+    fallback: int,
+    *,
+    field: str,
+    max_value: int | None = None,
+) -> int:
+    if raw is None:
         return fallback
-    return value if value >= 1 else fallback
+    if raw == "":
+        raise _bad_filter(field)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _bad_filter(field) from None
+    if value < 1 or (max_value is not None and value > max_value):
+        raise _bad_filter(field)
+    return value
+
+
+def _single_query_value(request: HttpRequest, field: str) -> str | None:
+    """Return one query value and reject HTTP parameter pollution.
+
+    Django's ``QueryDict.get`` silently chooses the last duplicate. Proxies,
+    caches, and generated clients do not all make that same choice, so a signed
+    or reviewed management URL must have one unambiguous value per scalar field.
+    """
+    values = request.GET.getlist(field)
+    if len(values) > 1:
+        raise _filter_error(field, "Supply this parameter once.")
+    return values[0] if values else None
+
+
+def _parse_date_filter(raw: str | None, field: str) -> date | None:
+    if raw is None or raw == "":
+        return None
+    if _ISO_DATE_RE.fullmatch(raw) is None:
+        raise _bad_filter(field)
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise _bad_filter(field) from None
 
 
 def _bad_filter(field: str) -> ValidationException:
+    return _filter_error(field, "Invalid value.")
+
+
+def _filter_error(field: str, message: str) -> ValidationException:
     return ValidationException(
         f"Invalid value for filter '{field}'.",
         code="validation_error",
-        fields={field: ["Invalid value."]},
+        fields={field: [message]},
     )

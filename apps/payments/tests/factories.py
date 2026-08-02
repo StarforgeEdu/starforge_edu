@@ -6,7 +6,9 @@ from decimal import Decimal
 
 import factory
 
+from apps.org.tests.factories import BranchFactory
 from apps.payments.models import FiscalReceipt, Payment, Provider, ProviderConfig
+from core.historical_scope import ScopeAttributionStatus
 
 
 class ProviderConfigFactory(factory.django.DjangoModelFactory):
@@ -34,6 +36,8 @@ class PaymentFactory(factory.django.DjangoModelFactory):
     status = Payment.Status.PENDING
     idempotency_key = factory.Sequence(lambda n: f"idem-{n}")
     account_ref = factory.Sequence(lambda n: f"INV-2026-{n:06d}")
+    branch_at_payment = factory.SubFactory(BranchFactory)
+    attribution_status = ScopeAttributionStatus.CAPTURED
     metadata = factory.LazyFunction(dict)
 
 

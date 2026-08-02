@@ -13,6 +13,7 @@ from apps.content.models import (
     LessonFile,
     Module,
 )
+from core.utils import current_schema
 
 
 class ContentLibraryFactory(factory.django.DjangoModelFactory[ContentLibrary]):
@@ -63,7 +64,9 @@ class LessonFileFactory(factory.django.DjangoModelFactory[LessonFile]):
 
     folder = factory.SubFactory(FolderFactory)
     title = factory.Sequence(lambda n: f"File {n}")
-    s3_key = factory.Sequence(lambda n: f"tenant_a/content/{n}/file.pdf")
+    # The final storage path is record-bound, so replace this collision-free
+    # creation placeholder with the row's canonical path after INSERT.
+    s3_key = factory.Sequence(lambda n: f"tenant_a/content/factory-{n}/file.pdf")
     content_type = "application/pdf"
     size_bytes = 1000
     status = LessonFile.Status.CLEAN
@@ -71,3 +74,10 @@ class LessonFileFactory(factory.django.DjangoModelFactory[LessonFile]):
     # so visibility fixtures stay green (F4-5). Real uploads default to unapproved.
     is_approved_teacher = True
     is_approved_manager = True
+
+    @factory.post_generation
+    def canonical_storage_key(self, create, extracted, **_kwargs):
+        if not create or extracted is False:
+            return
+        self.s3_key = f"{current_schema()}/content/{self.pk}/file.pdf"
+        self.save(update_fields=["s3_key"])

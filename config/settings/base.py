@@ -23,24 +23,35 @@ env = environ.Env(
     DATABASE_URL=(str, "postgres://starforge:starforge@localhost:5432/starforge"),
     REDIS_URL=(str, "redis://localhost:6379/0"),
     CELERY_BROKER_URL=(str, ""),
-    CELERY_RESULT_BACKEND=(str, ""),
     CHANNEL_REDIS_URL=(str, ""),
+    WEBSOCKET_ALLOWED_ORIGINS=(list, []),
+    WEBSOCKET_HANDSHAKE_RATE_LIMIT=(int, 120),
+    WEBSOCKET_USER_CONNECT_RATE_LIMIT=(int, 30),
+    WEBSOCKET_MAX_CONNECTIONS_PER_SESSION=(int, 5),
+    WEBSOCKET_CONNECTION_LEASE_SECONDS=(int, 90),
     CORS_ALLOWED_ORIGINS=(list, []),
     CSRF_TRUSTED_ORIGINS=(list, []),
     AWS_STORAGE_BUCKET_NAME=(str, "starforge-media"),
     AWS_S3_ENDPOINT_URL=(str, ""),
     AWS_S3_PUBLIC_ENDPOINT_URL=(str, ""),
+    AWS_STATIC_PUBLIC_ENDPOINT_URL=(str, ""),
     AWS_S3_ACCESS_KEY_ID=(str, ""),
     AWS_S3_SECRET_ACCESS_KEY=(str, ""),
+    AWS_STATIC_ACCESS_KEY_ID=(str, ""),
+    AWS_STATIC_SECRET_ACCESS_KEY=(str, ""),
+    STATIC_STORAGE_WRITE_ENABLED=(bool, False),
     AWS_S3_REGION_NAME=(str, "us-east-1"),
     ESKIZ_API_URL=(str, "https://notify.eskiz.uz/api"),
+    ESKIZ_API_ALLOWED_HOSTS=(list, ["notify.eskiz.uz"]),
     ESKIZ_EMAIL=(str, ""),
     ESKIZ_PASSWORD=(str, ""),
     ESKIZ_FROM=(str, "4546"),  # TD-17: approved sender nick; 4546 is Eskiz's test sender
     ESKIZ_USE_MOCK=(bool, True),
+    SMS_MOCK_CAPTURE_OUTBOX=(bool, False),
     SMS_ENABLED=(bool, True),
     NUM_PROXIES=(int, 0),  # trusted reverse-proxy hops for X-Forwarded-For (0 = trust REMOTE_ADDR only)
     SESSION_TTL_DAYS=(int, 7),
+    SESSION_IDLE_TIMEOUT_MINUTES=(int, 8 * 60),
     ANTHROPIC_API_KEY=(str, ""),
     ANTHROPIC_USE_MOCK=(bool, True),  # D4-LA-2 (TD-2): mock-first; production.py sets False
     AI_ENABLED=(bool, True),
@@ -57,20 +68,39 @@ env = environ.Env(
     # redirect bases only. ---
     CLICK_USE_MOCK=(bool, True),
     CLICK_CHECKOUT_URL=(str, "https://my.click.uz/services/pay"),
+    CLICK_CHECKOUT_ALLOWED_HOSTS=(list, ["my.click.uz"]),
     PAYME_USE_MOCK=(bool, True),
     PAYME_CHECKOUT_URL=(str, "https://checkout.paycom.uz"),
+    PAYME_CHECKOUT_ALLOWED_HOSTS=(list, ["checkout.paycom.uz"]),
     UZUM_USE_MOCK=(bool, True),
     UZUM_CHECKOUT_URL=(str, "https://www.uzumbank.uz/open-service"),
+    UZUM_CHECKOUT_ALLOWED_HOSTS=(list, ["www.uzumbank.uz"]),
+    # The legacy Uzum shape in this repository predates the current official
+    # Merchant API. It is test-only until the Basic-auth, multi-operation
+    # contract is implemented and certified against Uzum's conformance suite.
+    UZUM_LEGACY_INTEGRATION_ENABLED=(bool, False),
+    # Daily CBU exchange-rate refresh. Development/test may use the deterministic
+    # rate; production.py forces the live public feed.
+    FINANCE_FX_USE_MOCK=(bool, True),
     # --- Soliq fiscalization (TD-7), mock-first [OWNER:O-5] ---
     SOLIQ_USE_MOCK=(bool, True),
     SOLIQ_API_URL=(str, ""),
+    SOLIQ_API_ALLOWED_HOSTS=(list, []),
     SOLIQ_API_TOKEN=(str, ""),
     SOLIQ_QR_BASE_URL=(str, "https://ofd.soliq.uz/check"),
+    # Exact verification hosts accepted from the provider response. Never use a
+    # wildcard: this URL is rendered as a browser navigation target.
+    SOLIQ_QR_ALLOWED_HOSTS=(list, ["ofd.soliq.uz"]),
     FISCALIZATION_ENABLED=(bool, True),
     # --- FCM push (TD-15), mock-first [OWNER:O-7] ---
     FCM_USE_MOCK=(bool, True),
+    FCM_MOCK_CAPTURE_OUTBOX=(bool, False),
     FCM_CREDENTIALS_FILE=(str, ""),
     PUSH_NOTIFICATIONS_ENABLED=(bool, True),
+    # Never enable outside config.settings.test. It exists solely for a small
+    # number of explicit legacy-fixture adapters while role-native tests migrate.
+    ALLOW_LEGACY_PRINCIPAL_UNION_FOR_TESTS=(bool, False),
+    ALLOW_LEGACY_TENANT_SESSIONS_FOR_TESTS=(bool, False),
     # --- Billing / paywall (TD-8) ---
     BILLING_TRIAL_GRACE_DAYS=(int, 3),
     BILLING_DUNNING_DAYS=(int, 7),
@@ -91,10 +121,21 @@ SECRET_KEY = env("SECRET_KEY")
 DEBUG = env("DEBUG")
 ALLOWED_HOSTS = env("ALLOWED_HOSTS")
 SESSION_TTL_DAYS = env("SESSION_TTL_DAYS")
+SESSION_IDLE_TIMEOUT_MINUTES = env("SESSION_IDLE_TIMEOUT_MINUTES")
+# Browser management consoles keep the opaque session key outside JavaScript in
+# a host-only HttpOnly cookie. Production/staging retain the ``__Host-`` prefix:
+# it requires HTTPS, Path=/, and forbids a Domain attribute. Development uses a
+# separate unprefixed cookie because its loopback origin is intentionally HTTP.
+API_SESSION_COOKIE_NAME = "__Host-starforge_session"
+API_SESSION_COOKIE_SECURE = True
+API_SESSION_COOKIE_SAMESITE = "Lax"
+API_SESSION_COOKIE_PATH = "/"
 AWS_S3_PUBLIC_ENDPOINT_URL = env("AWS_S3_PUBLIC_ENDPOINT_URL")
+AWS_STATIC_PUBLIC_ENDPOINT_URL = env("AWS_STATIC_PUBLIC_ENDPOINT_URL")
 HEALTH_READY_RATELIMIT = env("HEALTH_READY_RATELIMIT", default="30/min")
 HEALTH_READY_CACHE_SECONDS = env.float("HEALTH_READY_CACHE_SECONDS", default=0.0)
 HEALTH_REQUIRE_CELERY_HEARTBEAT = env.bool("HEALTH_REQUIRE_CELERY_HEARTBEAT", default=False)
+ADMIN_LOGIN_RATELIMIT = env.str("ADMIN_LOGIN_RATELIMIT", default="10/min")
 
 # ---------------------------------------------------------------------------
 # Apps: SHARED_APPS (public schema) vs TENANT_APPS (per-tenant schema)
@@ -147,6 +188,7 @@ TENANT_APPS = [
     "apps.auth.apps.AuthAppConfig",
     "apps.org.apps.OrgConfig",  # Branch + Department (per-tenant org structure)
     "apps.students.apps.StudentsConfig",
+    "apps.crm.apps.CRMConfig",
     "apps.parents.apps.ParentsConfig",
     "apps.teachers.apps.TeachersConfig",
     "apps.cohorts.apps.CohortsConfig",
@@ -158,6 +200,7 @@ TENANT_APPS = [
     "apps.printing.apps.PrintingConfig",
     "apps.finance.apps.FinanceConfig",
     "apps.payments.apps.PaymentsConfig",
+    "apps.payroll.apps.PayrollConfig",
     "apps.notifications.apps.NotificationsConfig",
     "apps.ai.apps.AIConfig",
     "apps.audit.apps.AuditConfig",
@@ -198,6 +241,10 @@ DOMAIN_VERIFICATION_DNS_URL = env.str(
     "DOMAIN_VERIFICATION_DNS_URL",
     default="https://cloudflare-dns.com/dns-query",
 )
+DOMAIN_VERIFICATION_DNS_ALLOWED_HOSTS = env.list(
+    "DOMAIN_VERIFICATION_DNS_ALLOWED_HOSTS",
+    default=["cloudflare-dns.com"],
+)
 DOMAIN_VERIFICATION_TIMEOUT_SECONDS = env.float(
     "DOMAIN_VERIFICATION_TIMEOUT_SECONDS",
     default=3.0,
@@ -235,6 +282,9 @@ MIDDLEWARE = [
     # answers a clean 503 so one app never falls the whole API; a degraded app (soft
     # dependency down) is served with a `warnings` list. Runs after tenant resolution.
     "core.middleware.AppAvailabilityMiddleware",
+    # Activate the tenant's authoritative organization timezone for all business
+    # date calculations. Public-schema routes retain the process default.
+    "core.middleware.OrganizationTimezoneMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.locale.LocaleMiddleware",
@@ -348,8 +398,17 @@ NUM_PROXIES = env("NUM_PROXIES")
 # BOTH view styles (DRF's throttles above only see DRF views). Every request pays
 # the pre-auth IP cap; valid sessions then pay a stable user-id cap.
 API_RATELIMIT_USER = env.str("API_RATELIMIT_USER", default="1000/min")
+API_RATELIMIT_AGENT = env.str("API_RATELIMIT_AGENT", default="600/min")
 API_RATELIMIT_ANON = env.str("API_RATELIMIT_ANON", default="60/min")
 API_RATELIMIT_PREAUTH = env.str("API_RATELIMIT_PREAUTH", default="300/min")
+
+# A physical print claim is a renewable, per-attempt lease. Expiry never
+# requeues work; the maintenance sweep quarantines it for human evidence.
+PRINT_AGENT_LEASE_SECONDS = env.int("PRINT_AGENT_LEASE_SECONDS", default=600)
+PRINT_STALE_LEASE_SWEEP_BATCH_SIZE = env.int(
+    "PRINT_STALE_LEASE_SWEEP_BATCH_SIZE",
+    default=100,
+)
 
 # Admission limits for memory/CPU-heavy PDF/XLSX background work. The shared
 # document caps cover report runs and transcripts together; per-kind caps make
@@ -388,10 +447,16 @@ SPECTACULAR_SETTINGS = {
 # Allow the WS ?token= auth fallback (default on for client compatibility). Set
 # False to force subprotocol-only auth (keeps tokens out of proxy/access logs).
 WEBSOCKET_ALLOW_QUERY_TOKEN = env.bool("WEBSOCKET_ALLOW_QUERY_TOKEN", default=True)
+WEBSOCKET_ALLOWED_ORIGINS = env("WEBSOCKET_ALLOWED_ORIGINS")
+WEBSOCKET_HANDSHAKE_RATE_LIMIT = env("WEBSOCKET_HANDSHAKE_RATE_LIMIT")
+WEBSOCKET_USER_CONNECT_RATE_LIMIT = env("WEBSOCKET_USER_CONNECT_RATE_LIMIT")
+WEBSOCKET_MAX_CONNECTIONS_PER_SESSION = env("WEBSOCKET_MAX_CONNECTIONS_PER_SESSION")
+WEBSOCKET_CONNECTION_LEASE_SECONDS = env("WEBSOCKET_CONNECTION_LEASE_SECONDS")
 
-# Fault isolation (core.availability): app labels turned OFF at boot (ops default). A
-# director can additionally toggle apps at runtime via /api/v1/org/system/apps/ (a
-# cache-backed override). A disabled app's endpoints answer 503 without falling the rest.
+# Fault isolation (core.availability): app labels turned OFF at boot (ops default). An
+# organization-wide system operator can additionally persist tenant-specific toggles via
+# /api/v1/org/system/apps/. Redis caches that durable state but is not its source of truth.
+# A disabled app's endpoints answer 503 without taking down unrelated applications.
 DISABLED_APPS = env.list("DISABLED_APPS", default=[])
 
 # The Redis connection URL as a SETTING (not just an env read at each use site): the
@@ -405,7 +470,17 @@ _channel_redis = env("CHANNEL_REDIS_URL") or env("REDIS_URL")
 CHANNEL_LAYERS = {
     "default": {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {"hosts": [_channel_redis]},
+        "CONFIG": {
+            "hosts": [_channel_redis],
+            # Realtime traffic contains student and finance-related notification
+            # metadata. Encrypt it while transiting/resting in Redis, bound each
+            # consumer queue, and expire crashed-process group memberships soon
+            # after the application heartbeat stops refreshing them.
+            "symmetric_encryption_keys": [SECRET_KEY],
+            "capacity": 100,
+            "expiry": 60,
+            "group_expiry": 120,
+        },
     },
 }
 
@@ -413,28 +488,72 @@ CHANNEL_LAYERS = {
 # Celery
 # ---------------------------------------------------------------------------
 CELERY_BROKER_URL = env("CELERY_BROKER_URL") or env("REDIS_URL")
-CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND") or env("REDIS_URL")
+# Refuse pickle/YAML task payloads even if a broker or producer is compromised.
+# Kombu's JSON serializer preserves the Decimal/date types used by our tasks
+# without granting arbitrary-code execution during message deserialization.
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+# Every task persists authoritative state in the database/object store and callers
+# track that domain record rather than polling Celery's transient AsyncResult.  A
+# Redis result backend therefore only duplicated payloads, consumed memory, and
+# retained error details with no reader.  Keep results disabled globally; a future
+# workflow that genuinely needs a result must opt in with a separately reviewed
+# backend and retention policy.
+CELERY_RESULT_BACKEND = None
 CELERY_TIMEZONE = "Asia/Tashkent"
 CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_IGNORE_RESULT = True
 CELERY_TASK_TIME_LIMIT = 30 * 60
 CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60
+# Project tasks persist their authoritative progress in tenant tables and are
+# written for at-least-once delivery.  Acknowledge only after completion and
+# return a message to Redis when a worker child disappears.  Ordinary task
+# exceptions are still acknowledged after their explicit retry budget is
+# exhausted, avoiding poison-message loops; the sanitized DLQ signal preserves
+# terminal operational evidence.
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_ACKS_ON_FAILURE_OR_TIMEOUT = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+# A task may legitimately occupy a worker for the full 30-minute hard limit.
+# Do not kill it merely because the broker connection was interrupted: the
+# provider outcome may be ambiguous, and a replacement delivery could duplicate
+# a payment, message, or model charge while the original child is still alive.
+CELERY_WORKER_CANCEL_LONG_RUNNING_TASKS_ON_CONNECTION_LOSS = False
+# Redis moves an unacknowledged delivery back to its queue after this period if
+# the whole worker/container disappears.  It is deliberately above the hard
+# task limit, but bounded so total-worker loss does not strand work for hours.
+CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": 45 * 60}
+CELERY_TASK_PUBLISH_RETRY = True
+CELERY_TASK_PUBLISH_RETRY_POLICY = {
+    "max_retries": 5,
+    "interval_start": 0,
+    "interval_step": 0.5,
+    "interval_max": 5,
+}
+# Release draining uses Celery's broadcast inspection to discover every live
+# worker, including containers whose Compose service name changed.
+CELERY_WORKER_ENABLE_REMOTE_CONTROL = True
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 # Keep long AI/report work from reserving large batches ahead of payment and
 # notification work. Child recycling bounds leaks from PDF/image/native stacks.
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_WORKER_MAX_TASKS_PER_CHILD = 200
 CELERY_WORKER_MAX_MEMORY_PER_CHILD = 256_000  # KiB
-CELERY_RESULT_EXPIRES = 60 * 60 * 24
 CELERY_TASK_DEFAULT_QUEUE = "default"
 CELERY_TASK_ROUTES = {
     "celery_tasks.payment_tasks.*": {"queue": "critical"},
     "celery_tasks.health_tasks.*": {"queue": "critical"},
+    "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries*": {
+        "queue": "maintenance"
+    },
     "celery_tasks.notification_tasks.*": {"queue": "notifications"},
     "celery_tasks.campaign_tasks.*": {"queue": "notifications"},
     "celery_tasks.ai_tasks.*": {"queue": "ai"},
     "celery_tasks.report_tasks.*": {"queue": "reports"},
     "celery_tasks.academics_tasks.*": {"queue": "reports"},
     "celery_tasks.content_tasks.*": {"queue": "reports"},
+    "celery_tasks.print_tasks.quarantine_stale_print_leases*": {"queue": "maintenance"},
     "celery_tasks.print_tasks.*": {"queue": "reports"},
     "celery_tasks.cleanup_tasks.*": {"queue": "maintenance"},
     "celery_tasks.audit_tasks.*": {"queue": "maintenance"},
@@ -442,6 +561,7 @@ CELERY_TASK_ROUTES = {
     "celery_tasks.attendance_tasks.*": {"queue": "maintenance"},
     "celery_tasks.schedule_tasks.*": {"queue": "maintenance"},
     "celery_tasks.assignment_tasks.*": {"queue": "maintenance"},
+    "celery_tasks.attachment_tasks.*": {"queue": "maintenance"},
     "celery_tasks.billing_tasks.*": {"queue": "maintenance"},
     "celery_tasks.finance_tasks.*": {"queue": "maintenance"},
 }
@@ -457,6 +577,16 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 30.0,
         "options": {"queue": "critical", "expires": 25},
     },
+    "quarantine-stale-print-leases": {
+        "task": "celery_tasks.print_tasks.quarantine_stale_print_leases",
+        "schedule": 60.0,
+        "options": {"queue": "maintenance", "expires": 55},
+    },
+    "reconcile-deferred-notification-deliveries": {
+        "task": "celery_tasks.notification_tasks.reconcile_deferred_notification_deliveries",
+        "schedule": 60.0,
+        "options": {"queue": "maintenance", "expires": 55},
+    },
     "deactivate-expired-trials": {
         "task": "celery_tasks.tenancy_tasks.deactivate_expired_trials",
         "schedule": 60 * 60,  # hourly
@@ -464,6 +594,15 @@ CELERY_BEAT_SCHEDULE = {
     "purge-expired-otps": {
         "task": "celery_tasks.cleanup_tasks.purge_expired_otps",
         "schedule": 60 * 60 * 24,  # daily
+    },
+    "purge-expired-ai-content": {
+        "task": "celery_tasks.ai_tasks.purge_expired_ai_content",
+        "schedule": 60 * 60 * 24,  # daily; accounting rows remain append-only
+        "options": {"queue": "maintenance"},
+    },
+    "cleanup-expired-attachment-uploads": {
+        "task": "celery_tasks.attachment_tasks.cleanup_expired_attachment_uploads",
+        "schedule": 60 * 60,  # hourly; upload policies expire after ten minutes
     },
     "send-lesson-reminders": {
         "task": "celery_tasks.schedule_tasks.send_lesson_reminders",
@@ -631,10 +770,12 @@ LOGGING = {
 # 3rd-party integration config
 # ---------------------------------------------------------------------------
 ESKIZ_API_URL = env("ESKIZ_API_URL")
+ESKIZ_API_ALLOWED_HOSTS = env("ESKIZ_API_ALLOWED_HOSTS")
 ESKIZ_EMAIL = env("ESKIZ_EMAIL")
 ESKIZ_PASSWORD = env("ESKIZ_PASSWORD")
 ESKIZ_FROM = env("ESKIZ_FROM")  # TD-17: sender ID (was hardcoded "4546")
 ESKIZ_USE_MOCK = env("ESKIZ_USE_MOCK")
+SMS_MOCK_CAPTURE_OUTBOX = env("SMS_MOCK_CAPTURE_OUTBOX")
 SMS_ENABLED = env("SMS_ENABLED")
 
 ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY")
@@ -657,11 +798,13 @@ ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 AI_DEFAULT_DAILY_TOKENS = 100_000
 AI_DEFAULT_MONTHLY_TOKENS = 2_000_000
 
-# D4-LA-2/4 placeholder AI pricing (microUSD per million tokens). Real pricing is
-# [OWNER:O-2]; apps.ai.services.cost_microusd() reads these (TD-13: no magic
-# numbers). Defaults approximate Claude Sonnet list pricing ($3/MTok in,
-# $15/MTok out) expressed in microUSD.
+# D4-LA-2/4 AI pricing in microUSD per million tokens. Keep all four receipt
+# classes explicit: Anthropic reports base input, 5-minute prompt-cache writes,
+# cache reads, and output separately. A model/pricing change is a reviewed
+# configuration release, never an implicit reinterpretation of historical cost.
 AI_COST_PER_MTOK_INPUT_MICROUSD = 3_000_000
+AI_COST_PER_MTOK_CACHE_WRITE_MICROUSD = 3_750_000
+AI_COST_PER_MTOK_CACHE_READ_MICROUSD = 300_000
 AI_COST_PER_MTOK_OUTPUT_MICROUSD = 15_000_000
 
 # OTP config (consumed by apps.auth)
@@ -686,22 +829,32 @@ OTP_GLOBAL_RATE_WINDOW_SECONDS = env.int("OTP_GLOBAL_RATE_WINDOW_SECONDS", defau
 # these settings are the mock toggles + provider redirect/checkout bases.
 CLICK_USE_MOCK = env("CLICK_USE_MOCK")
 CLICK_CHECKOUT_URL = env("CLICK_CHECKOUT_URL")
+CLICK_CHECKOUT_ALLOWED_HOSTS = env("CLICK_CHECKOUT_ALLOWED_HOSTS")
 PAYME_USE_MOCK = env("PAYME_USE_MOCK")
 PAYME_CHECKOUT_URL = env("PAYME_CHECKOUT_URL")
+PAYME_CHECKOUT_ALLOWED_HOSTS = env("PAYME_CHECKOUT_ALLOWED_HOSTS")
 UZUM_USE_MOCK = env("UZUM_USE_MOCK")
 UZUM_CHECKOUT_URL = env("UZUM_CHECKOUT_URL")
+UZUM_CHECKOUT_ALLOWED_HOSTS = env("UZUM_CHECKOUT_ALLOWED_HOSTS")
+UZUM_LEGACY_INTEGRATION_ENABLED = env("UZUM_LEGACY_INTEGRATION_ENABLED")
+FINANCE_FX_USE_MOCK = env("FINANCE_FX_USE_MOCK")
 
 # Soliq e-fiscalization (TD-7) [OWNER:O-5]
 SOLIQ_USE_MOCK = env("SOLIQ_USE_MOCK")
 SOLIQ_API_URL = env("SOLIQ_API_URL")
+SOLIQ_API_ALLOWED_HOSTS = env("SOLIQ_API_ALLOWED_HOSTS")
 SOLIQ_API_TOKEN = env("SOLIQ_API_TOKEN")
 SOLIQ_QR_BASE_URL = env("SOLIQ_QR_BASE_URL")
+SOLIQ_QR_ALLOWED_HOSTS = env("SOLIQ_QR_ALLOWED_HOSTS")
 FISCALIZATION_ENABLED = env("FISCALIZATION_ENABLED")
 
 # FCM push (TD-15) [OWNER:O-7]
 FCM_USE_MOCK = env("FCM_USE_MOCK")
+FCM_MOCK_CAPTURE_OUTBOX = env("FCM_MOCK_CAPTURE_OUTBOX")
 FCM_CREDENTIALS_FILE = env("FCM_CREDENTIALS_FILE")
 PUSH_NOTIFICATIONS_ENABLED = env("PUSH_NOTIFICATIONS_ENABLED")
+ALLOW_LEGACY_PRINCIPAL_UNION_FOR_TESTS = env("ALLOW_LEGACY_PRINCIPAL_UNION_FOR_TESTS")
+ALLOW_LEGACY_TENANT_SESSIONS_FOR_TESTS = env("ALLOW_LEGACY_TENANT_SESSIONS_FOR_TESTS")
 
 # Billing / paywall (TD-8)
 BILLING_TRIAL_GRACE_DAYS = env("BILLING_TRIAL_GRACE_DAYS")

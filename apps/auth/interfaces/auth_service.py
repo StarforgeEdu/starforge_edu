@@ -13,7 +13,7 @@ from apps.auth.dto.auth_dto import (
     ResetRequestDTO,
     SessionContextDTO,
 )
-from apps.users.models import User
+from apps.users.models import Session, User
 
 
 class IAuthService(ABC):
@@ -31,8 +31,12 @@ class IAuthService(ABC):
         indistinguishable-failure contract as ``login``."""
 
     @abstractmethod
-    def logout(self, user: User) -> None:
-        """Revoke every session for the caller (instant server-side logout)."""
+    def logout(self, session: Session) -> None:
+        """Revoke only the authenticated session used for this request."""
+
+    @abstractmethod
+    def logout_all(self, user: User) -> None:
+        """Revoke every session and device credential for the caller."""
 
     @abstractmethod
     def change_password(

@@ -87,7 +87,12 @@ def _mock_marks(monkeypatch, marks_json):
     monkeypatch.setattr(
         ai_tasks,
         "complete",
-        lambda **kw: {"text": marks_json, "usage": {"input_tokens": 10, "output_tokens": 10}},
+        lambda **kw: {
+            "text": marks_json,
+            "raw_id": "msg_writing_marking",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 10},
+        },
     )
 
 

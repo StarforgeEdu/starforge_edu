@@ -170,6 +170,36 @@ def test_extend_trial_rejects_zero_days(staff_client, tenant_a):
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("path", "payload", "field"),
+    [
+        ("", {"name": "Unknown field", "slug": "unknown-field", "primary_domain": "unknown.localhost", "admin": True}, "admin"),
+        ("/{center}", {"contact_name": "Operator", "is_active": False}, "is_active"),
+        ("/{center}/suspend", {"reason": "review", "days": 7}, "days"),
+        ("/{center}/activate", {"force": True}, "force"),
+        ("/{center}/extend-trial", {"days": 7, "months": 1}, "months"),
+        ("/{center}/impersonate", {"user_id": 1, "read_only": False}, "read_only"),
+        ("/{center}/domains", {"domain": "strict.example", "verified": True}, "verified"),
+        ("/{center}/domains/999/set-primary", {"force": True}, "force"),
+        (
+            "/{center}/domains/00000000-0000-0000-0000-000000000001/verify",
+            {"skip_dns": True},
+            "skip_dns",
+        ),
+    ],
+)
+def test_platform_mutations_reject_unknown_fields(staff_client, tenant_a, path, payload, field):
+    rendered = path.format(center=tenant_a.pk)
+    url = f"/api/v1/platform/centers{rendered}/"
+    method = staff_client.patch if rendered == f"/{tenant_a.pk}" else staff_client.post
+
+    response = method(url, payload, format="json")
+
+    assert response.status_code == 400, response.content
+    assert response.json()["code"] == "validation_error"
+    assert field in response.json()["errors"]
+
+
 def test_create_center_delegates_to_provision(staff_client):
     resp = staff_client.post(
         "/api/v1/platform/centers/",
@@ -288,6 +318,16 @@ def test_usage_invalid_days_400(staff_client, tenant_a):
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["days=30&branch=1", "days=30&days=31"],
+)
+def test_usage_rejects_unknown_or_repeated_query_parameters(staff_client, tenant_a, query):
+    response = staff_client.get(f"/api/v1/platform/centers/{tenant_a.pk}/usage/?{query}")
+    assert response.status_code == 400
+    assert response.json()["code"] == "validation_error"
+
+
 # ---------------------------------------------------------------------------
 # D4-LE-3 — subscription management (flat /platform/subscriptions/)
 # ---------------------------------------------------------------------------
@@ -345,6 +385,17 @@ def test_impersonation_unknown_user_404(staff_client, tenant_a):
     resp = _mint_impersonation(staff_client, tenant_a, 999999)
     assert resp.status_code == 404
     assert resp.json()["code"] == "user_not_found"
+
+
+def test_impersonation_rejects_inactive_bridge_account(staff_client, tenant_a, user_in):
+    target = user_in(tenant_a, roles=["teacher"])
+    with schema_context(tenant_a.schema_name):
+        type(target).objects.filter(pk=target.pk).update(is_active=False)
+
+    response = _mint_impersonation(staff_client, tenant_a, target.pk)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "impersonation_principal_ambiguous"
 
 
 def test_impersonation_both_sides_audited(staff_client, tenant_a, user_in):
@@ -521,6 +572,16 @@ def test_resolve_unknown_slug_404(public_tenant, api_client):
 
 def test_resolve_missing_slug_400(public_tenant, api_client):
     assert api_client.get("/api/v1/platform/resolve/").status_code == 400
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["slug=tenant_a&redirect=https://example.test", "slug=tenant_a&slug=tenant_b"],
+)
+def test_resolve_rejects_unknown_or_repeated_query_parameters(public_tenant, api_client, query):
+    response = api_client.get(f"/api/v1/platform/resolve/?{query}")
+    assert response.status_code == 400
+    assert response.json()["code"] == "validation_error"
 
 
 def test_resolve_anon_throttle(public_tenant, tenant_a, api_client, monkeypatch):

@@ -24,13 +24,21 @@ def _pending_forms_for(*, teacher: TeacherProfile, user, roles, now) -> list[dic
 
     from apps.forms.models import Form, FormResponse
 
-    audience = Q(audience_user_ids__contains=[user.pk])
+    audience = Q(audience_principals__contains=[{"kind": "teacher", "id": teacher.pk, "user_id": user.pk}])
     for role in roles:
         audience |= Q(audience_roles__contains=[str(role)])
 
-    already_answered = FormResponse.objects.filter(form=OuterRef("pk"), respondent=user)
+    already_answered = FormResponse.objects.filter(
+        form=OuterRef("pk"),
+        respondent_principal_kind="teacher",
+        respondent_principal_id=teacher.pk,
+    )
     forms = (
-        Form.objects.filter(status=Form.Status.PUBLISHED)
+        # Anonymous submissions intentionally carry no role principal, so the
+        # service cannot truthfully mark one teacher's anonymous response as
+        # completed. Keep such surveys available in /forms/ but do not present
+        # them as individually trackable pending work.
+        Form.objects.filter(status=Form.Status.PUBLISHED, is_anonymous=False)
         .filter(Q(opens_at__isnull=True) | Q(opens_at__lte=now))
         .filter(Q(closes_at__isnull=True) | Q(closes_at__gte=now))
         .filter(Q(branch__isnull=True) | Q(branch_id=teacher.branch_id))
@@ -99,7 +107,12 @@ def teacher_dashboard(*, teacher: TeacherProfile, user, roles) -> dict:
 
     from apps.meetings.services import next_meeting_for
 
-    next_meeting = next_meeting_for(user, now=now)
+    next_meeting = next_meeting_for(
+        user,
+        principal_kind="teacher",
+        principal_id=teacher.pk,
+        now=now,
+    )
     return {
         "groups_count": len(cohort_ids),
         "students_count": students_count,

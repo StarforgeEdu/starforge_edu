@@ -18,25 +18,49 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.tasks.dto.task_dto import AssignTaskDTO, CreateTaskDTO, RoleGradeDTO
 from apps.tasks.interfaces.services import IRoleGradeService, ITaskService
 from apps.tasks.models import Task
+from apps.tasks.openapi_contracts import (
+    ROLE_GRADE_DETAIL_CONTRACTS,
+    ROLE_GRADES_COLLECTION_CONTRACTS,
+    TASK_ASSIGN_CONTRACT,
+    TASK_AUTO_ASSIGN_CONTRACT,
+    TASK_DETAIL_CONTRACTS,
+    TASK_TRANSITION_CONTRACT,
+    TASKS_COLLECTION_CONTRACTS,
+    TASKS_MINE_CONTRACTS,
+)
 from apps.tasks.presenters import role_grade_to_dict, task_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
 from core.http import int_field, read_json, str_field
-from core.listing import apply_filters, paginate
-from core.permissions import (
-    Role,
-    _request_overrides,
-    get_user_roles,
-    has_permission_code,
-)
+from core.listing import apply_filters, paginate, positive_int_filter, validate_pagination_filters
+from core.openapi_contracts import openapi_contract
+from core.permissions import MembershipGrantScope, get_user_roles
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import (
+    STAFF_PRINCIPAL_KINDS,
+    RolePrincipal,
+    request_role_principal,
+)
 from core.scoping import (
-    permission_membership_branch_ids,
-    permission_membership_department_ids,
+    is_permission_unscoped,
+    permission_membership_scopes,
 )
 
 _RESOURCE = "tasks"
+MAX_TASK_DESCRIPTION_CHARS = 20_000
+_CREATE_FIELDS = frozenset(
+    {
+        "title",
+        "description",
+        "priority",
+        "assignee",
+        "assignee_principal",
+        "department",
+        "branch",
+        "due_at",
+    }
+)
 
 
 def _task_service() -> ITaskService:
@@ -50,53 +74,72 @@ def _grade_service() -> IRoleGradeService:
 class _Scope(NamedTuple):
     is_superuser: bool
     is_unscoped: bool
-    has_write: bool
-    roles: set[str]
+    principal: RolePrincipal
+    grants: tuple[MembershipGrantScope, ...]
     branch_ids: set[int]
     dept_ids: set[int]
+
+    def allows(self, task: Task) -> bool:
+        if self.is_unscoped:
+            return True
+        if task.branch_id is None:
+            return False
+        return any(
+            grant.branch_id == task.branch_id
+            and (grant.department_id is None or grant.department_id == task.department_id)
+            for grant in self.grants
+        )
+
+
+def _request_principal(request: HttpRequest) -> RolePrincipal:
+    cached = getattr(request, "_tasks_role_principal", None)
+    if isinstance(cached, RolePrincipal):
+        return cached
+    principal = request_role_principal(
+        request,
+        allowed_kinds=STAFF_PRINCIPAL_KINDS,
+        error_code="tasks_principal_unavailable",
+    )
+    request._tasks_role_principal = principal  # type: ignore[attr-defined]
+    return principal
 
 
 def _scope(request: HttpRequest, *, permission: str = f"{_RESOURCE}:read") -> _Scope:
     req: Any = request  # perm helpers are duck-typed on .user (typed Request upstream)
     roles = get_user_roles(req)
-    is_superuser = getattr(req.user, "is_superuser", False)
-    branch_scope = permission_membership_branch_ids(
+    is_superuser = bool(getattr(req.user, "is_superuser", False))
+    grants = permission_membership_scopes(
         roles=roles,
         permission=permission,
         account_kinds={"staff", "teacher"},
     )
-    department_scope = permission_membership_department_ids(
-        roles=roles,
-        permission=permission,
-        account_kinds={"staff", "teacher"},
-    )
-    has_write = has_permission_code(roles, f"{_RESOURCE}:write", _request_overrides(req))
-    if permission == f"{_RESOURCE}:read" and has_write:
-        # Branch-wide task visibility is a write-holder capability. Do not let a
-        # write grant on AccountType B widen a read grant from AccountType A.
-        write_branches = permission_membership_branch_ids(
-            roles=roles,
-            permission=f"{_RESOURCE}:write",
-            account_kinds={"staff", "teacher"},
-        )
-        branch_scope &= write_branches
-        has_write = bool(branch_scope)
     return _Scope(
         is_superuser=is_superuser,
-        is_unscoped=is_superuser or Role.DIRECTOR in roles,
-        has_write=has_write,
-        roles=roles,
-        branch_ids=branch_scope,
-        dept_ids=department_scope,
+        is_unscoped=is_superuser
+        or is_permission_unscoped(
+            req,
+            permission=permission,
+            account_kinds={"staff", "teacher"},
+        ),
+        principal=_request_principal(request),
+        grants=grants,
+        branch_ids={grant.branch_id for grant in grants if grant.department_id is None},
+        dept_ids={grant.department_id for grant in grants if grant.department_id is not None},
     )
 
 
 # --- role grades -----------------------------------------------------------
+@openapi_contract(
+    path="/api/v1/tasks/grades/",
+    operations=ROLE_GRADES_COLLECTION_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def role_grades_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:read")
+        _validate_query(request, allowed={"ordering", "page", "page_size"})
+        _validate_ordering(request, allowed={"level", "role"})
         # No default_ordering: keep the model's compound Meta.ordering ("-level", "role")
         # when no ?ordering is given, so equal-level grades keep their deterministic
         # role tiebreak (a single-key default_ordering would drop it).
@@ -105,22 +148,53 @@ def role_grades_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([role_grade_to_dict(g) for g in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, f"{_RESOURCE}:assign_any")
-        return created(role_grade_to_dict(_grade_service().create(_grade_dto(read_json(request)))))
+        _validate_query(request, allowed=set())
+        _assert_global_grade_write(request)
+        return created(
+            role_grade_to_dict(
+                _grade_service().create(
+                    _grade_dto(
+                        _body(
+                            read_json(request),
+                            allowed=frozenset({"role", "level", "label"}),
+                        )
+                    )
+                )
+            )
+        )
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
 
+@openapi_contract(
+    path="/api/v1/tasks/grades/{pk}/",
+    operations=ROLE_GRADE_DETAIL_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def role_grade_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method not in ("GET", "HEAD", "PUT", "PATCH", "DELETE"):
+        return error("Method not allowed.", code="method_not_allowed", status=405)
     read = request.method in ("GET", "HEAD")
     check_perm(request, f"{_RESOURCE}:read" if read else f"{_RESOURCE}:assign_any")
+    _validate_query(request, allowed=set())
+    if not read:
+        _assert_global_grade_write(request)
     grade = _grade_service().get(pk)
     if grade is None:
         raise NotFoundException(code="not_found")
     if read:
         return success(role_grade_to_dict(grade))
     if request.method in ("PUT", "PATCH"):
-        body = read_json(request)
+        body = _body(
+            read_json(request),
+            allowed=frozenset({"role", "level", "label"}),
+        )
+        if request.method == "PATCH" and not body:
+            raise ValidationException(
+                "Provide at least one field to update.",
+                code="validation_error",
+                fields={"body": ["Provide at least one field to update."]},
+            )
         if request.method == "PUT":
             missing = [field for field in ("role", "level") if field not in body]
             if missing:
@@ -133,7 +207,17 @@ def role_grade_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method == "DELETE":
         _grade_service().delete(grade)
         return no_content()
-    return error("Method not allowed.", code="method_not_allowed", status=405)
+    raise AssertionError("unreachable")
+
+
+def _assert_global_grade_write(request: HttpRequest) -> None:
+    if not _scope(request, permission=f"{_RESOURCE}:assign_any").is_unscoped:
+        from core.exceptions import PermissionException
+
+        raise PermissionException(
+            "Role grades are organization-wide settings.",
+            code="out_of_scope",
+        )
 
 
 def _grade_dto(body: dict[str, Any]) -> RoleGradeDTO:
@@ -163,27 +247,41 @@ def _grade_changes(body: dict[str, Any]) -> dict[str, Any]:
 
 def _level(body: dict[str, Any]) -> int:
     value = cast(int, int_field(body, "level", required=True))
-    if value < 0:  # PositiveIntegerField — a negative level is a clean 400, not a DB error
+    if value < 0 or value > 1_000_000:
         raise ValidationException(
-            "Level must be non-negative.", code="validation_error", fields={"level": ["Must be >= 0."]}
+            "Level is outside the supported range.",
+            code="validation_error",
+            fields={"level": ["Must be between 0 and 1000000."]},
         )
     return value
 
 
 # --- tasks -----------------------------------------------------------------
+@openapi_contract(
+    path="/api/v1/tasks/",
+    operations=TASKS_COLLECTION_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def tasks_collection_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
         check_perm(request, f"{_RESOURCE}:read")
         s = _scope(request)
+        _validate_task_filters(request)
         qs = _task_service().scoped_list(
-            user=request.user,
             is_unscoped=s.is_unscoped,
-            has_write=s.has_write,
+            include_assignee=True,
+            principal_kind=s.principal.kind,
+            principal_id=s.principal.principal_id,
             branch_ids=s.branch_ids,
             dept_ids=s.dept_ids,
         )
+        if request.GET.get("assignee_kind"):
+            qs = qs.filter(
+                assignee_principal_kind=request.GET["assignee_kind"],
+                assignee_principal_id=int(request.GET["assignee_principal_id"]),
+                assignee_attribution_status="captured",
+            )
         qs = apply_filters(
             request,
             qs,
@@ -196,85 +294,132 @@ def tasks_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([task_to_dict(t) for t in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, f"{_RESOURCE}:write")
-        return _create_task(request)
+        _validate_query(request, allowed=set())
+        return _create_task(request, body=read_json(request))
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
 
+@openapi_contract(
+    path="/api/v1/tasks/mine/",
+    operations=TASKS_MINE_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def tasks_mine_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
-    qs = _task_service().mine(request.user)
+    _validate_query(request, allowed={"page", "page_size"})
+    principal = _request_principal(request)
+    qs = _task_service().mine(
+        principal_kind=principal.kind,
+        principal_id=principal.principal_id,
+    )
     items, total, page, size = paginate(request, qs)
     return paginated([task_to_dict(t) for t in items], total=total, page=page, page_size=size)
 
 
+@openapi_contract(
+    path="/api/v1/tasks/{pk}/",
+    operations=TASK_DETAIL_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def task_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
+    _validate_query(request, allowed=set())
     return success(task_to_dict(_get_visible(request, pk)))
 
 
+@openapi_contract(
+    path="/api/v1/tasks/{pk}/assign/",
+    operations=(TASK_ASSIGN_CONTRACT,),
+)
 @csrf_exempt
 @require_auth
 def task_assign_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
+    _validate_query(request, allowed=set())
     s = _scope(request, permission=f"{_RESOURCE}:write")
     task = _get_visible(request, pk, permission=f"{_RESOURCE}:write")
-    body = read_json(request)
+    body = _body(
+        read_json(request),
+        allowed=frozenset({"assignee", "assignee_principal", "department"}),
+    )
+    _assert_one_assignee_selector(body)
+    principal_kind, principal_id = _assignee_principal(body)
     dto = AssignTaskDTO(
-        assignee_provided="assignee" in body,
+        assignee_provided="assignee" in body or "assignee_principal" in body,
         assignee_id=int_field(body, "assignee"),
+        assignee_principal_kind=principal_kind,
+        assignee_principal_id=principal_id,
         department_provided="department" in body,
         department_id=int_field(body, "department"),
     )
     result = _task_service().assign(
-        task, dto, actor=request.user, actor_roles=s.roles, is_unscoped=s.is_unscoped, branch_ids=s.branch_ids
+        task,
+        dto,
+        actor=request.user,
+        is_unscoped=s.is_unscoped,
+        write_grants=s.grants,
+        assign_any_grants=_scope(request, permission=f"{_RESOURCE}:assign_any").grants,
     )
     return success(task_to_dict(result))
 
 
+@openapi_contract(
+    path="/api/v1/tasks/{pk}/transition/",
+    operations=(TASK_TRANSITION_CONTRACT,),
+)
 @csrf_exempt
 @require_auth
 def task_transition_view(request: HttpRequest, pk: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
+    _validate_query(request, allowed=set())
     task = _get_visible(request, pk)
-    to_status = str_field(read_json(request), "status")
-    s = _scope(request)
-    can_transition_any = (
-        s.is_superuser
-        or has_permission_code(s.roles, f"{_RESOURCE}:transition_any", _request_overrides(request))
-        or has_permission_code(s.roles, f"{_RESOURCE}:assign_any", _request_overrides(request))
+    to_status = str_field(
+        _body(read_json(request), allowed=frozenset({"status"})),
+        "status",
     )
+    s = _scope(request)
     return success(
         task_to_dict(
             _task_service().transition(
                 task,
                 to_status=to_status,
                 actor=request.user,
-                can_transition_any=can_transition_any,
+                actor_principal_kind=s.principal.kind,
+                actor_principal_id=s.principal.principal_id,
+                is_superuser=s.is_superuser,
+                transition_grants=_scope(request, permission=f"{_RESOURCE}:transition_any").grants,
+                assign_any_grants=_scope(request, permission=f"{_RESOURCE}:assign_any").grants,
             )
         )
     )
 
 
+@openapi_contract(
+    path="/api/v1/tasks/auto-assign/",
+    operations=(TASK_AUTO_ASSIGN_CONTRACT,),
+)
 @csrf_exempt
 @require_auth
 def task_auto_assign_view(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:write")
+    _validate_query(request, allowed=set())
     s = _scope(request, permission=f"{_RESOURCE}:write")
-    body = read_json(request)
+    body = _body(
+        read_json(request),
+        allowed=frozenset({"task_ids", "department", "mode"}),
+    )
     mode = str_field(body, "mode", default="fair")
     if mode not in ("fair", "free"):
         raise ValidationException(
@@ -284,10 +429,10 @@ def task_auto_assign_view(request: HttpRequest) -> HttpResponse:
         task_ids=_task_ids(body),
         department_id=int_field(body, "department", required=True),  # type: ignore[arg-type]
         actor=request.user,
-        actor_roles=s.roles,
         mode=mode,
         is_unscoped=s.is_unscoped,
-        branch_ids=s.branch_ids,
+        write_grants=s.grants,
+        assign_any_grants=_scope(request, permission=f"{_RESOURCE}:assign_any").grants,
     )
     return success(result)
 
@@ -296,9 +441,10 @@ def task_auto_assign_view(request: HttpRequest) -> HttpResponse:
 def _get_visible(request: HttpRequest, pk: int, *, permission: str = f"{_RESOURCE}:read") -> Task:
     s = _scope(request, permission=permission)
     task = _task_service().get_visible(
-        user=request.user,
         is_unscoped=s.is_unscoped,
-        has_write=s.has_write,
+        include_assignee=permission == f"{_RESOURCE}:read",
+        principal_kind=s.principal.kind,
+        principal_id=s.principal.principal_id,
         branch_ids=s.branch_ids,
         dept_ids=s.dept_ids,
         pk=pk,
@@ -308,9 +454,9 @@ def _get_visible(request: HttpRequest, pk: int, *, permission: str = f"{_RESOURC
     return task
 
 
-def _create_task(request: HttpRequest) -> HttpResponse:
+def _create_task(request: HttpRequest, *, body: dict[str, Any]) -> HttpResponse:
     s = _scope(request, permission=f"{_RESOURCE}:write")
-    body = read_json(request)
+    body = _body(body, allowed=_CREATE_FIELDS)
     title = str_field(body, "title", max_length=200).strip()
     if not title:
         raise ValidationException(
@@ -323,11 +469,15 @@ def _create_task(request: HttpRequest) -> HttpResponse:
             code="validation_error",
             fields={"priority": [f"Must be one of {', '.join(Task.Priority.values)}."]},
         )
+    _assert_one_assignee_selector(body)
+    principal_kind, principal_id = _assignee_principal(body)
     dto = CreateTaskDTO(
         title=title,
-        description=str_field(body, "description"),
+        description=str_field(body, "description", max_length=MAX_TASK_DESCRIPTION_CHARS),
         priority=priority,
         assignee_id=int_field(body, "assignee"),
+        assignee_principal_kind=principal_kind,
+        assignee_principal_id=principal_id,
         department_id=int_field(body, "department"),
         branch_id=int_field(body, "branch"),
         due_at=_optional_datetime(body, "due_at"),
@@ -335,10 +485,11 @@ def _create_task(request: HttpRequest) -> HttpResponse:
     task = _task_service().create(
         dto,
         creator=request.user,
-        creator_roles=s.roles,
+        creator_principal=s.principal,
         is_superuser=s.is_superuser,
         is_unscoped=s.is_unscoped,
-        branch_ids=s.branch_ids,
+        write_grants=s.grants,
+        assign_any_grants=_scope(request, permission=f"{_RESOURCE}:assign_any").grants,
     )
     return created(task_to_dict(task))
 
@@ -363,6 +514,44 @@ def _optional_datetime(body: dict[str, Any], name: str):
     return timezone.make_aware(dt) if timezone.is_naive(dt) else dt
 
 
+def _assert_one_assignee_selector(body: dict[str, Any]) -> None:
+    if "assignee" in body and "assignee_principal" in body:
+        raise ValidationException(
+            "Choose one assignee selector.",
+            code="validation_error",
+            fields={
+                "assignee": ["Do not combine person and role-account selectors."],
+                "assignee_principal": ["Do not combine person and role-account selectors."],
+            },
+        )
+
+
+def _assignee_principal(body: dict[str, Any]) -> tuple[str | None, int | None]:
+    if "assignee_principal" not in body or body["assignee_principal"] is None:
+        return None, None
+    raw = body["assignee_principal"]
+    if not isinstance(raw, dict) or set(raw) != {"kind", "id"}:
+        raise ValidationException(
+            "Invalid assignee role account.",
+            code="validation_error",
+            fields={"assignee_principal": ["Provide only kind and id."]},
+        )
+    kind = raw.get("kind")
+    principal_id = raw.get("id")
+    if (
+        kind not in STAFF_PRINCIPAL_KINDS
+        or isinstance(principal_id, bool)
+        or not isinstance(principal_id, int)
+        or principal_id <= 0
+    ):
+        raise ValidationException(
+            "Invalid assignee role account.",
+            code="validation_error",
+            fields={"assignee_principal": ["Choose an active staff or teacher role account."]},
+        )
+    return str(kind), principal_id
+
+
 def _task_ids(body: dict[str, Any]) -> list[int]:
     raw = body.get("task_ids")
     if not isinstance(raw, list) or not raw:  # allow_empty=False
@@ -384,4 +573,120 @@ def _task_ids(body: dict[str, Any]) -> list[int]:
                 fields={"task_ids": ["Each item must be a positive integer id."]},
             )
         out.append(item)
+    if len(out) != len(set(out)):
+        raise ValidationException(
+            "Duplicate task id.",
+            code="validation_error",
+            fields={"task_ids": ["Each task id may appear only once."]},
+        )
     return out
+
+
+def _body(body: dict[str, Any], *, allowed: frozenset[str]) -> dict[str, Any]:
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise ValidationException(
+            "Request contains unknown fields.",
+            code="validation_error",
+            fields={field: ["Unknown field."] for field in unknown},
+        )
+    return body
+
+
+def _validate_query(request: HttpRequest, *, allowed: set[str]) -> None:
+    unknown = sorted(set(request.GET) - allowed)
+    if unknown:
+        raise ValidationException(
+            "Unknown query parameter.",
+            code="validation_error",
+            fields={field: ["Unknown query parameter."] for field in unknown},
+        )
+    duplicates = sorted(name for name in request.GET if len(request.GET.getlist(name)) != 1)
+    if duplicates:
+        raise ValidationException(
+            "Query parameter may be supplied only once.",
+            code="validation_error",
+            fields={field: ["Supply this parameter once."] for field in duplicates},
+        )
+    validate_pagination_filters(request)
+
+
+def _validate_ordering(request: HttpRequest, *, allowed: set[str]) -> None:
+    if "ordering" not in request.GET:
+        return
+    ordering = request.GET.get("ordering", "")
+    field = ordering[1:] if ordering.startswith("-") else ordering
+    if field not in allowed:
+        raise ValidationException(
+            "Invalid ordering.",
+            code="validation_error",
+            fields={"ordering": ["Choose a declared ordering field."]},
+        )
+
+
+def _validate_task_filters(request: HttpRequest) -> None:
+    _validate_query(
+        request,
+        allowed={
+            "status",
+            "priority",
+            "assignee",
+            "assignee_kind",
+            "assignee_principal_id",
+            "department",
+            "branch",
+            "search",
+            "ordering",
+            "page",
+            "page_size",
+        },
+    )
+    status = request.GET.get("status")
+    if "status" in request.GET and status not in Task.Status.values:
+        raise ValidationException(
+            "Invalid status filter.",
+            code="validation_error",
+            fields={"status": [f"Must be one of: {', '.join(Task.Status.values)}."]},
+        )
+    priority = request.GET.get("priority")
+    if "priority" in request.GET and priority not in Task.Priority.values:
+        raise ValidationException(
+            "Invalid priority filter.",
+            code="validation_error",
+            fields={"priority": [f"Must be one of: {', '.join(Task.Priority.values)}."]},
+        )
+    for name in ("assignee", "department", "branch"):
+        if name in request.GET and positive_int_filter(request, name) is None:
+            raise ValidationException(
+                f"Invalid {name} filter.",
+                code="validation_error",
+                fields={name: ["Must be a positive integer."]},
+            )
+    _validate_ordering(request, allowed={"created_at", "due_at", "priority"})
+    search = request.GET.get("search")
+    if search is not None and len(search) > 200:
+        raise ValidationException(
+            "Search term is too long.",
+            code="validation_error",
+            fields={"search": ["Must be at most 200 characters."]},
+        )
+    assignee_kind = request.GET.get("assignee_kind", "").strip()
+    raw_principal_id = request.GET.get("assignee_principal_id", "").strip()
+    exact_filter_supplied = "assignee_kind" in request.GET or "assignee_principal_id" in request.GET
+    if exact_filter_supplied and (not assignee_kind or not raw_principal_id):
+        raise ValidationException(
+            "Assignee role filters must be provided together.",
+            code="validation_error",
+            fields={
+                "assignee_kind": ["Provide both role filters."],
+                "assignee_principal_id": ["Provide both role filters."],
+            },
+        )
+    if assignee_kind:
+        if assignee_kind not in STAFF_PRINCIPAL_KINDS:
+            raise ValidationException(
+                "Invalid assignee kind.",
+                code="validation_error",
+                fields={"assignee_kind": ["Must be staff or teacher."]},
+            )
+        positive_int_filter(request, "assignee_principal_id")

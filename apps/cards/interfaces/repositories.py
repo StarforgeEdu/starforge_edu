@@ -42,7 +42,7 @@ class ICardRepository(IBaseRepository[Card]):
 
 
 class IWalletRepository(IBaseRepository[Wallet]):
-    def get_or_create_for(self, *, student) -> Wallet:
+    def get_for(self, *, student) -> Wallet | None:
         raise NotImplementedError
 
     def recent_transactions(self, *, wallet: Wallet, limit: int = 50) -> list:

@@ -92,6 +92,8 @@ def test_default_matrix(event_type, channel, expected):
 
 
 def test_explicit_preference_overrides_default(tenant_a, user_in):
+    from apps.notifications.tests.helpers import principal_kwargs
+
     user = user_in(tenant_a)
     with schema_context(tenant_a.schema_name):
         NotificationPreference.objects.create(
@@ -103,6 +105,7 @@ def test_explicit_preference_overrides_default(tenant_a, user_in):
         assert (
             services.channel_enabled_for_user(
                 user_id=user.pk,
+                **principal_kwargs(user),
                 event_type=EventType.PAYMENTS_PAYMENT_COMPLETED,
                 channel=Channel.SMS,
             )
@@ -112,6 +115,7 @@ def test_explicit_preference_overrides_default(tenant_a, user_in):
         assert (
             services.channel_enabled_for_user(
                 user_id=user.pk,
+                **principal_kwargs(user),
                 event_type=EventType.PAYMENTS_PAYMENT_COMPLETED,
                 channel=Channel.IN_APP,
             )
@@ -331,6 +335,7 @@ def test_absence_signal_double_fire_dedupes(tenant_a, sms_outbox):
 # ---------------------------------------------------------------------------
 @time_machine.travel("2026-06-10 12:00 +05:00", tick=False)
 def test_dead_token_cleared_after_three_push_failures(tenant_a, user_in, django_capture_on_commit_callbacks):
+    from apps.notifications.tests.helpers import session_principal_kwargs
     from apps.users.models import Device
     from core.session_auth import create_session
     from infrastructure.push.fcm_client import MockFCMClient
@@ -342,7 +347,7 @@ def test_dead_token_cleared_after_three_push_failures(tenant_a, user_in, django_
         device = Device.objects.create(
             user=user, device_id="d1", platform="android", push_token="dead-token-xyz"
         )
-        create_session(user, device_id="d1")
+        create_session(user, device_id="d1", **session_principal_kwargs(user))
         # push-only dispatch x3 -> 3rd is the dead-token flip. Each dispatch
         # queues the fan-out via on_commit, so each runs in its own capture
         # block (the delivery history accumulates across the three runs).

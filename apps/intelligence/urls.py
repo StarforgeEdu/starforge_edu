@@ -3,6 +3,7 @@ from django.urls import path
 from apps.intelligence.views.v1 import intelligence_views as views
 
 urlpatterns = [
+    path("executive-summary/", views.executive_summary_view, name="executive-summary"),
     path("risk/", views.risk_list_view, name="risk-list"),
     path("risk/<int:student_id>/", views.risk_detail_view, name="risk-detail"),
     path("branches/", views.branch_ranking_view, name="branch-ranking"),

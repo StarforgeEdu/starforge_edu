@@ -2,10 +2,10 @@
 
 - GET   /api/v1/ai/requests/          ai:read   — paginated request log
 - GET   /api/v1/ai/requests/<id>/     ai:read
-- GET   /api/v1/ai/budget/            ai:read   — current budget snapshot
+- GET   /api/v1/ai/budget/            ai:manage — current organization budget
 - PATCH /api/v1/ai/budget/            ai:manage — update limits / is_enabled
 - POST  /api/v1/ai/exam-generation/   ai:write  — 202 {request_id}
-- GET   /api/v1/ai/usage-report/      ai:read   — per-feature totals
+- GET   /api/v1/ai/usage-report/      ai:manage — organization-wide totals
 """
 
 from __future__ import annotations
@@ -19,21 +19,45 @@ from django.utils.dateparse import parse_date, parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.ai.interfaces.services import IAIService
+from apps.ai.models import AIFeature, AIRequest
+from apps.ai.openapi_contracts import (
+    AI_BUDGET_CONTRACTS,
+    AI_EXAM_GENERATION_CONTRACT,
+    AI_REQUEST_COLLECTION_CONTRACTS,
+    AI_REQUEST_DETAIL_CONTRACTS,
+    AI_USAGE_REPORT_CONTRACTS,
+)
 from apps.ai.presenters import ai_request_to_dict, budget_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
-from core.http import read_json
-from core.listing import apply_filters, paginate
-from core.permissions import _request_overrides, get_user_roles, has_permission_code
+from core.http import read_json, reject_unknown_fields
+from core.listing import apply_filters, paginate, validate_pagination_filters
+from core.openapi_contracts import openapi_contract
+from core.permissions import get_user_roles
 from core.ratelimit import check_rate
 from core.responses import error, paginated, success
+from core.role_principals import RolePrincipal, request_role_principal
+from core.scoping import (
+    assert_permission_organization_scope,
+    is_permission_unscoped,
+    request_permission_membership_allows,
+)
 from core.tenant_context import assert_tenant_context
 from core.utils import current_schema
 
 
 def _service() -> IAIService:
     return container.resolve(IAIService)  # type: ignore[type-abstract]
+
+
+def _principal(request: HttpRequest) -> RolePrincipal:
+    cached = getattr(request, "_ai_role_principal", None)
+    if isinstance(cached, RolePrincipal):
+        return cached
+    principal = request_role_principal(request, error_code="ai_principal_unavailable")
+    request._ai_role_principal = principal  # type: ignore[attr-defined]
+    return principal
 
 
 def _method_not_allowed() -> HttpResponse:
@@ -103,27 +127,31 @@ def _choice_value(raw: Any, name: str, choices) -> str:
     return raw
 
 
-def _query_datetime(raw: str, name: str):
+def _query_datetime(raw: str, name: str) -> tuple[datetime, bool]:
+    # ``parse_datetime`` also accepts ``YYYY-MM-DD`` and turns it into midnight.
+    # Parse the exact date form first so an upper date bound can include the full
+    # organization-local calendar day instead of silently stopping at 00:00.
     try:
-        parsed = parse_datetime(raw)
+        day = parse_date(raw)
     except ValueError:
-        parsed = None
-    if parsed is None:
-        # Accept a date-only value too (the old DateTimeFilter used Django's
-        # DATETIME_INPUT_FORMATS, which include "%Y-%m-%d" -> that date at midnight).
+        day = None
+    if day is not None:
+        parsed = datetime(day.year, day.month, day.day)
+        date_only = True
+    else:
         try:
-            day = parse_date(raw)
+            parsed = parse_datetime(raw)
         except ValueError:
-            day = None
-        if day is not None:
-            parsed = datetime(day.year, day.month, day.day)
+            parsed = None
+        date_only = False
     if parsed is None:
         raise ValidationException(
             "Invalid query parameter.",
             code="invalid_query_param",
             fields={name: ["Enter a valid ISO 8601 date or datetime."]},
         )
-    return timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
+    value = timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
+    return value, date_only
 
 
 def _month_bounds(month: str | None) -> tuple[date, date]:
@@ -151,6 +179,10 @@ def _month_bounds(month: str | None) -> tuple[date, date]:
 # --- request log -----------------------------------------------------------
 
 
+@openapi_contract(
+    path="/api/v1/ai/requests/",
+    operations=AI_REQUEST_COLLECTION_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def ai_requests_collection_view(request: HttpRequest) -> HttpResponse:
@@ -158,13 +190,53 @@ def ai_requests_collection_view(request: HttpRequest) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "ai:read")
     assert_tenant_context()
-    qs = _service().list_requests()
+    principal = _principal(request)
+    roles = get_user_roles(request)
+    qs = _service().list_requests(
+        roles=roles,
+        principal=principal,
+        is_superuser=bool(request.user.is_superuser),
+    )
+    feature = request.GET.get("feature")
+    status_value = request.GET.get("status")
+    if feature is not None and feature not in AIFeature.values:
+        raise _reject("feature", "Choose a supported AI feature.")
+    if status_value is not None and status_value not in AIRequest.Status.values:
+        raise _reject("status", "Choose a supported AI request status.")
     created_after = request.GET.get("created_after")
     created_before = request.GET.get("created_before")
+    after_value = None
+    before_value = None
+    before_is_date = False
     if created_after:
-        qs = qs.filter(created_at__gte=_query_datetime(created_after, "created_after"))
+        after_value, _after_is_date = _query_datetime(created_after, "created_after")
+        qs = qs.filter(created_at__gte=after_value)
     if created_before:
-        qs = qs.filter(created_at__lte=_query_datetime(created_before, "created_before"))
+        before_value, before_is_date = _query_datetime(created_before, "created_before")
+        if before_is_date:
+            before_value += timedelta(days=1)
+            qs = qs.filter(created_at__lt=before_value)
+        else:
+            qs = qs.filter(created_at__lte=before_value)
+    if (
+        after_value is not None
+        and before_value is not None
+        and (after_value >= before_value if before_is_date else after_value > before_value)
+    ):
+        raise ValidationException(
+            "Invalid query range.",
+            code="invalid_query_param",
+            fields={"created_before": ["Must not be earlier than created_after."]},
+        )
+    allowed_query = {"feature", "status", "created_after", "created_before", "ordering", "page", "page_size"}
+    unknown = sorted(set(request.GET) - allowed_query)
+    if unknown:
+        raise ValidationException(
+            "Unsupported query parameter.",
+            code="invalid_query_param",
+            fields={name: ["This query parameter is not supported."] for name in unknown},
+        )
+    validate_pagination_filters(request)
     qs = apply_filters(
         request,
         qs,
@@ -176,6 +248,10 @@ def ai_requests_collection_view(request: HttpRequest) -> HttpResponse:
     return paginated([ai_request_to_dict(r) for r in items], total=total, page=page, page_size=size)
 
 
+@openapi_contract(
+    path="/api/v1/ai/requests/{pk}/",
+    operations=AI_REQUEST_DETAIL_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def ai_request_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
@@ -183,30 +259,56 @@ def ai_request_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         return _method_not_allowed()
     check_perm(request, "ai:read")
     assert_tenant_context()
-    req = _service().get_request(pk=pk)
+    principal = _principal(request)
+    roles = get_user_roles(request)
+    req = _service().get_request(
+        pk=pk,
+        roles=roles,
+        principal=principal,
+        is_superuser=bool(request.user.is_superuser),
+    )
     if req is None:
         raise NotFoundException(code="not_found")
-    roles = get_user_roles(request)
-    can_view_output = (
-        req.requested_by_id == request.user.id
-        or request.user.is_superuser
-        or has_permission_code(roles, "ai:manage", _request_overrides(request))
+    is_exact_requester = (
+        req.requested_by_id == principal.user_id
+        and req.requested_principal_kind == principal.kind
+        and req.requested_principal_id == principal.principal_id
     )
+    if req.scope_status == req.ScopeStatus.ORGANIZATION:
+        has_manage_scope = is_permission_unscoped(request, permission="ai:manage")
+    else:
+        has_manage_scope = request_permission_membership_allows(
+            request,
+            permission="ai:manage",
+            branch_id=req.branch_at_request_id,
+            department_id=req.department_at_request_id,
+        )
+    can_view_output = is_exact_requester or bool(request.user.is_superuser) or has_manage_scope
     return success(ai_request_to_dict(req, include_output=can_view_output))
 
 
 # --- budget ----------------------------------------------------------------
 
 
+@openapi_contract(
+    path="/api/v1/ai/budget/",
+    operations=AI_BUDGET_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def budget_view(request: HttpRequest) -> HttpResponse:
     if request.method in ("GET", "HEAD"):
-        check_perm(request, "ai:read")
+        check_perm(request, "ai:manage")
+        assert_permission_organization_scope(request, permission="ai:manage")
         return success(budget_to_dict(_service().get_budget()))
     if request.method == "PATCH":
         check_perm(request, "ai:manage")
+        assert_permission_organization_scope(request, permission="ai:manage")
         data = read_json(request)
+        reject_unknown_fields(
+            data,
+            allowed={"daily_token_limit", "monthly_token_limit", "is_enabled"},
+        )
         daily = (
             _int_value(data["daily_token_limit"], "daily_token_limit", min_value=0)
             if "daily_token_limit" in data
@@ -230,24 +332,39 @@ def budget_view(request: HttpRequest) -> HttpResponse:
 # --- exam generation -------------------------------------------------------
 
 
+@openapi_contract(
+    path="/api/v1/ai/exam-generation/",
+    operations=(AI_EXAM_GENERATION_CONTRACT,),
+)
 @csrf_exempt
 @require_auth
 def exam_generation_view(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "ai:write")
-    # A per-request rate cap (20/min per schema+user) on top of the token budget —
+    principal = _principal(request)
+    # A per-request rate cap (10/min per schema+principal) on top of the token budget —
     # stops request flooding before budget accounting runs (mirrors AIGenerationThrottle).
-    check_rate(scope="ai_generation", key=f"{current_schema()}:{request.user.pk}", limit=20, window=60)
+    check_rate(
+        scope="ai_generation",
+        key=f"{current_schema()}:{principal.kind}:{principal.principal_id}",
+        limit=10,
+        window=60,
+    )
     data = read_json(request)
+    reject_unknown_fields(
+        data,
+        allowed={"subject_id", "exam_type", "question_count", "difficulty"},
+    )
     subject_id = _int_value(_require(data, "subject_id"), "subject_id", min_value=1)
     exam_type = _str_value(_require(data, "exam_type"), "exam_type", max_length=32)
     question_count = _int_value(
-        _require(data, "question_count"), "question_count", min_value=1, max_value=200
+        _require(data, "question_count"), "question_count", min_value=1, max_value=100
     )
     difficulty = _choice_value(_require(data, "difficulty"), "difficulty", ("easy", "medium", "hard"))
     ai_request = _service().request_exam_generation(
         requested_by=request.user,
+        requested_principal=principal,
         subject_id=subject_id,
         exam_type=exam_type,
         question_count=question_count,
@@ -259,11 +376,23 @@ def exam_generation_view(request: HttpRequest) -> HttpResponse:
 # --- usage report ----------------------------------------------------------
 
 
+@openapi_contract(
+    path="/api/v1/ai/usage-report/",
+    operations=AI_USAGE_REPORT_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def usage_report_view(request: HttpRequest) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return _method_not_allowed()
-    check_perm(request, "ai:read")
+    check_perm(request, "ai:manage")
+    assert_permission_organization_scope(request, permission="ai:manage")
+    unknown = sorted(set(request.GET) - {"month"})
+    if unknown:
+        raise ValidationException(
+            "Unsupported query parameter.",
+            code="invalid_query_param",
+            fields={name: ["This query parameter is not supported."] for name in unknown},
+        )
     start, end = _month_bounds(request.GET.get("month"))
     return success(_service().usage_report(start=start, end=end))

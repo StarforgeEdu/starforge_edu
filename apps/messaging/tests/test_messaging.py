@@ -6,10 +6,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from botocore.exceptions import ClientError
 from django.utils import timezone
 from django_tenants.utils import schema_context
 
+from core.attachment_storage import AttachmentObjectError, VerifiedAttachment
 from core.permissions import Role
 
 pytestmark = pytest.mark.django_db
@@ -17,6 +17,7 @@ pytestmark = pytest.mark.django_db
 THREADS = "/api/v1/messaging/threads/"
 UPLOAD = "/api/v1/messaging/attachments/upload-url/"
 CONTACTS = "/api/v1/messaging/contacts/"
+ROLE_PASSWORD = "Messaging-Principal-42"
 
 
 def _rows(body):
@@ -43,10 +44,103 @@ def _attachment_key(client, monkeypatch, *, filename="photo.jpg", size=3, conten
     assert response.status_code == 200, response.content
     key = response.json()["data"]["key"]
     monkeypatch.setattr(
-        "apps.messaging.services.head_object",
-        lambda stored_key: {"ContentLength": size, "ContentType": content_type},
+        "apps.messaging.services.promote_attachment_object",
+        lambda **_kwargs: VerifiedAttachment(
+            size_bytes=size,
+            content_type=content_type,
+            sniffed_type=content_type,
+        ),
     )
     return key
+
+
+def _role_client(client_for, tenant, *, username: str):
+    login = client_for(tenant)
+    response = login.post(
+        "/api/v1/auth/role-login/",
+        {"username": username, "password": ROLE_PASSWORD},
+        format="json",
+    )
+    assert response.status_code == 200, response.content
+    client = client_for(tenant)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {response.json()['data']['access']}")
+    return client
+
+
+def _multi_profile_student_network(tenant):
+    """One bridge User with student scope A and director scope B.
+
+    The student role login must retain only scope A. The staff profile and
+    director membership intentionally make this a regression for bridge-wide
+    role unioning in messaging services.
+    """
+    from apps.org.models import StaffProfile
+    from apps.org.tests.factories import BranchFactory
+    from apps.parents.tests.factories import ParentProfileFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.users.models import RoleMembership
+    from apps.users.tests.factories import UserFactory
+
+    with schema_context(tenant.schema_name):
+        local_branch = BranchFactory()
+        remote_branch = BranchFactory()
+        creator = UserFactory()
+        student_account = StudentProfileFactory(
+            user=creator,
+            branch=local_branch,
+            username="messaging.multi.student",
+            phone="",
+            email="",
+        )
+        staff_account = StaffProfile.objects.create(
+            user=creator,
+            username="messaging.multi.staff",
+        )
+        for account in (student_account, staff_account):
+            account.set_password(ROLE_PASSWORD)
+            account.save(update_fields=["password"])
+        RoleMembership.objects.create(
+            user=creator,
+            branch=local_branch,
+            role=Role.STUDENT,
+        )
+        RoleMembership.objects.create(
+            user=creator,
+            branch=remote_branch,
+            role=Role.DIRECTOR,
+        )
+
+        local_staff = UserFactory()
+        remote_staff = UserFactory()
+        parent_user = UserFactory()
+        RoleMembership.objects.create(
+            user=local_staff,
+            branch=local_branch,
+            role=Role.REGISTRAR,
+        )
+        RoleMembership.objects.create(
+            user=remote_staff,
+            branch=remote_branch,
+            role=Role.REGISTRAR,
+        )
+        RoleMembership.objects.create(
+            user=parent_user,
+            branch=local_branch,
+            role=Role.PARENT,
+        )
+        for user, label in ((local_staff, "Local"), (remote_staff, "Remote")):
+            StaffProfile.objects.create(
+                user=user,
+                username=f"messaging.{label.lower()}.staff",
+                first_name=label,
+            )
+        ParentProfileFactory(
+            user=parent_user,
+            username="messaging.local.parent",
+            phone="",
+            email="",
+        )
+    return creator, local_staff, remote_staff, parent_user
 
 
 def test_create_thread_and_exchange_messages(tenant_a, as_role):
@@ -336,6 +430,11 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
         "role_label": "Student",
         "role_slug": Role.STUDENT,
         "is_online": False,
+        "is_online_is_heuristic": True,
+        "recently_active": False,
+        "presence_source": "last_seen_within_5_minutes",
+        "activity_status": "not_recently_active",
+        "activity_status_is_presence": False,
     }
     assert "phone" not in student_row
     assert "email" not in student_row
@@ -379,6 +478,275 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
         assert denied.json()["code"] == "recipient_out_of_scope"
 
 
+def test_non_teacher_staff_cannot_guess_cross_branch_recipient_ids(tenant_a, user_in, as_user):
+    from apps.org.models import StaffProfile
+    from apps.org.tests.factories import BranchFactory
+
+    with schema_context(tenant_a.schema_name):
+        branch_a = BranchFactory()
+        branch_b = BranchFactory()
+    creator = user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch_a)
+    local = user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch_a)
+    remote = user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch_b)
+    with schema_context(tenant_a.schema_name):
+        for user, label in ((creator, "Creator"), (local, "Local"), (remote, "Remote")):
+            StaffProfile.objects.create(
+                user=user,
+                username=user.username,
+                password=user.password,
+                first_name=label,
+            )
+
+    client = as_user(tenant_a, creator)
+    allowed = client.post(
+        THREADS,
+        {"participant_ids": [local.id], "first_body": "local"},
+        format="json",
+    )
+    assert allowed.status_code == 201, allowed.content
+
+    denied = client.post(
+        THREADS,
+        {"participant_ids": [remote.id], "first_body": "guessed id"},
+        format="json",
+    )
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "recipient_out_of_scope"
+
+
+def test_recipient_scope_does_not_borrow_an_unrelated_department_membership(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.org.models import StaffProfile
+    from apps.org.tests.factories import BranchFactory, DepartmentFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        permitted_department = DepartmentFactory(branch=branch)
+        unrelated_department = DepartmentFactory(branch=branch)
+    creator = user_in(tenant_a)
+    local = user_in(tenant_a)
+    remote = user_in(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        # Only the registrar assignment grants messaging:write. The security
+        # assignment must not lend its department to that separate grant.
+        RoleMembership.objects.create(
+            user=creator,
+            branch=branch,
+            department=permitted_department,
+            role=Role.REGISTRAR,
+        )
+        RoleMembership.objects.create(
+            user=creator,
+            branch=branch,
+            department=unrelated_department,
+            role=Role.SECURITY,
+        )
+        RoleMembership.objects.create(
+            user=local,
+            branch=branch,
+            department=permitted_department,
+            role=Role.REGISTRAR,
+        )
+        RoleMembership.objects.create(
+            user=remote,
+            branch=branch,
+            department=unrelated_department,
+            role=Role.REGISTRAR,
+        )
+        for user, label in ((creator, "Creator"), (local, "Local"), (remote, "Remote")):
+            StaffProfile.objects.create(
+                user=user,
+                username=user.username,
+                password=user.password,
+                first_name=label,
+            )
+            user.refresh_from_db()
+
+    client = as_user(tenant_a, creator)
+    allowed = client.post(
+        THREADS,
+        {"participant_ids": [local.pk], "first_body": "local"},
+        format="json",
+    )
+    denied = client.post(
+        THREADS,
+        {"participant_ids": [remote.pk], "first_body": "guessed id"},
+        format="json",
+    )
+
+    assert allowed.status_code == 201, allowed.content
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "recipient_out_of_scope"
+
+
+def test_teacher_membership_without_profile_cannot_bypass_recipient_directory(
+    tenant_a,
+    user_in,
+    client_for,
+):
+    from apps.org.tests.factories import BranchFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from core.session_auth import create_session
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+    teacher = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    student = user_in(tenant_a, roles=[Role.STUDENT], branch=branch)
+    with schema_context(tenant_a.schema_name):
+        StudentProfileFactory(user=student, branch=branch)
+        invalid_session = create_session(
+            teacher,
+            principal_kind="teacher",
+            principal_id=9_223_372_036_854_775_807,
+        )
+
+    client = client_for(tenant_a)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {invalid_session.key}")
+    response = client.post(
+        THREADS,
+        {"participant_ids": [student.id], "first_body": "profile bypass"},
+        format="json",
+    )
+    assert response.status_code == 401
+    assert response.json()["code"] == "authentication_failed"
+
+
+def test_student_session_cannot_borrow_multi_profile_staff_scope(tenant_a, client_for):
+    creator, local_staff, remote_staff, _parent = _multi_profile_student_network(tenant_a)
+    client = _role_client(
+        client_for,
+        tenant_a,
+        username="messaging.multi.student",
+    )
+
+    contacts = client.get(CONTACTS)
+    assert contacts.status_code == 200, contacts.content
+    contact_ids = {row["user_id"] for row in contacts.json()["data"]}
+    assert local_staff.pk in contact_ids
+    assert remote_staff.pk not in contact_ids
+
+    allowed = client.post(
+        THREADS,
+        {"participant_ids": [local_staff.pk], "first_body": "local student question"},
+        format="json",
+    )
+    denied = client.post(
+        THREADS,
+        {"participant_ids": [remote_staff.pk], "first_body": "borrowed director scope"},
+        format="json",
+    )
+
+    assert allowed.status_code == 201, allowed.content
+    assert creator.pk in {participant["user"] for participant in allowed.json()["data"]["participants"]}
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "recipient_out_of_scope"
+
+
+def test_student_session_uses_student_safeguarding_on_multi_profile_user(
+    tenant_a,
+    client_for,
+):
+    _creator, _local_staff, _remote_staff, parent = _multi_profile_student_network(tenant_a)
+    client = _role_client(
+        client_for,
+        tenant_a,
+        username="messaging.multi.student",
+    )
+
+    response = client.post(
+        THREADS,
+        {"participant_ids": [parent.pk], "first_body": "unsafe non-staff pairing"},
+        format="json",
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "non_staff_recipient"
+
+
+def test_role_native_staff_and_teacher_messaging_flows_remain_available(
+    tenant_a,
+    client_for,
+):
+    from apps.cohorts.tests.factories import CohortFactory, CohortTeacherFactory
+    from apps.org.models import StaffProfile
+    from apps.org.tests.factories import BranchFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+    from apps.users.models import RoleMembership
+    from apps.users.tests.factories import UserFactory
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        staff_creator = UserFactory()
+        staff_recipient = UserFactory()
+        teacher_user = UserFactory()
+        student_user = UserFactory()
+        for user, role in (
+            (staff_creator, Role.REGISTRAR),
+            (staff_recipient, Role.REGISTRAR),
+            (teacher_user, Role.TEACHER),
+            (student_user, Role.STUDENT),
+        ):
+            RoleMembership.objects.create(user=user, branch=branch, role=role)
+
+        staff_account = StaffProfile.objects.create(
+            user=staff_creator,
+            username="messaging.normal.staff",
+        )
+        StaffProfile.objects.create(
+            user=staff_recipient,
+            username="messaging.staff.recipient",
+        )
+        teacher_account = TeacherProfileFactory(
+            user=teacher_user,
+            branch=branch,
+            username="messaging.normal.teacher",
+            phone="",
+            email="",
+        )
+        for account in (staff_account, teacher_account):
+            account.set_password(ROLE_PASSWORD)
+            account.save(update_fields=["password"])
+
+        cohort = CohortFactory(branch=branch)
+        CohortTeacherFactory(cohort=cohort, teacher=teacher_account)
+        StudentProfileFactory(
+            user=student_user,
+            branch=branch,
+            current_cohort=cohort,
+            phone="",
+            email="",
+        )
+
+    staff_client = _role_client(
+        client_for,
+        tenant_a,
+        username="messaging.normal.staff",
+    )
+    teacher_client = _role_client(
+        client_for,
+        tenant_a,
+        username="messaging.normal.teacher",
+    )
+
+    staff_thread = staff_client.post(
+        THREADS,
+        {"participant_ids": [staff_recipient.pk], "first_body": "staff flow"},
+        format="json",
+    )
+    teacher_thread = teacher_client.post(
+        THREADS,
+        {"participant_ids": [student_user.pk], "first_body": "teacher flow"},
+        format="json",
+    )
+    assert staff_thread.status_code == 201, staff_thread.content
+    assert teacher_thread.status_code == 201, teacher_thread.content
+
+
 # --------------------------------------------------------------------------- #
 # review hardening
 # --------------------------------------------------------------------------- #
@@ -393,6 +761,31 @@ def test_staff_cannot_open_a_two_student_thread(tenant_a, as_role):
     )
     assert r.status_code == 403
     assert r.json()["code"] == "non_staff_recipient"
+
+
+def test_safeguarding_uses_canonical_account_kind_when_legacy_roles_drift(
+    tenant_a,
+    as_role,
+):
+    from apps.users.models import RoleMembership
+
+    teacher_client, _teacher = as_role(Role.TEACHER)
+    _first_client, first = as_role(Role.STUDENT)
+    _second_client, second = as_role(Role.STUDENT)
+    with schema_context(tenant_a.schema_name):
+        RoleMembership.objects.filter(user_id__in=(first.pk, second.pk)).update(role=Role.SUPPORT)
+
+    response = teacher_client.post(
+        THREADS,
+        {
+            "participant_ids": [first.pk, second.pk],
+            "first_body": "This must remain blocked",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "non_staff_recipient"
 
 
 def test_teacher_parent_student_thread_allowed(tenant_a, as_role):
@@ -447,7 +840,9 @@ def test_attachment_only_message_allowed(tenant_a, as_role, monkeypatch):
     assert created.status_code == 201, created.content
     msgs = _rows(teacher_client.get(f"{THREADS}{created.json()['data']['id']}/messages/").json())
     assert len(msgs) == 1
-    assert msgs[0]["attachments"] == [key]
+    assert len(msgs[0]["attachments"]) == 1
+    assert msgs[0]["attachments"][0] != key
+    assert "/messaging/messages/" in msgs[0]["attachments"][0]
     assert msgs[0]["body"] == ""
 
 
@@ -481,13 +876,22 @@ def test_attachment_grant_is_owner_bound_and_single_use(tenant_a, as_role, monke
     assert stolen.status_code == 422
     assert stolen.json()["code"] == "invalid_attachment_key"
 
-    sent = owner_client.post(
+    noncanonical = owner_client.post(
         f"{THREADS}{tid}/messages/",
         {"attachments": [f"  {key}  "]},
         format="json",
     )
+    assert noncanonical.status_code == 400
+    assert noncanonical.json()["code"] == "validation_error"
+
+    sent = owner_client.post(
+        f"{THREADS}{tid}/messages/",
+        {"attachments": [key]},
+        format="json",
+    )
     assert sent.status_code == 201, sent.content
-    assert sent.json()["data"]["attachments"] == [key]
+    assert sent.json()["data"]["attachments"] != [key]
+    assert "/messaging/messages/" in sent.json()["data"]["attachments"][0]
 
     replay = owner_client.post(
         f"{THREADS}{tid}/messages/",
@@ -531,7 +935,12 @@ def test_uploaded_attachment_metadata_must_match_grant(
     teacher_client, _teacher = as_role(Role.TEACHER)
     _student_client, student = as_role(Role.STUDENT)
     key = _attachment_key(teacher_client, monkeypatch)
-    monkeypatch.setattr("apps.messaging.services.head_object", lambda stored_key: metadata)
+    reason = "size" if metadata["ContentLength"] != 3 else "content_type"
+
+    def mismatch(**_kwargs):
+        raise AttachmentObjectError(reason)
+
+    monkeypatch.setattr("apps.messaging.services.promote_attachment_object", mismatch)
 
     response = teacher_client.post(
         THREADS,
@@ -547,10 +956,10 @@ def test_attachment_must_be_uploaded_before_message(tenant_a, as_role, monkeypat
     _student_client, student = as_role(Role.STUDENT)
     key = _attachment_key(teacher_client, monkeypatch)
 
-    def missing(stored_key):
-        raise ClientError({"Error": {"Code": "NoSuchKey"}}, "HeadObject")
+    def missing(**_kwargs):
+        raise AttachmentObjectError("missing")
 
-    monkeypatch.setattr("apps.messaging.services.head_object", missing)
+    monkeypatch.setattr("apps.messaging.services.promote_attachment_object", missing)
     response = teacher_client.post(
         THREADS,
         {"participant_ids": [student.id], "attachments": [key]},
@@ -571,17 +980,19 @@ def test_attachment_download_requires_thread_participation(tenant_a, as_role, mo
         format="json",
     )
     tid = created.json()["data"]["id"]
+    messages = _rows(teacher_client.get(f"{THREADS}{tid}/messages/").json())
+    stored_key = messages[0]["attachments"][0]
     monkeypatch.setattr(
         "apps.messaging.services.presign_download",
         lambda stored_key, **kwargs: f"https://storage.invalid/download/{stored_key}",
     )
     url = f"{THREADS}{tid}/attachments/download/"
 
-    participant = student_client.get(url, {"key": key})
+    participant = student_client.get(url, {"key": stored_key})
     assert participant.status_code == 200
-    assert participant.json()["data"]["url"].endswith(key)
-    assert student_client.head(url, {"key": key}).status_code == 200
-    assert outsider_client.get(url, {"key": key}).status_code == 404
+    assert stored_key in participant.json()["data"]["url"]
+    assert student_client.head(url, {"key": stored_key}).status_code == 200
+    assert outsider_client.get(url, {"key": stored_key}).status_code == 404
 
 
 def test_attachment_null_and_excess_are_clean_400s(tenant_a, as_role):
@@ -627,9 +1038,9 @@ def test_thread_detail_pagination_ordering_and_head(tenant_a, as_role):
     assert page.status_code == 200
     assert [row["body"] for row in page.json()["data"]] == ["second"]
     assert teacher_client.get(f"{THREADS}?ordering=-created_at&page_size=1").status_code == 200
-    # Invalid ordering syntax is ignored like DRF's OrderingFilter; critically it
-    # remains a clean response instead of reaching ORM order_by("--field") as a 500.
-    assert teacher_client.get(f"{THREADS}?ordering=--created_at").status_code == 200
+    invalid_ordering = teacher_client.get(f"{THREADS}?ordering=--created_at")
+    assert invalid_ordering.status_code == 400
+    assert invalid_ordering.json()["errors"] == {"ordering": ["Invalid value."]}
     assert teacher_client.head(THREADS).status_code == 200
     assert teacher_client.head(f"{THREADS}{tid}/").status_code == 200
     assert teacher_client.head(f"{THREADS}{tid}/messages/").status_code == 200
@@ -637,16 +1048,22 @@ def test_thread_detail_pagination_ordering_and_head(tenant_a, as_role):
 
 def test_thread_create_role_lookup_query_count_is_bounded(tenant_a, user_in, django_assert_max_num_queries):
     from apps.messaging.services import create_thread
+    from apps.teachers.tests.factories import TeacherProfileFactory
     from apps.users.tests.factories import RoleMembershipFactory, UserFactory
 
     creator = user_in(tenant_a, roles=[Role.TEACHER])
     with schema_context(tenant_a.schema_name):
+        TeacherProfileFactory(user=creator)
         participants = []
         for _ in range(40):
             participant = UserFactory()
             RoleMembershipFactory(user=participant, role=Role.TEACHER)
+            TeacherProfileFactory(user=participant)
             participants.append(participant)
 
-        with django_assert_max_num_queries(6):
+        # Resolution performs one batch query per role-principal table, never one
+        # lookup per participant. Permission scope checks and both writes are also
+        # bounded, so forty recipients still have a constant query budget.
+        with django_assert_max_num_queries(14):
             thread = create_thread(creator=creator, participants=participants)
         assert thread.participants.count() == 41

@@ -23,6 +23,15 @@ def _payment_method(tenant) -> int:
         return PaymentMethod.objects.create(name="Cash", slug="cash").id
 
 
+def _same_branch_clients(tenant, user_in, as_user, *roles):
+    with schema_context(tenant.schema_name):
+        from apps.org.tests.factories import BranchFactory
+
+        branch = BranchFactory()
+    users = [user_in(tenant, roles=[role], branch=branch) for role in roles]
+    return branch, [(as_user(tenant, user), user) for user in users]
+
+
 def _disbursed_loan(tenant, *, teacher, director, cashier, method_id, amount="1000000.00") -> int:
     """Drive a loan all the way to DISBURSED and return its id."""
     loan = teacher.post(LOANS, {"title": "Advance", "amount_uzs": amount}, format="json")
@@ -38,10 +47,11 @@ def _disbursed_loan(tenant, *, teacher, director, cashier, method_id, amount="10
     return lid
 
 
-def test_loan_lifecycle_request_disburse_repay_settle(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_loan_lifecycle_request_disburse_repay_settle(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.TEACHER, Role.DIRECTOR, Role.CASHIER
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     lid = _disbursed_loan(tenant_a, teacher=teacher, director=director, cashier=cashier, method_id=method_id)
@@ -83,10 +93,11 @@ def test_loan_lifecycle_request_disburse_repay_settle(tenant_a, as_role):
     assert {e["amount_uzs"] for e in ins} == {"400000.00", "600000.00"}
 
 
-def test_cannot_repay_before_disbursed(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_cannot_repay_before_disbursed(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.TEACHER, Role.DIRECTOR, Role.CASHIER
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     lid = teacher.post(LOANS, {"title": "Advance", "amount_uzs": "500000.00"}, format="json").json()["data"][
@@ -101,10 +112,11 @@ def test_cannot_repay_before_disbursed(tenant_a, as_role):
     assert r.json()["code"] == "loan_not_disbursed"
 
 
-def test_repayment_cannot_exceed_outstanding(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_repayment_cannot_exceed_outstanding(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.TEACHER, Role.DIRECTOR, Role.CASHIER
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     lid = _disbursed_loan(
@@ -156,10 +168,11 @@ def test_borrower_sees_only_own_loans(tenant_a, as_role, user_in, as_user):
     assert other.get(LOANS).json()["pagination"]["total"] == 0  # another borrower sees none of it
 
 
-def test_repay_requires_collect_permission(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_repay_requires_collect_permission(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.TEACHER, Role.DIRECTOR, Role.CASHIER
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     lid = _disbursed_loan(tenant_a, teacher=teacher, director=director, cashier=cashier, method_id=method_id)
@@ -170,13 +183,14 @@ def test_repay_requires_collect_permission(tenant_a, as_role):
     assert r.status_code == 403
 
 
-def test_manager_raises_loan_for_another_staff_borrower(tenant_a, as_role, user_in, as_user):
+def test_manager_raises_loan_for_another_staff_borrower(tenant_a, user_in, as_user):
     """A manager borrows ON BEHALF of staff B: B (not the keyer) sees the loan, and
     the ledger names B — the borrower — on both the OUT and IN rows (anti-fraud)."""
-    manager, _ = as_role(Role.REGISTRAR)  # loan:write, not the borrower
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
-    b_user = user_in(tenant_a, roles=[Role.TEACHER])
+    branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.REGISTRAR, Role.DIRECTOR, Role.CASHIER
+    )
+    (manager, _), (director, _), (cashier, _) = actors
+    b_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
     b_client = as_user(tenant_a, b_user)
     other = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER]))
     expected_label = (b_user.get_full_name() or b_user.username)[:200]
@@ -205,13 +219,27 @@ def test_manager_raises_loan_for_another_staff_borrower(tenant_a, as_role, user_
     assert inn["party_label"] == expected_label
 
 
-def test_borrower_cannot_approve_or_disburse_own_loan(tenant_a, as_role, user_in, as_user):
+def test_borrower_cannot_approve_or_disburse_own_loan(tenant_a, user_in, as_user):
     """Segregation of duties reaches the beneficiary: a borrower can't sign off or pay
     out their own loan, even keyed by a colleague."""
-    manager, _ = as_role(Role.REGISTRAR)
-    borrower_user = user_in(tenant_a, roles=[Role.DIRECTOR])  # holds approve + disburse
+    with schema_context(tenant_a.schema_name):
+        from apps.org.tests.factories import BranchFactory
+
+        branch = BranchFactory.create()
+    manager = as_user(
+        tenant_a,
+        user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch),
+    )
+    borrower_user = user_in(
+        tenant_a,
+        roles=[Role.DIRECTOR],
+        branch=branch,
+    )  # holds approve + disburse
     borrower = as_user(tenant_a, borrower_user)
-    approver, _ = as_role(Role.DIRECTOR)  # a different director
+    approver = as_user(
+        tenant_a,
+        user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch),
+    )  # a different director
     method_id = _payment_method(tenant_a)
 
     lid = manager.post(
@@ -241,10 +269,11 @@ def test_loan_borrower_must_be_staff(tenant_a, as_role, user_in):
     assert r.json()["code"] == "loan_borrower_required"
 
 
-def test_repay_with_invalid_payment_method(tenant_a, as_role):
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+def test_repay_with_invalid_payment_method(tenant_a, user_in, as_user):
+    _branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.TEACHER, Role.DIRECTOR, Role.CASHIER
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     lid = _disbursed_loan(tenant_a, teacher=teacher, director=director, cashier=cashier, method_id=method_id)
@@ -253,11 +282,12 @@ def test_repay_with_invalid_payment_method(tenant_a, as_role):
     assert r.json()["code"] == "payment_method_invalid"
 
 
-def test_second_repayment_cannot_exceed_remaining(tenant_a, as_role):
+def test_second_repayment_cannot_exceed_remaining(tenant_a, user_in, as_user):
     """The exceed check is against the RUNNING outstanding, not the original amount."""
-    teacher, _ = as_role(Role.TEACHER)
-    director, _ = as_role(Role.DIRECTOR)
-    cashier, _ = as_role(Role.CASHIER)
+    _branch, actors = _same_branch_clients(
+        tenant_a, user_in, as_user, Role.TEACHER, Role.DIRECTOR, Role.CASHIER
+    )
+    (teacher, _), (director, _), (cashier, _) = actors
     method_id = _payment_method(tenant_a)
 
     lid = _disbursed_loan(

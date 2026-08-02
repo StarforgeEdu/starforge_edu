@@ -18,18 +18,44 @@ from core.repositories import BaseRepository
 class AssignmentRepository(BaseRepository[Assignment], IAssignmentRepository):
     model = Assignment
 
-    def scoped(self, *, user, roles: set[str]) -> QuerySet[Assignment]:
-        return scoped_assignments(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Assignment]:
+        return scoped_assignments(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, user, roles: set[str], pk: int) -> Assignment | None:
-        return self.scoped(user=user, roles=roles).filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        pk: int,
+        permission: str = "assignments:read",
+    ) -> Assignment | None:
+        return self.scoped(user=user, roles=roles, permission=permission).filter(pk=pk).first()
 
 
 class SubmissionRepository(BaseRepository[Submission], ISubmissionRepository):
     model = Submission
 
-    def scoped(self, *, user, roles: set[str]) -> QuerySet[Submission]:
-        return scoped_submissions(user=user, roles=roles)
+    def scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        permission: str = "assignments:read",
+    ) -> QuerySet[Submission]:
+        return scoped_submissions(user=user, roles=roles, permission=permission)
 
-    def get_scoped(self, *, user, roles: set[str], pk: int) -> Submission | None:
-        return self.scoped(user=user, roles=roles).filter(pk=pk).first()
+    def get_scoped(
+        self,
+        *,
+        user,
+        roles: set[str],
+        pk: int,
+        permission: str = "assignments:read",
+    ) -> Submission | None:
+        return self.scoped(user=user, roles=roles, permission=permission).filter(pk=pk).first()

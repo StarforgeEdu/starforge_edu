@@ -16,16 +16,36 @@ class AssignmentUploadGrant(models.Model):
     """Single-use, owner-bound authorization for an assignment S3 object."""
 
     key = models.CharField(max_length=512, unique=True)
-    requested_by = models.ForeignKey("users.User", on_delete=models.CASCADE, related_name="+")
+    requested_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
     content_type = models.CharField(max_length=127)
     expected_size_bytes = models.PositiveBigIntegerField()
     actual_size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     expires_at = models.DateTimeField(db_index=True)
     consumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    source_deleted_at = models.DateTimeField(null=True, blank=True)
+    durable_key = models.CharField(max_length=512, null=True, blank=True, unique=True)
+    deletion_requested_at = models.DateTimeField(null=True, blank=True)
+    durable_deleted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [models.Index(fields=("requested_by", "consumed_at", "expires_at"))]
+        indexes = [
+            models.Index(fields=("requested_by", "consumed_at", "expires_at")),
+            models.Index(
+                fields=("source_deleted_at", "expires_at"),
+                name="assign_upload_source_exp_idx",
+            ),
+            models.Index(
+                fields=("durable_deleted_at", "deletion_requested_at"),
+                name="assign_upload_delete_idx",
+            ),
+        ]
 
 
 class Assignment(models.Model):

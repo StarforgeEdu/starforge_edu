@@ -118,6 +118,46 @@ def test_duplicate_override_rejected(tenant_a, as_role):
     assert director.post(OVERRIDES, payload, format="json").status_code == 400
 
 
+def test_override_mutations_reject_unknown_fields_and_are_immutably_audited(
+    tenant_a,
+    as_role,
+    django_capture_on_commit_callbacks,
+):
+    from apps.audit.models import AuditLog
+
+    director, _ = as_role(Role.DIRECTOR)
+    payload = {"role": "teacher", "permission": "finance:read", "effect": "grant"}
+
+    unknown = director.post(OVERRIDES, {**payload, "surprise": True}, format="json")
+    assert unknown.status_code == 400
+    assert set(unknown.json()["errors"]) == {"surprise"}
+
+    with django_capture_on_commit_callbacks(execute=True):
+        created = director.post(OVERRIDES, payload, format="json")
+        assert created.status_code == 201, created.content
+        override_id = created.json()["data"]["id"]
+        detail = f"{OVERRIDES}{override_id}/"
+
+        unknown_update = director.patch(detail, {"unexpected": "ignored-before"}, format="json")
+        assert unknown_update.status_code == 400
+        assert set(unknown_update.json()["errors"]) == {"unexpected"}
+        updated = director.patch(detail, {"effect": "revoke", "note": "reviewed"}, format="json")
+        assert updated.status_code == 200, updated.content
+        assert director.delete(detail).status_code == 204
+
+    with schema_context(tenant_a.schema_name):
+        events = list(
+            AuditLog.objects.filter(
+                resource_type="access.RolePermissionOverride",
+                resource_id=str(override_id),
+            ).order_by("created_at", "pk")
+        )
+    assert [event.action for event in events] == ["create", "update", "delete"]
+    assert all(event.scope_status == "organization" for event in events)
+    assert events[1].before["effect"] == "grant"
+    assert events[1].after["effect"] == "revoke"
+
+
 def test_permission_catalog(tenant_a, as_role):
     director, _ = as_role(Role.DIRECTOR)
     body = director.get("/api/v1/access/permissions/").json()["data"]

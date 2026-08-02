@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any
+from uuid import UUID
 
 from django.db.models import QuerySet
 
-from apps.printing.models import BranchAgent, Printer, PrintJob
+from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
 
 
 class IPrintJobService(ABC):
@@ -24,8 +25,44 @@ class IPrintJobService(ABC):
     def claim(self, *, agent: BranchAgent) -> PrintJob | None: ...
 
     @abstractmethod
+    def reject_invalid_claim(self, *, agent: BranchAgent, job_id: int) -> PrintJob: ...
+
+    @abstractmethod
+    def heartbeat(
+        self,
+        *,
+        agent: BranchAgent,
+        job_id: int,
+        lease_id: UUID,
+        pages_printed: int | None,
+    ) -> PrintJob: ...
+
+    @abstractmethod
     def update_status(
-        self, *, agent: BranchAgent, job_id: int, status: str, error: str, pages_printed: int | None
+        self,
+        *,
+        agent: BranchAgent,
+        job_id: int,
+        lease_id: UUID,
+        status: str,
+        error: str,
+        pages_printed: int | None,
+    ) -> PrintJob: ...
+
+    @abstractmethod
+    def list_reconciliations(self, *, job_id: int) -> QuerySet[PrintJobReconciliation]: ...
+
+    @abstractmethod
+    def reconcile(
+        self,
+        *,
+        job_id: int,
+        expected_branch_id: int,
+        actor,
+        actor_principal,
+        outcome: str,
+        evidence_reference: str,
+        idempotency_key: str,
     ) -> PrintJob: ...
 
 

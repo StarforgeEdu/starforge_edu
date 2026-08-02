@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db import IntegrityError, transaction
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
 
@@ -48,20 +49,42 @@ class RoleGradeService(IRoleGradeService):
     def get(self, pk: int) -> RoleGrade | None:
         return self._grades.get_by_id(pk)
 
+    @transaction.atomic
     def create(self, data: RoleGradeDTO) -> RoleGrade:
         _validate_role(data.role)
         _assert_role_free(data.role)
-        return RoleGrade.objects.create(role=data.role, level=data.level, label=data.label)
+        try:
+            with transaction.atomic():
+                return RoleGrade.objects.create(role=data.role, level=data.level, label=data.label)
+        except IntegrityError:
+            raise ValidationException(
+                _("This role already has a grade."),
+                code="validation_error",
+                fields={"role": [_("This role already has a grade.")]},
+            ) from None
 
+    @transaction.atomic
     def update(self, grade: RoleGrade, changes: dict[str, Any]) -> RoleGrade:
+        grade = RoleGrade.objects.select_for_update().get(pk=grade.pk)
         if "role" in changes:
             _validate_role(changes["role"])
             _assert_role_free(changes["role"], exclude_pk=grade.pk)
         for field in _SCALARS:
             if field in changes:
                 setattr(grade, field, changes[field])
-        grade.save()
+        try:
+            with transaction.atomic():
+                grade.save()
+        except IntegrityError:
+            raise ValidationException(
+                _("This role already has a grade."),
+                code="validation_error",
+                fields={"role": [_("This role already has a grade.")]},
+            ) from None
         return grade
 
+    @transaction.atomic
     def delete(self, grade: RoleGrade) -> None:
-        grade.delete()
+        locked = RoleGrade.objects.select_for_update().filter(pk=grade.pk).first()
+        if locked is not None:
+            locked.delete()

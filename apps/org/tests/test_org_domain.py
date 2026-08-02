@@ -48,7 +48,8 @@ def test_room_crud_and_branch_scope(as_role, tenant_a):
 
     assert client.delete(f"/api/v1/org/rooms/{room_id}/").status_code == 204
     with schema_context(tenant_a.schema_name):
-        assert not Room.objects.filter(pk=room_id).exists()
+        room = Room.objects.get(pk=room_id)
+        assert room.is_active is False
 
 
 @pytest.mark.parametrize("role", [Role.TEACHER, Role.CASHIER])

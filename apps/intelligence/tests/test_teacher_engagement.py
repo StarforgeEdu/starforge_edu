@@ -155,3 +155,26 @@ def test_teacher_with_no_marks_has_null_rate_and_sorts_last(tenant_a, user_in, a
     assert idle_row["engagement_score"] is None
     assert idle_row["lessons_delivered"] == 0
     assert body["results"][-1]["teacher"] == idle.id  # unscored sorts last
+
+
+def test_teacher_page_query_count_is_population_invariant(tenant_a, user_in, as_role):
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    s = _setup(tenant_a, user_in)
+    director, _ = as_role(Role.DIRECTOR)
+    with CaptureQueriesContext(connection) as small_capture:
+        small = director.get(f"{TEACHERS}?page_size=1")
+    with schema_context(tenant_a.schema_name):
+        TeacherProfileFactory.create_batch(40, branch=s["branch_a"])
+    with CaptureQueriesContext(connection) as large_capture:
+        large = director.get(f"{TEACHERS}?page_size=1")
+
+    assert small.status_code == 200, small.content
+    assert large.status_code == 200, large.content
+    assert large.json()["data"]["count"] == small.json()["data"]["count"] + 40
+    assert len(small.json()["data"]["results"]) == 1
+    assert len(large.json()["data"]["results"]) == 1
+    assert len(large_capture) <= len(small_capture) + 1

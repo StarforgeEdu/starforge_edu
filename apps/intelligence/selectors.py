@@ -9,18 +9,42 @@ overdue invoices), computed on read so it is always current and fully explainabl
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, time, timedelta
+from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from django.db.models import Avg, Count, ExpressionWrapper, F, FloatField, Q, QuerySet, Subquery
+from django.db.models import (
+    Avg,
+    BooleanField,
+    Case,
+    Count,
+    Exists,
+    ExpressionWrapper,
+    F,
+    FloatField,
+    IntegerField,
+    OuterRef,
+    Q,
+    QuerySet,
+    Subquery,
+    Sum,
+    Value,
+    When,
+)
+from django.db.models.functions import Cast, Coalesce, NullIf
 from django.utils import timezone
 
 from apps.academics.models import ExamResult
 from apps.attendance.models import AttendanceRecord
-from apps.finance.models import Invoice
+from apps.finance.models import Expense, Invoice, PaymentAllocation, Refund
+from apps.intelligence.dto import ExecutiveScopeBoundary, ExecutiveSummaryContext
+from apps.intelligence.executive import EXECUTIVE_SECTION_REQUIREMENTS
 from apps.parents.models import Guardian
+from apps.payments.models import Payment
 from apps.schedule.models import Lesson
 from apps.students.models import StudentProfile
+from core.historical_scope import ATTRIBUTED_SCOPE_STATUSES
 
 # --- transparent, documented thresholds (will move to CenterSettings later) ----- #
 ATTENDANCE_WINDOW_DAYS = 30
@@ -98,7 +122,10 @@ def student_risk(students: QuerySet[StudentProfile], *, now=None, include_financ
     if include_finance:
         overdue = set(
             Invoice.objects.filter(
-                student_id__in=Subquery(student_scope), status=Invoice.Status.OVERDUE
+                student_id__in=Subquery(student_scope),
+                status=Invoice.Status.OVERDUE,
+                attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+                branch_at_issue_id=F("student__branch_id"),
             ).values_list("student_id", flat=True)
         )
 
@@ -150,6 +177,143 @@ def _flags_for(att, avg_pct, is_overdue) -> list[dict]:
     if is_overdue:
         flags.append({"code": "overdue_payment", "reason": "Has an overdue invoice."})
     return flags
+
+
+def student_risk_page(
+    students: QuerySet[StudentProfile],
+    *,
+    include_finance: bool,
+    page: int,
+    page_size: int,
+    now=None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return one globally-ranked page without loading the scoped population.
+
+    Risk signals are correlated subqueries and the score is ordered in SQL, so
+    memory and row materialization stay bounded by ``page_size``. The public
+    rules and row shape remain identical to :func:`student_risk`.
+    """
+
+    now = now or timezone.now()
+    window = now - timedelta(days=ATTENDANCE_WINDOW_DAYS)
+    attendance_stats = (
+        AttendanceRecord.objects.filter(
+            student_id=OuterRef("pk"),
+            lesson__starts_at__gte=window,
+            lesson__starts_at__lte=now,
+        )
+        .values("student_id")
+        .annotate(
+            denominator=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
+            absent=Count("id", filter=Q(status=AttendanceRecord.Status.ABSENT)),
+        )
+    )
+    grade_stats = (
+        ExamResult.objects.filter(
+            student_id=OuterRef("pk"),
+            exam__is_published=True,
+        )
+        .values("student_id")
+        .annotate(
+            avg_pct=Avg(
+                ExpressionWrapper(
+                    F("score") * 100.0 / F("exam__max_score"),
+                    output_field=FloatField(),
+                )
+            )
+        )
+    )
+    overdue: Exists | Value
+    if include_finance:
+        overdue = Exists(
+            Invoice.objects.filter(
+                student_id=OuterRef("pk"),
+                status=Invoice.Status.OVERDUE,
+                attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+                branch_at_issue_id=OuterRef("branch_id"),
+            )
+        )
+    else:
+        overdue = Value(False, output_field=BooleanField())
+    ranked = (
+        students.order_by()
+        .annotate(
+            risk_attendance_total=Coalesce(
+                Subquery(attendance_stats.values("denominator")[:1]),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            risk_attendance_absent=Coalesce(
+                Subquery(attendance_stats.values("absent")[:1]),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            risk_avg_grade_pct=Subquery(
+                grade_stats.values("avg_pct")[:1],
+                output_field=FloatField(),
+            ),
+            risk_overdue_payment=overdue,
+        )
+        .annotate(
+            risk_absence_rate=ExpressionWrapper(
+                Cast(F("risk_attendance_absent"), FloatField())
+                / NullIf(Cast(F("risk_attendance_total"), FloatField()), Value(0.0)),
+                output_field=FloatField(),
+            )
+        )
+        .annotate(
+            risk_low_attendance=Case(
+                When(
+                    risk_attendance_total__gte=MIN_LESSONS_FOR_ATTENDANCE_FLAG,
+                    risk_absence_rate__gte=ABSENCE_RATE_THRESHOLD,
+                    then=Value(True),
+                ),
+                default=Value(False),
+                output_field=BooleanField(),
+            ),
+            risk_low_grades=Case(
+                When(risk_avg_grade_pct__lt=LOW_GRADE_PCT_THRESHOLD, then=Value(True)),
+                default=Value(False),
+                output_field=BooleanField(),
+            ),
+        )
+        .annotate(
+            risk_score=(
+                Cast(F("risk_low_attendance"), IntegerField()) * RULES["low_attendance"]["weight"]
+                + Cast(F("risk_low_grades"), IntegerField()) * RULES["low_grades"]["weight"]
+                + Cast(F("risk_overdue_payment"), IntegerField()) * RULES["overdue_payment"]["weight"]
+            )
+        )
+        .filter(risk_score__gt=0)
+        .order_by("-risk_score", "pk")
+    )
+    total = ranked.count()
+    offset = (page - 1) * page_size
+    if offset > 1_000_000_000:
+        return [], total
+    rows = list(ranked.select_related("user", "current_cohort")[offset : offset + page_size])
+    results: list[dict[str, Any]] = []
+    for student in rows:
+        attendance = {
+            "total": student.risk_attendance_total,
+            "absent": student.risk_attendance_absent,
+        }
+        flags = _flags_for(
+            attendance,
+            student.risk_avg_grade_pct,
+            student.risk_overdue_payment,
+        )
+        results.append(
+            {
+                "student": student.pk,
+                "name": student.get_full_name(),
+                "cohort": student.current_cohort_id,
+                "score": student.risk_score,
+                "level": _level(student.risk_score),
+                "flags": flags,
+            }
+        )
+    return results, total
 
 
 # --- A-3 facet: branch performance ranking --------------------------------------- #
@@ -357,7 +521,12 @@ def family_health(branches, *, now=None, include_finance: bool = True) -> list[d
         return []
 
     families: dict[int, dict] = {}
-    for g in Guardian.objects.filter(student_id__in=Subquery(student_scope)).select_related("parent__user"):
+    for g in Guardian.objects.filter(
+        student_id__in=Subquery(student_scope),
+        revoked_at__isnull=True,
+        parent__is_active=True,
+        parent__user__is_active=True,
+    ).select_related("parent__user"):
         parent_user = g.parent.user
         fam = families.setdefault(
             g.parent_id,
@@ -479,58 +648,1020 @@ TEACHER_METRICS: dict[str, str] = {
 }
 
 
-def teacher_engagement(teachers: QuerySet, *, now=None) -> list[dict]:
-    """Per-teacher engagement over the attendance window for an already-scoped
-    TeacherProfile queryset. A couple of grouped aggregates keep it cheap. A teacher
-    with no marks gets a null rate (not a spurious 0) and sorts last."""
+def teacher_engagement_page(
+    teachers: QuerySet,
+    *,
+    page: int,
+    page_size: int,
+    now=None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return the globally-ranked teacher page from bounded SQL.
+
+    Correlated aggregates preserve the transparent metric definitions while
+    applying ranking and pagination before teacher rows are materialized.
+    """
+
     now = now or timezone.now()
-    teacher_scope = teachers.order_by().values("id")
-    teacher_rows = {t.id: t for t in teachers.select_related("user")}
-    if not teacher_rows:
-        return []
     window = now - timedelta(days=ATTENDANCE_WINDOW_DAYS)
-    st = AttendanceRecord.Status
-    attendance = {
-        row["lesson__teacher_id"]: row
-        for row in AttendanceRecord.objects.filter(
-            lesson__teacher_id__in=Subquery(teacher_scope),
+    status = AttendanceRecord.Status
+    attendance_stats = (
+        AttendanceRecord.objects.filter(
+            lesson__teacher_id=OuterRef("pk"),
             lesson__starts_at__gte=window,
             lesson__starts_at__lte=now,
         )
         .values("lesson__teacher_id")
         .annotate(
-            total=Count("id", filter=~Q(status=st.EXCUSED)),
-            attended=Count("id", filter=Q(status__in=(st.PRESENT, st.LATE))),
-            students=Count("student", distinct=True),
+            denominator=Count("id", filter=~Q(status=status.EXCUSED)),
+            attended=Count("id", filter=Q(status__in=(status.PRESENT, status.LATE))),
+            students=Count("student_id", distinct=True),
         )
-    }
-    lessons = {
-        row["teacher_id"]: row["n"]
-        # Upper-bounded at `now`: future SCHEDULED lessons (materialized from
-        # recurrence rules) are not yet delivered, so they must not inflate the count.
-        for row in Lesson.objects.filter(
-            teacher_id__in=Subquery(teacher_scope), starts_at__gte=window, starts_at__lte=now
+    )
+    lesson_stats = (
+        Lesson.objects.filter(
+            teacher_id=OuterRef("pk"),
+            starts_at__gte=window,
+            starts_at__lte=now,
         )
         .exclude(status__in=(Lesson.Status.CANCELLED, Lesson.Status.ARCHIVED))
         .values("teacher_id")
-        .annotate(n=Count("id"))
-    }
-    out: list[dict] = []
-    for tid, teacher in teacher_rows.items():
-        att = attendance.get(tid, {})
-        total = att.get("total", 0)
-        rate = round(100 * att["attended"] / total, 1) if total else None
-        out.append(
+        .annotate(total=Count("id"))
+    )
+    ranked = (
+        teachers.order_by()
+        .annotate(
+            engagement_marks_sampled=Coalesce(
+                Subquery(attendance_stats.values("denominator")[:1]),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            engagement_attended=Coalesce(
+                Subquery(attendance_stats.values("attended")[:1]),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            engagement_students_reached=Coalesce(
+                Subquery(attendance_stats.values("students")[:1]),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            engagement_lessons_delivered=Coalesce(
+                Subquery(lesson_stats.values("total")[:1]),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+        )
+        .annotate(
+            engagement_rate=Case(
+                When(
+                    engagement_marks_sampled__gt=0,
+                    then=ExpressionWrapper(
+                        Cast(F("engagement_attended"), FloatField())
+                        * Value(100.0)
+                        / Cast(F("engagement_marks_sampled"), FloatField()),
+                        output_field=FloatField(),
+                    ),
+                ),
+                default=Value(None),
+                output_field=FloatField(),
+            )
+        )
+        .order_by(F("engagement_rate").desc(nulls_last=True), "pk")
+    )
+    total = ranked.count()
+    offset = (page - 1) * page_size
+    if offset > 1_000_000_000:
+        return [], total
+    rows = list(ranked.select_related("user")[offset : offset + page_size])
+    results: list[dict[str, Any]] = []
+    for teacher in rows:
+        rate = round(teacher.engagement_rate, 1) if teacher.engagement_rate is not None else None
+        results.append(
             {
-                "teacher": tid,
+                "teacher": teacher.pk,
                 "name": teacher.get_full_name(),
-                "lessons_delivered": lessons.get(tid, 0),
-                "students_reached": att.get("students", 0),
-                "marks_sampled": total,
-                "attendance_rate": rate,  # present+late / non-excused, percent
-                "engagement_score": rate,  # transparent: equals the attendance rate
+                "lessons_delivered": teacher.engagement_lessons_delivered,
+                "students_reached": teacher.engagement_students_reached,
+                "marks_sampled": teacher.engagement_marks_sampled,
+                "attendance_rate": rate,
+                "engagement_score": rate,
             }
         )
-    # Best engagement first; teachers with no marks (None) sort last, then by id.
-    out.sort(key=lambda r: (r["engagement_score"] is None, -(r["engagement_score"] or 0), r["teacher"]))
-    return out
+    return results, total
+
+
+# --- Permission-pruned executive snapshot ------------------------------------ #
+
+_OPEN_INVOICE_STATUSES = (
+    Invoice.Status.ISSUED,
+    Invoice.Status.PARTIALLY_PAID,
+    Invoice.Status.OVERDUE,
+)
+_ZERO = Decimal("0")
+
+
+def executive_summary(context: ExecutiveSummaryContext) -> dict[str, Any]:
+    """Build one bounded, permission-pruned management snapshot.
+
+    Every metric is a database aggregate or a branch-grouped aggregate.  No
+    student, attendance, invoice, or payment population is materialized in
+    Python.  ``context.scope`` was already authorized by the view, while
+    ``included_sections`` records which domain permissions cover that *entire*
+    scope; an unauthorized section is omitted instead of rendered as zero.
+    """
+
+    included = context.included_sections
+    coverage: dict[str, dict[str, Any]] = {}
+    warnings: list[dict[str, Any]] = []
+    for section, alternatives in EXECUTIVE_SECTION_REQUIREMENTS.items():
+        requirement = _coverage_requirement(alternatives)
+        if section in included:
+            coverage[section] = {"status": "complete", **requirement}
+        else:
+            coverage[section] = {
+                "status": "omitted",
+                "reason": "insufficient_permission",
+                **requirement,
+            }
+
+    payload: dict[str, Any] = {
+        "generated_at": context.generated_at.isoformat(),
+        "locale": context.locale,
+        "currency": context.currency,
+        "window": context.window.to_dict(),
+        "scope": context.scope.to_dict(),
+        "coverage": coverage,
+        "warnings": warnings,
+    }
+
+    student_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="branch_id",
+        department_field="current_cohort__department_id",
+    )
+    attendance_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="lesson__cohort__branch_id",
+        department_field="lesson__cohort__department_id",
+    )
+    lower, upper = _window_bounds(context)
+
+    branch_metrics: dict[int, dict[str, Any]] = {
+        branch.id: {"id": branch.id, "name": branch.name} for branch in context.scope.branches
+    }
+
+    if "students" in included:
+        students = StudentProfile.objects.filter(student_scope).order_by()
+        student_totals = students.aggregate(
+            total=Count("id"),
+            active=Count("id", filter=Q(status=StudentProfile.Status.ACTIVE)),
+            leads=Count("id", filter=Q(status=StudentProfile.Status.LEAD)),
+            graduated=Count("id", filter=Q(status=StudentProfile.Status.GRADUATED)),
+            withdrawn=Count("id", filter=Q(status=StudentProfile.Status.WITHDRAWN)),
+            blocked=Count("id", filter=Q(blocked_at__isnull=False)),
+            with_cohort=Count("id", filter=Q(current_cohort__isnull=False)),
+            ungrouped=Count("id", filter=Q(current_cohort__isnull=True)),
+            joined_in_window=Count(
+                "id",
+                filter=Q(
+                    enrollment_date__gte=context.window.date_from,
+                    enrollment_date__lte=context.window.date_to,
+                ),
+            ),
+        )
+        payload["students"] = student_totals
+        coverage["students"]["sample_size"] = student_totals["total"]
+        coverage["students"]["windowed_metrics"] = ["joined_in_window"]
+        coverage["students"]["as_of_generated_at"] = [
+            "total",
+            "active",
+            "leads",
+            "graduated",
+            "withdrawn",
+            "blocked",
+            "with_cohort",
+            "ungrouped",
+        ]
+        for row in students.values("branch_id").annotate(student_count=Count("id")):
+            if row["branch_id"] in branch_metrics:
+                branch_metrics[row["branch_id"]]["student_count"] = row["student_count"]
+        for row in branch_metrics.values():
+            row.setdefault("student_count", 0)
+
+    if "retention" in included:
+        payload["retention"] = _retention_summary(
+            context,
+            student_scope=student_scope,
+            lower=lower,
+            upper=upper,
+        )
+        coverage["retention"].update(
+            {
+                "sample_size": payload["retention"]["current_student_sample_size"],
+                "metric_definition": (
+                    "Distinct currently scoped students with enrollment or terminal "
+                    "transition evidence in the selected window."
+                ),
+                "attribution": "current_student_scope",
+            }
+        )
+
+    if "capacity" in included:
+        payload["capacity"] = _capacity_summary(context)
+        coverage["capacity"].update(
+            {
+                "sample_size": payload["capacity"]["active_group_count"],
+                "metric_definition": (
+                    "Current active students divided by declared seats in active groups; "
+                    "groups without capacity remain explicitly unmeasured."
+                ),
+            }
+        )
+
+    if "risk" in included:
+        payload["risk"] = _risk_summary(
+            context,
+            student_scope=student_scope,
+            lower=lower,
+            upper=upper,
+            include_finance="finance" in included,
+        )
+        coverage["risk"].update(
+            {
+                "sample_size": payload["risk"]["student_sample_size"],
+                "signals": payload["risk"]["included_signals"],
+                "metric_definition": (
+                    "Transparent attendance, published-assessment, and (when authorized) "
+                    "immutable-scope overdue-invoice rules; this is not a predictive model."
+                ),
+            }
+        )
+
+    if "attendance" in included:
+        attendance = AttendanceRecord.objects.filter(
+            attendance_scope,
+            lesson__starts_at__gte=lower,
+            lesson__starts_at__lt=upper,
+        ).order_by()
+        attendance_totals = attendance.aggregate(
+            attended=Count(
+                "id",
+                filter=Q(status__in=(AttendanceRecord.Status.PRESENT, AttendanceRecord.Status.LATE)),
+            ),
+            absent=Count("id", filter=Q(status=AttendanceRecord.Status.ABSENT)),
+            excused=Count("id", filter=Q(status=AttendanceRecord.Status.EXCUSED)),
+            denominator=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
+        )
+        denominator = attendance_totals["denominator"]
+        attendance_totals["attendance_rate_fraction"] = (
+            round(attendance_totals["attended"] / denominator, 4) if denominator else None
+        )
+        payload["attendance"] = attendance_totals
+        coverage["attendance"]["sample_size"] = denominator
+        coverage["attendance"]["rate_definition"] = "present_or_late divided by non_excused marks"
+        if not denominator:
+            coverage["attendance"]["status"] = "no_data"
+            warnings.append(
+                {
+                    "code": "insufficient_data",
+                    "message": "Attendance has no eligible records in the selected window.",
+                    "affected_sections": ["attendance"],
+                }
+            )
+        for row in attendance.values("lesson__cohort__branch_id").annotate(
+            attended=Count(
+                "id",
+                filter=Q(status__in=(AttendanceRecord.Status.PRESENT, AttendanceRecord.Status.LATE)),
+            ),
+            denominator=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
+        ):
+            branch_id = row["lesson__cohort__branch_id"]
+            if branch_id not in branch_metrics:
+                continue
+            branch_metrics[branch_id].update(
+                {
+                    "attendance_numerator": row["attended"],
+                    "attendance_denominator": row["denominator"],
+                    "attendance_rate_fraction": (
+                        round(row["attended"] / row["denominator"], 4) if row["denominator"] else None
+                    ),
+                }
+            )
+        for row in branch_metrics.values():
+            row.setdefault("attendance_numerator", 0)
+            row.setdefault("attendance_denominator", 0)
+            row.setdefault("attendance_rate_fraction", None)
+
+    if "students" in included or "attendance" in included:
+        payload["branches"] = [branch_metrics[branch.id] for branch in context.scope.branches]
+        coverage["branches"] = {
+            "status": "complete",
+            "derived_from": [section for section in ("students", "attendance") if section in included],
+        }
+
+    if "finance" in included:
+        payload["finance"] = _finance_summary(context, lower=lower, upper=upper)
+        coverage["finance"]["currency"] = context.currency
+        coverage["finance"]["window_basis"] = {
+            "billed": "invoice issue_date",
+            "collected": "payment paid_at",
+            "refunded": "provider_confirmed_at",
+            "expenses": "approved_at or paid_at",
+        }
+        coverage["finance"]["attribution"] = "immutable_historical_scope"
+        if any(boundary.department_id is not None for boundary in context.scope.boundaries):
+            # Expense has immutable branch attribution but no department column.
+            # Returning whole-branch expenses for a department scope would broaden
+            # authority, so only those two metrics are omitted and explained.
+            coverage["finance"]["status"] = "partial"
+            coverage["finance"]["omitted_metrics"] = ["approved_expense", "paid_expense"]
+            warnings.append(
+                {
+                    "code": "scope_not_representable",
+                    "message": "Expense totals are unavailable for department-only scope.",
+                    "affected_sections": ["finance"],
+                }
+            )
+
+    if "teachers" in included:
+        payload["teachers"] = _teacher_summary(
+            context,
+            lower=lower,
+            upper=upper,
+        )
+        coverage["teachers"].update(
+            {
+                "sample_size": payload["teachers"]["teacher_count"],
+                "metric_definition": (
+                    "Delivery, reach, attendance, group-load, and published-assessment "
+                    "evidence in the selected window; no causal employee score is inferred."
+                ),
+            }
+        )
+
+    attention: dict[str, Any] = {}
+    if "tasks" in included:
+        attention["tasks"] = _task_attention(context)
+        coverage["tasks"].update(
+            {
+                "sample_size": attention["tasks"]["open_assigned_to_me"],
+                "attribution": "exact_assignee_principal",
+            }
+        )
+    if "approvals" in included:
+        if _branch_only_scope(context):
+            attention["pending_approvals"] = _pending_approval_count(
+                context,
+                include_compensation="_compensation" in included,
+            )
+            coverage["approvals"].update(
+                {
+                    "sample_size": attention["pending_approvals"],
+                    "attribution": "handler_branch_scope",
+                }
+            )
+        else:
+            _mark_scope_unrepresentable(
+                coverage,
+                warnings,
+                section="approvals",
+                message="Approval totals are unavailable for department-only scope.",
+            )
+    if "notifications" in included:
+        # Notification rows intentionally contain no mutable resource-derived
+        # branch relation. Return an exact personal total only for a tenant-wide
+        # snapshot; a branch-filtered total would silently mix scopes.
+        if context.scope.organization_wide:
+            attention["unread_notifications"] = _unread_notification_count(context)
+            coverage["notifications"].update(
+                {
+                    "sample_size": attention["unread_notifications"],
+                    "attribution": "exact_recipient_principal",
+                }
+            )
+        else:
+            _mark_scope_unrepresentable(
+                coverage,
+                warnings,
+                section="notifications",
+                message="Unread notifications are unavailable for a filtered organization scope.",
+            )
+    if "meetings" in included:
+        if _branch_only_scope(context):
+            attention["upcoming_meetings"] = _upcoming_meeting_count(
+                context,
+                upper=upper,
+            )
+            coverage["meetings"].update(
+                {
+                    "sample_size": attention["upcoming_meetings"],
+                    "attribution": "exact_invitee_principal",
+                }
+            )
+        else:
+            _mark_scope_unrepresentable(
+                coverage,
+                warnings,
+                section="meetings",
+                message="Upcoming meetings are unavailable for department-only scope.",
+            )
+    if attention:
+        payload["attention"] = attention
+
+    permission_omissions = [
+        section
+        for section, item in coverage.items()
+        if item["status"] == "omitted" and item.get("reason") == "insufficient_permission"
+    ]
+    if permission_omissions:
+        warnings.append(
+            {
+                "code": "sections_omitted",
+                "message": "Some sections were omitted because they are not authorized.",
+                "affected_sections": permission_omissions,
+            }
+        )
+    return payload
+
+
+def _coverage_requirement(
+    alternatives: tuple[tuple[str, ...], ...],
+) -> dict[str, Any]:
+    if alternatives == ((),):
+        return {"authorization_basis": "current_principal"}
+    if len(alternatives) == 1 and len(alternatives[0]) == 1:
+        return {"required_permission": alternatives[0][0]}
+    return {"required_permission_sets": [list(all_of) for all_of in alternatives]}
+
+
+def _scope_predicate(
+    boundaries: tuple[ExecutiveScopeBoundary, ...],
+    *,
+    branch_field: str,
+    department_field: str,
+) -> Q:
+    predicate = Q(pk__in=[])
+    for boundary in boundaries:
+        if boundary.department_id is None:
+            predicate |= Q(**{branch_field: boundary.branch_id})
+        else:
+            predicate |= Q(
+                **{
+                    branch_field: boundary.branch_id,
+                    department_field: boundary.department_id,
+                }
+            )
+    return predicate
+
+
+def _window_bounds(context: ExecutiveSummaryContext) -> tuple[datetime, datetime]:
+    tz = ZoneInfo(context.window.timezone)
+    lower = timezone.make_aware(datetime.combine(context.window.date_from, time.min), tz)
+    # Exclusive next-day bound is precise across database timestamp precision and
+    # avoids manufacturing a 23:59:59.999999 sentinel.
+    upper = timezone.make_aware(
+        datetime.combine(context.window.date_to + timedelta(days=1), time.min),
+        tz,
+    )
+    return lower, upper
+
+
+def _retention_summary(
+    context: ExecutiveSummaryContext,
+    *,
+    student_scope: Q,
+    lower: datetime,
+    upper: datetime,
+) -> dict[str, int | str]:
+    from apps.students.models import EnrollmentEvent
+
+    scoped_students = StudentProfile.objects.filter(student_scope).order_by()
+    transitions = EnrollmentEvent.objects.filter(
+        student_id__in=Subquery(scoped_students.values("pk")),
+        created_at__gte=lower,
+        created_at__lt=upper,
+    ).order_by()
+    totals = transitions.aggregate(
+        exit_events=Count(
+            "id",
+            filter=Q(
+                to_status__in=(
+                    StudentProfile.Status.GRADUATED,
+                    StudentProfile.Status.WITHDRAWN,
+                )
+            ),
+        ),
+        exited_students=Count(
+            "student_id",
+            filter=Q(
+                to_status__in=(
+                    StudentProfile.Status.GRADUATED,
+                    StudentProfile.Status.WITHDRAWN,
+                )
+            ),
+            distinct=True,
+        ),
+    )
+    student_totals = scoped_students.aggregate(
+        current_student_sample_size=Count("id"),
+        joined_students=Count(
+            "id",
+            filter=Q(
+                enrollment_date__gte=context.window.date_from,
+                enrollment_date__lte=context.window.date_to,
+            ),
+        ),
+    )
+    return {
+        "current_student_sample_size": student_totals["current_student_sample_size"],
+        "joined_students": student_totals["joined_students"],
+        "exited_students": totals["exited_students"],
+        "exit_events": totals["exit_events"],
+        "attribution": "current_student_scope",
+    }
+
+
+def _capacity_summary(context: ExecutiveSummaryContext) -> dict[str, int | str]:
+    from apps.cohorts.models import Cohort
+
+    scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="branch_id",
+        department_field="department_id",
+    )
+    cohorts = Cohort.objects.filter(scope, is_archived=False).order_by()
+    totals = cohorts.aggregate(
+        active_group_count=Count("id"),
+        groups_with_declared_capacity=Count("id", filter=Q(capacity__isnull=False)),
+        groups_without_declared_capacity=Count("id", filter=Q(capacity__isnull=True)),
+        declared_seats=Sum("capacity"),
+        active_students=Count(
+            "current_students",
+            filter=Q(current_students__status=StudentProfile.Status.ACTIVE),
+            distinct=True,
+        ),
+        active_students_in_measured_groups=Count(
+            "current_students",
+            filter=Q(
+                capacity__isnull=False,
+                current_students__status=StudentProfile.Status.ACTIVE,
+            ),
+            distinct=True,
+        ),
+    )
+    declared = totals["declared_seats"] or 0
+    measured_students = totals["active_students_in_measured_groups"]
+    return {
+        "active_group_count": totals["active_group_count"],
+        "groups_with_declared_capacity": totals["groups_with_declared_capacity"],
+        "groups_without_declared_capacity": totals["groups_without_declared_capacity"],
+        "declared_seats": declared,
+        "active_students": totals["active_students"],
+        "active_students_in_measured_groups": measured_students,
+        "seat_balance": declared - measured_students,
+        "attribution": "current_group_scope",
+    }
+
+
+def _risk_summary(
+    context: ExecutiveSummaryContext,
+    *,
+    student_scope: Q,
+    lower: datetime,
+    upper: datetime,
+    include_finance: bool,
+) -> dict[str, Any]:
+    students = StudentProfile.objects.filter(
+        student_scope,
+        status=StudentProfile.Status.ACTIVE,
+    ).order_by()
+    attendance_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="lesson__cohort__branch_id",
+        department_field="lesson__cohort__department_id",
+    )
+    recent_attendance = (
+        AttendanceRecord.objects.filter(
+            attendance_scope,
+            student_id=OuterRef("pk"),
+            lesson__starts_at__gte=lower,
+            lesson__starts_at__lt=upper,
+        )
+        .values("student_id")
+        .annotate(
+            denominator=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
+            absent=Count("id", filter=Q(status=AttendanceRecord.Status.ABSENT)),
+        )
+        .filter(denominator__gte=MIN_LESSONS_FOR_ATTENDANCE_FLAG)
+        .annotate(
+            absence_rate=ExpressionWrapper(
+                Cast(F("absent"), FloatField()) / Cast(F("denominator"), FloatField()),
+                output_field=FloatField(),
+            )
+        )
+        .filter(absence_rate__gte=ABSENCE_RATE_THRESHOLD)
+    )
+    assessment_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="exam__cohort__branch_id",
+        department_field="exam__cohort__department_id",
+    )
+    low_grades = (
+        ExamResult.objects.filter(
+            assessment_scope,
+            student_id=OuterRef("pk"),
+            exam__is_published=True,
+            exam__exam_date__gte=context.window.date_from,
+            exam__exam_date__lte=context.window.date_to,
+        )
+        .values("student_id")
+        .annotate(
+            avg_pct=Avg(
+                ExpressionWrapper(
+                    F("score") * 100.0 / F("exam__max_score"),
+                    output_field=FloatField(),
+                )
+            )
+        )
+        .filter(avg_pct__lt=LOW_GRADE_PCT_THRESHOLD)
+    )
+    overdue_exists: Exists | Value
+    if include_finance:
+        invoice_scope = _scope_predicate(
+            context.scope.boundaries,
+            branch_field="branch_at_issue_id",
+            department_field="department_at_issue_id",
+        )
+        overdue_exists = Exists(
+            Invoice.objects.filter(
+                invoice_scope,
+                attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+                student_id=OuterRef("pk"),
+                status=Invoice.Status.OVERDUE,
+            )
+        )
+    else:
+        overdue_exists = Value(False, output_field=BooleanField())
+
+    annotated = students.annotate(
+        low_attendance=Exists(recent_attendance),
+        low_grades=Exists(low_grades),
+        overdue_payment=overdue_exists,
+    )
+    any_risk = Q(low_attendance=True) | Q(low_grades=True) | Q(overdue_payment=True)
+    high_risk = Q(low_attendance=True) & (Q(low_grades=True) | Q(overdue_payment=True))
+    medium_risk = Q(low_attendance=True, low_grades=False, overdue_payment=False) | Q(
+        low_attendance=False, low_grades=True, overdue_payment=True
+    )
+    low_risk = Q(low_attendance=False) & (
+        Q(low_grades=True, overdue_payment=False) | Q(low_grades=False, overdue_payment=True)
+    )
+    totals = annotated.aggregate(
+        student_sample_size=Count("id"),
+        at_risk_students=Count("id", filter=any_risk),
+        high_risk_students=Count("id", filter=high_risk),
+        medium_risk_students=Count("id", filter=medium_risk),
+        low_risk_students=Count("id", filter=low_risk),
+        low_attendance_students=Count("id", filter=Q(low_attendance=True)),
+        low_grade_students=Count("id", filter=Q(low_grades=True)),
+        overdue_payment_students=Count("id", filter=Q(overdue_payment=True)),
+    )
+    sample = totals["student_sample_size"]
+    totals["at_risk_rate_fraction"] = round(totals["at_risk_students"] / sample, 4) if sample else None
+    totals["included_signals"] = [
+        "low_attendance",
+        "low_grades",
+        *(("overdue_payment",) if include_finance else ()),
+    ]
+    totals["finance_signal_included"] = include_finance
+    return totals
+
+
+def _teacher_summary(
+    context: ExecutiveSummaryContext,
+    *,
+    lower: datetime,
+    upper: datetime,
+) -> dict[str, Any]:
+    from apps.academics.models import Exam
+    from apps.teachers.models import TeacherProfile
+
+    profile_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="branch_id",
+        department_field="department_id",
+    )
+    cohort_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="cohort__branch_id",
+        department_field="cohort__department_id",
+    )
+    attendance_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="lesson__cohort__branch_id",
+        department_field="lesson__cohort__department_id",
+    )
+    teacher_totals = TeacherProfile.objects.filter(profile_scope).aggregate(
+        teacher_count=Count("id"),
+        active_teacher_count=Count("id", filter=Q(is_active=True)),
+    )
+    lessons = Lesson.objects.filter(
+        cohort_scope,
+        starts_at__gte=lower,
+        starts_at__lt=upper,
+    ).order_by()
+    lesson_totals = lessons.aggregate(
+        completed_lessons=Count("id", filter=Q(status=Lesson.Status.COMPLETED)),
+        teachers_delivering=Count(
+            "teacher_id",
+            filter=Q(status=Lesson.Status.COMPLETED),
+            distinct=True,
+        ),
+        groups_delivered=Count(
+            "cohort_id",
+            filter=Q(status=Lesson.Status.COMPLETED),
+            distinct=True,
+        ),
+    )
+    marks = AttendanceRecord.objects.filter(
+        attendance_scope,
+        lesson__starts_at__gte=lower,
+        lesson__starts_at__lt=upper,
+    ).order_by()
+    mark_totals = marks.aggregate(
+        attendance_numerator=Count(
+            "id",
+            filter=Q(status__in=(AttendanceRecord.Status.PRESENT, AttendanceRecord.Status.LATE)),
+        ),
+        attendance_denominator=Count(
+            "id",
+            filter=~Q(status=AttendanceRecord.Status.EXCUSED),
+        ),
+        students_reached=Count("student_id", distinct=True),
+        lessons_with_attendance=Count("lesson_id", distinct=True),
+    )
+    exam_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="exam__cohort__branch_id",
+        department_field="exam__cohort__department_id",
+    )
+    assessment_totals = ExamResult.objects.filter(
+        exam_scope,
+        exam__is_published=True,
+        exam__exam_date__gte=context.window.date_from,
+        exam__exam_date__lte=context.window.date_to,
+    ).aggregate(
+        published_exams_with_results=Count("exam_id", distinct=True),
+        graded_results=Count("id"),
+        assessed_students=Count("student_id", distinct=True),
+    )
+    # Published exams without results are readiness evidence too; report them
+    # separately instead of pretending they contributed assessment samples.
+    published_exams = Exam.objects.filter(
+        cohort_scope,
+        is_published=True,
+        exam_date__gte=context.window.date_from,
+        exam_date__lte=context.window.date_to,
+    ).count()
+    denominator = mark_totals["attendance_denominator"]
+    return {
+        **teacher_totals,
+        **lesson_totals,
+        **mark_totals,
+        **assessment_totals,
+        "published_exams": published_exams,
+        "attendance_rate_fraction": (
+            round(mark_totals["attendance_numerator"] / denominator, 4) if denominator else None
+        ),
+    }
+
+
+def _task_attention(context: ExecutiveSummaryContext) -> dict[str, int]:
+    from apps.tasks.models import Task
+
+    if context.scope.organization_wide:
+        scope = Q()
+    else:
+        scope = _scope_predicate(
+            context.scope.boundaries,
+            branch_field="branch_id",
+            department_field="department_id",
+        )
+    tasks = Task.objects.filter(
+        scope,
+        assignee_principal_kind=context.principal_kind,
+        assignee_principal_id=context.principal_id,
+        assignee_attribution_status="captured",
+        status__in=(Task.Status.OPEN, Task.Status.IN_PROGRESS, Task.Status.BLOCKED),
+    ).order_by()
+    totals = tasks.aggregate(
+        open_assigned_to_me=Count("id"),
+        blocked_assigned_to_me=Count("id", filter=Q(status=Task.Status.BLOCKED)),
+        overdue_assigned_to_me=Count(
+            "id",
+            filter=Q(due_at__lt=context.generated_at),
+        ),
+    )
+    return totals
+
+
+def _branch_only_scope(context: ExecutiveSummaryContext) -> bool:
+    return all(boundary.department_id is None for boundary in context.scope.boundaries)
+
+
+def _pending_approval_count(
+    context: ExecutiveSummaryContext,
+    *,
+    include_compensation: bool,
+) -> int:
+    from apps.approvals.models import ApprovalRequest
+    from apps.approvals.services import KIND_SALARY_PREP
+
+    requests = ApprovalRequest.objects.filter(status=ApprovalRequest.Status.PENDING)
+    if not context.scope.organization_wide:
+        requests = requests.filter(
+            branch_id__in=[boundary.branch_id for boundary in context.scope.boundaries]
+        )
+    if not include_compensation:
+        requests = requests.exclude(kind=KIND_SALARY_PREP)
+    return requests.count()
+
+
+def _unread_notification_count(context: ExecutiveSummaryContext) -> int:
+    from apps.notifications.models import (
+        DELIVERABLE_ATTRIBUTION_STATUSES,
+        Notification,
+    )
+
+    return Notification.objects.filter(
+        user_id=context.user_id,
+        recipient_principal_kind=context.principal_kind,
+        recipient_principal_id=context.principal_id,
+        attribution_status__in=DELIVERABLE_ATTRIBUTION_STATUSES,
+        read_at__isnull=True,
+    ).count()
+
+
+def _upcoming_meeting_count(
+    context: ExecutiveSummaryContext,
+    *,
+    upper: datetime,
+) -> int:
+    from apps.meetings.models import MeetingAttendee, StaffMeeting
+
+    invitations = MeetingAttendee.objects.filter(
+        principal_kind=context.principal_kind,
+        principal_id=context.principal_id,
+        meeting__status=StaffMeeting.Status.SCHEDULED,
+        meeting__starts_at__gte=context.generated_at,
+        meeting__starts_at__lt=upper,
+    )
+    if not context.scope.organization_wide:
+        invitations = invitations.filter(
+            meeting__branch_id__in=[boundary.branch_id for boundary in context.scope.boundaries]
+        )
+    return invitations.values("meeting_id").distinct().count()
+
+
+def _mark_scope_unrepresentable(
+    coverage: dict[str, dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    *,
+    section: str,
+    message: str,
+) -> None:
+    coverage[section]["status"] = "omitted"
+    coverage[section]["reason"] = "scope_not_representable"
+    warnings.append(
+        {
+            "code": "scope_not_representable",
+            "message": message,
+            "affected_sections": [section],
+        }
+    )
+
+
+def _finance_summary(
+    context: ExecutiveSummaryContext,
+    *,
+    lower: datetime,
+    upper: datetime,
+) -> dict[str, Any]:
+    invoice_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="branch_at_issue_id",
+        department_field="department_at_issue_id",
+    )
+    invoices = Invoice.objects.filter(
+        invoice_scope,
+        attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+        issue_date__gte=context.window.date_from,
+        issue_date__lte=context.window.date_to,
+    ).order_by()
+    invoice_totals = invoices.aggregate(
+        billed=Sum(
+            "total_uzs",
+            filter=~Q(status__in=(Invoice.Status.DRAFT, Invoice.Status.VOID)),
+        ),
+        open_total=Sum("total_uzs", filter=Q(status__in=_OPEN_INVOICE_STATUSES)),
+        overdue_invoices=Count("id", filter=Q(status=Invoice.Status.OVERDUE)),
+    )
+
+    payment_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="branch_at_payment_id",
+        department_field="department_at_payment_id",
+    )
+    attributed_payments = Payment.objects.filter(
+        payment_scope,
+        attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+        status__in=(Payment.Status.COMPLETED, Payment.Status.REFUNDED),
+    ).order_by()
+    collected = (
+        attributed_payments.filter(paid_at__gte=lower, paid_at__lt=upper).aggregate(total=Sum("amount_uzs"))[
+            "total"
+        ]
+        or _ZERO
+    )
+
+    allocation_invoice_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="invoice__branch_at_issue_id",
+        department_field="invoice__department_at_issue_id",
+    )
+    allocations = PaymentAllocation.objects.filter(
+        allocation_invoice_scope,
+        invoice__attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+        payment_id__in=Subquery(attributed_payments.values("pk")),
+    )
+    allocation_totals = allocations.aggregate(
+        allocated_to_open_window_invoices=Sum(
+            "amount_uzs",
+            filter=Q(
+                invoice__status__in=_OPEN_INVOICE_STATUSES,
+                invoice__issue_date__gte=context.window.date_from,
+                invoice__issue_date__lte=context.window.date_to,
+            ),
+        ),
+    )
+    open_total = invoice_totals["open_total"] or _ZERO
+    allocated = allocation_totals["allocated_to_open_window_invoices"] or _ZERO
+    outstanding = max(open_total - allocated, _ZERO)
+
+    refund_scope = _scope_predicate(
+        context.scope.boundaries,
+        branch_field="invoice__branch_at_issue_id",
+        department_field="invoice__department_at_issue_id",
+    )
+    refunded = (
+        Refund.objects.filter(
+            refund_scope,
+            invoice__attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+            payment_id__in=Subquery(attributed_payments.values("pk")),
+            state=Refund.State.COMPLETED,
+            provider_confirmed_at__gte=lower,
+            provider_confirmed_at__lt=upper,
+        ).aggregate(total=Sum("amount_uzs"))["total"]
+        or _ZERO
+    )
+
+    result = {
+        "billed": _money(invoice_totals["billed"], context.currency),
+        "collected": _money(collected, context.currency),
+        "outstanding_for_invoices_issued_in_window": _money(outstanding, context.currency),
+        "overdue_invoice_count": invoice_totals["overdue_invoices"],
+        "refunded": _money(refunded, context.currency),
+    }
+
+    if all(boundary.department_id is None for boundary in context.scope.boundaries):
+        expense_branch_ids = [boundary.branch_id for boundary in context.scope.boundaries]
+        expenses = Expense.objects.filter(branch_id__in=expense_branch_ids).order_by()
+        expense_totals = expenses.aggregate(
+            approved=Sum(
+                "amount_uzs",
+                filter=Q(
+                    status__in=(Expense.Status.APPROVED, Expense.Status.PAID),
+                    approved_at__gte=lower,
+                    approved_at__lt=upper,
+                ),
+            ),
+            paid=Sum(
+                "amount_uzs",
+                filter=Q(
+                    status=Expense.Status.PAID,
+                    paid_at__gte=lower,
+                    paid_at__lt=upper,
+                ),
+            ),
+        )
+        result["approved_expense"] = _money(expense_totals["approved"], context.currency)
+        result["paid_expense"] = _money(expense_totals["paid"], context.currency)
+    return result
+
+
+def _money(value: Decimal | None, currency: str) -> dict[str, int | str]:
+    amount = value or _ZERO
+    return {
+        "amount_minor": int((amount * 100).to_integral_exact()),
+        "currency": currency,
+    }

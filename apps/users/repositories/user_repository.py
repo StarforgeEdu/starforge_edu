@@ -16,7 +16,7 @@ class UserRepository(BaseRepository[User], IUserRepository):
         return User.objects.prefetch_related(
             Prefetch(
                 "role_memberships",
-                queryset=RoleMembership.objects.select_related("account_type"),
+                queryset=RoleMembership.objects.select_related("account_type", "branch", "department"),
             )
         ).all()
 

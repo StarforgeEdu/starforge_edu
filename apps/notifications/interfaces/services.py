@@ -17,25 +17,50 @@ from apps.notifications.models import Notification, NotificationPreference, Noti
 
 class INotificationService(ABC):
     @abstractmethod
-    def feed(self, *, user) -> QuerySet[Notification]: ...
+    def feed(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[Notification]: ...
 
     @abstractmethod
-    def get_own(self, *, user, pk: int) -> Notification | None: ...
+    def get_own(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        pk: int,
+    ) -> Notification | None: ...
 
     @abstractmethod
-    def unread_count(self, *, user) -> int: ...
+    def unread_count(self, *, user, recipient_principal_kind: str, recipient_principal_id: int) -> int: ...
 
     @abstractmethod
-    def mark_read(self, *, user, notification_id: int) -> bool: ...
+    def mark_read(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        notification_id: int,
+    ) -> bool: ...
 
     @abstractmethod
-    def mark_all_read(self, *, user) -> int: ...
+    def mark_all_read(self, *, user, recipient_principal_kind: str, recipient_principal_id: int) -> int: ...
 
     @abstractmethod
-    def preferences(self, *, user) -> QuerySet[NotificationPreference]: ...
+    def preferences(
+        self, *, user, recipient_principal_kind: str, recipient_principal_id: int
+    ) -> QuerySet[NotificationPreference]: ...
 
     @abstractmethod
-    def upsert_preferences(self, *, user, rows: list[PreferenceRowDTO]) -> list[NotificationPreference]: ...
+    def upsert_preferences(
+        self,
+        *,
+        user,
+        recipient_principal_kind: str,
+        recipient_principal_id: int,
+        rows: list[PreferenceRowDTO],
+    ) -> list[NotificationPreference]: ...
 
     @abstractmethod
     def announce(self, data: AnnouncementDTO, *, actor) -> dict[str, Any]: ...

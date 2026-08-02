@@ -40,7 +40,9 @@ def test_director_parent_create_list_retrieve_update_delete(tenant_a, as_role):
     assert upd.json()["data"]["workplace"] == "NewCo"
 
     assert client.delete(f"{PARENTS}{pid}/").status_code == 204
-    assert client.get(f"{PARENTS}{pid}/").status_code == 404
+    deactivated = client.get(f"{PARENTS}{pid}/")
+    assert deactivated.status_code == 200
+    assert deactivated.json()["data"]["is_active"] is False
 
 
 def test_create_requires_phone_or_email(tenant_a, as_role):
@@ -76,6 +78,7 @@ def test_guardian_link_create_list_delete_and_no_update(tenant_a, as_role):
     # Links are create+delete only — no PUT/PATCH.
     assert client.put(f"{GUARDIANS}{gid}/", {"relationship": "father"}, format="json").status_code == 405
     assert client.delete(f"{GUARDIANS}{gid}/").status_code == 204
+    assert client.get(f"{GUARDIANS}{gid}/").status_code == 404
 
 
 def test_guardian_duplicate_link_is_400(tenant_a, as_role):

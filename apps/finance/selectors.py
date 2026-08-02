@@ -5,62 +5,188 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from django.db.models import Q, QuerySet, Sum
+from django.db.models import DecimalField, OuterRef, Q, QuerySet, Subquery, Sum, Value
+from django.db.models.functions import Coalesce
 
-from apps.finance.models import CashierShift, Invoice
-from core.permissions import PermissionRoleSet, Role, has_permission_code
-from core.scoping import permission_membership_scope_q
+from apps.finance.models import CashierShift, Invoice, PaymentAllocation
+from core.historical_scope import ATTRIBUTED_SCOPE_STATUSES
+from core.permissions import (
+    PermissionRoleSet,
+    Role,
+    get_unambiguous_user_roles,
+    has_permission_code,
+)
+from core.scoping import (
+    permission_membership_is_unscoped,
+    permission_membership_scope_q,
+    permission_membership_scopes,
+)
 
 _ZERO = Decimal("0")
 
-# Directors see the whole tenant. Other roles holding ``finance:read`` are
-# branch-scoped through active memberships; parents/students retain their
-# natural own-record scopes below.
+# Organization-wide visibility comes only from the same active staff membership
+# that grants the requested permission. Other staff grants retain their exact
+# branch/department boundary; parents and students retain natural own-record
+# scopes only when the same account-kind membership grants ``finance:read_own``.
 
 # Statuses that still owe money — outstanding-balance + reminders.
 OPEN_STATUSES = (Invoice.Status.ISSUED, Invoice.Status.PARTIALLY_PAID, Invoice.Status.OVERDUE)
 
 
-def _invoice_base() -> QuerySet[Invoice]:
+def _invoice_related() -> QuerySet[Invoice]:
     return Invoice.objects.select_related(
-        "student__user", "student__current_cohort", "cohort", "fee_schedule", "created_by"
-    ).prefetch_related("lines", "allocations")
+        "student__user",
+        "student__current_cohort",
+        "cohort",
+        "fee_schedule",
+        "created_by",
+        "branch_at_issue",
+        "department_at_issue",
+    )
 
 
-def scoped_invoices(*, user, roles: set[str] | None = None) -> QuerySet[Invoice]:
-    """Invoices visible to `user`. Superuser + finance staff -> all; PARENT ->
-    guardian-linked children only; STUDENT -> own; everyone else -> none."""
-    qs = _invoice_base()
+def _invoice_base() -> QuerySet[Invoice]:
+    """Detail/statement query with nested records eagerly loaded."""
+    return _invoice_related().prefetch_related("lines", "allocations")
+
+
+def _invoice_summary_base() -> QuerySet[Invoice]:
+    """List query: one row per invoice, no nested collection prefetches.
+
+    A correlated aggregate avoids both the two full prefetch result sets and the
+    multiplication bug a direct JOIN/SUM would have under guardian/cohort scope
+    joins.  ``allocated_uzs`` is consumed by the lightweight presenter.
+    """
+    money_field = DecimalField(max_digits=24, decimal_places=2)
+    allocation_total = (
+        PaymentAllocation.objects.filter(invoice_id=OuterRef("pk"))
+        .values("invoice_id")
+        .annotate(total=Sum("amount_uzs"))
+        .values("total")[:1]
+    )
+    return _invoice_related().annotate(
+        allocated_uzs=Coalesce(
+            Subquery(allocation_total, output_field=money_field),
+            Value(_ZERO, output_field=money_field),
+            output_field=money_field,
+        )
+    )
+
+
+def _scope_invoices(
+    *,
+    qs: QuerySet[Invoice],
+    user,
+    roles: set[str] | None,
+    permission: str,
+) -> QuerySet[Invoice]:
+    """Apply the shared person/permission scope to either list or detail rows."""
+    # Historical ownership is authoritative only after write-time capture or a
+    # reviewed backfill. Quarantined/ambiguous rows stay out of every product
+    # read and are visible only to the backfill/review tooling.
+    qs = qs.filter(attribution_status__in=ATTRIBUTED_SCOPE_STATUSES)
     if getattr(user, "is_superuser", False):
         return qs
     if roles is None:
-        roles = {m.role for m in user.role_memberships.filter(revoked_at__isnull=True)}
-    if Role.DIRECTOR in roles:
+        roles = get_unambiguous_user_roles(user)
+    if isinstance(roles, PermissionRoleSet):
+        if permission_membership_is_unscoped(
+            roles=roles,
+            permission=permission,
+            account_kinds={"staff"},
+        ):
+            return qs
+    elif Role.DIRECTOR in roles:
+        # Raw role sets are retained only for explicit legacy selector callers.
         return qs
     visible = Q(pk__in=[])
-    if has_permission_code(roles, "finance:read") or has_permission_code(roles, "finance:write"):
+    if has_permission_code(roles, permission):
         if isinstance(roles, PermissionRoleSet):
-            for permission in ("finance:read", "finance:write"):
-                visible |= permission_membership_scope_q(
-                    roles=roles,
-                    permission=permission,
-                    branch_field="student__branch_id",
-                    department_field="student__current_cohort__department_id",
-                    account_kinds={"staff"},
-                )
+            visible |= permission_membership_scope_q(
+                roles=roles,
+                permission=permission,
+                branch_field="branch_at_issue_id",
+                department_field="department_at_issue_id",
+                account_kinds={"staff"},
+            )
         else:
             # Direct selector calls with a raw legacy role set retain the old
             # compatibility behavior; request paths use PermissionRoleSet.
-            allowed_branches = user.role_memberships.filter(
-                revoked_at__isnull=True,
-                branch_id__isnull=False,
-            ).values_list("branch_id", flat=True)
-            visible |= Q(student__branch_id__in=allowed_branches)
-    if Role.PARENT in roles:
-        visible |= Q(student__guardians__parent__user=user)
-    if Role.STUDENT in roles:
+            allowed_branches = (
+                user.role_memberships.filter(
+                    role__in=roles,
+                    revoked_at__isnull=True,
+                    branch_id__isnull=False,
+                )
+                .filter(Q(account_type__isnull=True) | Q(account_type__is_active=True))
+                .values_list("branch_id", flat=True)
+            )
+            visible |= Q(branch_at_issue_id__in=allowed_branches)
+    if permission == "finance:read" and has_natural_finance_scope(
+        roles,
+        account_kind="parent",
+        legacy_role=Role.PARENT,
+    ):
+        visible |= Q(
+            student__guardians__parent__user=user,
+            student__guardians__revoked_at__isnull=True,
+        )
+    if permission == "finance:read" and has_natural_finance_scope(
+        roles,
+        account_kind="student",
+        legacy_role=Role.STUDENT,
+    ):
         visible |= Q(student__user=user)
     return qs.filter(visible).distinct()
+
+
+def has_natural_finance_scope(
+    roles: set[str],
+    *,
+    account_kind: str,
+    legacy_role: str,
+) -> bool:
+    """Require own-finance authority and natural identity on one membership.
+
+    A custom staff assignment carrying ``finance:read_own`` must not borrow a
+    parent/student identity from an unrelated assignment. Plain role sets are
+    accepted only for explicit legacy selector callers and retain their
+    historical role-name behavior.
+    """
+    if isinstance(roles, PermissionRoleSet):
+        return bool(
+            permission_membership_scopes(
+                roles=roles,
+                permission="finance:read_own",
+                account_kinds={account_kind},
+            )
+        )
+    return legacy_role in roles
+
+
+def scoped_invoices(
+    *,
+    user,
+    roles: set[str] | None = None,
+    permission: str = "finance:read",
+) -> QuerySet[Invoice]:
+    """Invoices visible through exact permission-bearing or natural scopes."""
+    return _scope_invoices(qs=_invoice_base(), user=user, roles=roles, permission=permission)
+
+
+def scoped_invoice_summaries(
+    *,
+    user,
+    roles: set[str] | None = None,
+    permission: str = "finance:read",
+) -> QuerySet[Invoice]:
+    """Visible invoices optimized for a paginated register/list response."""
+    return _scope_invoices(
+        qs=_invoice_summary_base(),
+        user=user,
+        roles=roles,
+        permission=permission,
+    )
 
 
 def list_fee_schedules() -> QuerySet:
@@ -78,9 +204,27 @@ def list_discounts() -> QuerySet:
 def outstanding_balance(student_id: int) -> Decimal:
     """issued + partially_paid + overdue invoice totals minus allocations, for one
     student. Two aggregate queries, independent of row count."""
-    invoices = Invoice.objects.filter(student_id=student_id, status__in=OPEN_STATUSES)
-    billed = invoices.aggregate(s=Sum("total_uzs"))["s"] or _ZERO
-    allocated = invoices.aggregate(s=Sum("allocations__amount_uzs"))["s"] or _ZERO
+    invoices = Invoice.objects.filter(
+        student_id=student_id,
+        status__in=OPEN_STATUSES,
+        attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+    )
+    return outstanding_balance_for_invoices(invoices)
+
+
+def outstanding_balance_for_invoices(invoices: QuerySet[Invoice]) -> Decimal:
+    """Calculate a balance from only the supplied visible invoice queryset.
+
+    Rebase through a primary-key subquery before aggregating. Scoped invoice
+    querysets may join guardians or membership relations and use ``distinct``;
+    aggregating their joins directly can multiply both billed and allocated
+    amounts. This form preserves the authorization boundary and one-row invoice
+    cardinality.
+    """
+    visible_ids = invoices.order_by().values("pk")
+    scoped = Invoice.objects.filter(pk__in=Subquery(visible_ids))
+    billed = scoped.aggregate(s=Sum("total_uzs"))["s"] or _ZERO
+    allocated = scoped.aggregate(s=Sum("allocations__amount_uzs"))["s"] or _ZERO
     return (Decimal(billed) - Decimal(allocated)).quantize(Decimal("0.01"))
 
 
@@ -95,19 +239,32 @@ def parent_can_see_student(*, user, student_id: int) -> bool:
     """A parent may view a student's balance only when guardian-linked."""
     from apps.parents.models import Guardian
 
-    return Guardian.objects.filter(student_id=student_id, parent__user=user).exists()
+    return Guardian.objects.filter(
+        student_id=student_id,
+        parent__user=user,
+        revoked_at__isnull=True,
+    ).exists()
 
 
-def statement_context(*, student) -> dict:
+def statement_context(*, student, invoice_ids: list[int] | None = None) -> dict:
     """Render context for the statement-of-account PDF: every invoice (with lines
-    + allocations prefetched) and the outstanding balance for one student."""
+    + allocations prefetched) and its scope-matched outstanding balance."""
     from django.utils import timezone
 
-    invoices = _invoice_base().filter(student=student).order_by("issue_date", "id")
+    invoices_qs = (
+        _invoice_base()
+        .filter(student=student, attribution_status__in=ATTRIBUTED_SCOPE_STATUSES)
+        .order_by("issue_date", "id")
+    )
+    if invoice_ids is not None:
+        invoices_qs = invoices_qs.filter(pk__in=invoice_ids)
+    open_invoices = invoices_qs.filter(status__in=OPEN_STATUSES)
+    billed = open_invoices.aggregate(s=Sum("total_uzs"))["s"] or _ZERO
+    allocated = open_invoices.aggregate(s=Sum("allocations__amount_uzs"))["s"] or _ZERO
     return {
         "student": student,
-        "invoices": list(invoices),
-        "outstanding_uzs": outstanding_balance(student.pk),
+        "invoices": list(invoices_qs),
+        "outstanding_uzs": (Decimal(billed) - Decimal(allocated)).quantize(Decimal("0.01")),
         "generated_on": timezone.localdate().isoformat(),
     }
 
@@ -119,7 +276,11 @@ def cashier_shift_report(*, shift: CashierShift) -> dict:
     from apps.payments.models import Payment
 
     rows = (
-        Payment.objects.filter(cashier_shift_id=shift.pk, status="completed")
+        Payment.objects.filter(
+            cashier_shift_id=shift.pk,
+            status="completed",
+            attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+        )
         .values("provider")
         .annotate(total=Sum("amount_uzs"))
     )

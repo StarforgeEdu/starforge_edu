@@ -110,6 +110,8 @@ class IBranchTransferService(ABC):
         to_branch_id: int,
         reason: str,
         actor: Any,
+        actor_principal_kind: str,
+        actor_principal_id: int | None,
         allowed_branch_ids: set[int] | None,
     ) -> BranchTransfer: ...
 

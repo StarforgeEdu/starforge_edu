@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from django.contrib import admin
 
-from apps.printing.models import BranchAgent, Printer, PrintJob
+from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
 
 
 @admin.register(Printer)
@@ -19,8 +19,10 @@ class BranchAgentAdmin(admin.ModelAdmin):
     list_display = ("name", "branch", "last_seen_at", "revoked_at", "created_at")
     list_filter = ("branch",)
     search_fields = ("name",)
-    # token_hash is never exposed; raw token never stored.
-    readonly_fields = ("token_hash", "last_seen_at", "created_at")
+    # A token digest is still authentication material and has no operational UI
+    # purpose. Keep it out of HTML entirely; the raw token is never stored.
+    exclude = ("token_hash",)
+    readonly_fields = ("last_seen_at", "created_at")
 
 
 @admin.register(PrintJob)
@@ -37,5 +39,30 @@ class PrintJobAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = ("status", "source", "branch")
-    search_fields = ("source_id", "payload_s3_key")
-    readonly_fields = ("created_at", "claimed_at", "finished_at")
+    # Object-store keys are capability inputs, not operator search terms.
+    search_fields = ("source_id",)
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(PrintJobReconciliation)
+class PrintJobReconciliationAdmin(admin.ModelAdmin):
+    list_display = ("id", "job", "branch", "outcome", "resolved_by", "resolved_at")
+    list_filter = ("outcome", "branch")
+    search_fields = ("job__id", "evidence_reference")
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

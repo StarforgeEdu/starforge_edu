@@ -26,9 +26,9 @@ def _dec(value) -> str | None:
     return str(value) if value is not None else None
 
 
-def department_to_dict(d: Department) -> dict[str, Any]:
+def department_to_dict(d: Department, *, include_budget: bool) -> dict[str, Any]:
     teacher = getattr(d.head, "teacher_profile", None) if d.head else None
-    return {
+    payload = {
         "id": d.id,
         "branch": d.branch_id,
         # Readable companions so a client need not fetch the branch/head separately.
@@ -43,9 +43,11 @@ def department_to_dict(d: Department) -> dict[str, Any]:
         # Object-guard (not head_id): a null FK short-circuits with no query, a set
         # FK is select_related/prefetched — and it narrows the Optional for the checker.
         "head_name": teacher.get_full_name() if teacher is not None else None,
-        "budget": _dec(d.budget),
         "created_at": d.created_at.isoformat(),
     }
+    if include_budget:
+        payload["budget"] = _dec(d.budget)
+    return payload
 
 
 def working_hour_to_dict(w: BranchWorkingHours) -> dict[str, Any]:
@@ -120,24 +122,30 @@ def branch_capacity_status(b: Branch) -> dict[str, Any]:
     }
 
 
-def branch_detail_to_dict(b: Branch) -> dict[str, Any]:
-    return {**branch_to_dict(b), "capacity_status": branch_capacity_status(b)}
+def branch_detail_to_dict(b: Branch, *, include_capacity: bool) -> dict[str, Any]:
+    payload = branch_to_dict(b)
+    if include_capacity:
+        payload["capacity_status"] = branch_capacity_status(b)
+    return payload
 
 
 def transfer_to_dict(t: BranchTransfer) -> dict[str, Any]:
-    # Readable companions for every FK — the transfer list select_related("from_branch",
-    # "to_branch", "user", "actor"), so these add JOINs, not queries. actor is nullable.
+    # The compatibility User FK is intentionally absent: it is an internal
+    # bridge, not a stable public student or actor identifier.
     return {
         "id": t.id,
-        "user": t.user_id,
-        "user_name": t.user.get_full_name() if t.user_id else None,
+        "student": t.student_id,
+        "student_public_id": t.student_public_id or None,
+        "student_name": t.student_name or None,
+        "student_attribution_status": t.student_attribution_status,
         "from_branch": t.from_branch_id,
         "from_branch_name": t.from_branch.name if t.from_branch_id else None,
         "to_branch": t.to_branch_id,
         "to_branch_name": t.to_branch.name if t.to_branch_id else None,
         "reason": t.reason,
-        "actor": t.actor_id,
-        "actor_name": t.actor.get_full_name() if t.actor else None,
+        "actor_principal_kind": t.actor_principal_kind or None,
+        "actor_principal_id": t.actor_principal_id,
+        "actor_name": t.actor_name or None,
         "created_at": t.created_at.isoformat(),
     }
 
@@ -167,6 +175,7 @@ _SETTINGS_BOOL_FIELDS = (
 )
 _SETTINGS_STR_FIELDS = (
     "default_language",
+    "organization_timezone",
     "grading_scheme",
     "currency_primary",
     "currency_secondary",
@@ -201,7 +210,10 @@ def settings_to_dict(s: CenterSettings) -> dict[str, Any]:
 
 def staff_to_dict(staff) -> dict[str, Any]:
     """Role-native staff payload; the internal User bridge is intentionally absent."""
-    memberships = [rm for rm in staff.user.role_memberships.all() if rm.revoked_at is None]
+    # The view attaches only active staff-principal memberships that are inside
+    # the caller's exact permission boundary. Falling back to the bridge manager
+    # here could expose another role profile or a hidden branch assignment.
+    memberships = getattr(staff.user, "_visible_staff_memberships", ())
     return {
         "id": staff.id,
         "username": staff.username,
@@ -216,6 +228,22 @@ def staff_to_dict(staff) -> dict[str, Any]:
         "is_active": staff.is_active,
         "must_change_password": staff.must_change_password,
         "last_login_at": staff.last_login_at.isoformat() if staff.last_login_at else None,
+        "role_memberships": [role_membership_to_dict(membership) for membership in memberships],
+        "created_at": staff.created_at.isoformat(),
+        "updated_at": staff.updated_at.isoformat(),
+    }
+
+
+def staff_directory_row_to_dict(staff) -> dict[str, Any]:
+    """PII-minimized staff register row with caller-visible assignments only."""
+    memberships = getattr(staff.user, "_visible_staff_memberships", ())
+    return {
+        "id": staff.id,
+        "username": staff.username,
+        "full_name": staff.get_full_name(),
+        "phone": staff.phone,
+        "email": staff.email,
+        "is_active": staff.is_active,
         "role_memberships": [role_membership_to_dict(membership) for membership in memberships],
         "created_at": staff.created_at.isoformat(),
         "updated_at": staff.updated_at.isoformat(),

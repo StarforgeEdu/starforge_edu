@@ -14,13 +14,15 @@ from apps.students.models import StudentProfile
 
 
 class StudentFilter(django_filters.FilterSet):
-    status = django_filters.CharFilter(field_name="status")
+    status = django_filters.ChoiceFilter(field_name="status", choices=StudentProfile.Status.choices)
     branch = django_filters.NumberFilter(field_name="branch_id")
     cohort = django_filters.NumberFilter(field_name="current_cohort_id")
     # with/without a group
     has_cohort = django_filters.BooleanFilter(method="_filter_has_cohort")
     level = django_filters.CharFilter(field_name="academic_level", lookup_expr="iexact")
-    gender = django_filters.CharFilter(field_name="user__gender")
+    # StudentProfile owns identity after the role-native account migration.
+    # Filtering the legacy bridge user silently returned empty/wrong results.
+    gender = django_filters.ChoiceFilter(field_name="gender", choices=StudentProfile.Gender.choices)
     location = django_filters.CharFilter(field_name="location", lookup_expr="icontains")
     previous_school = django_filters.CharFilter(field_name="previous_school", lookup_expr="icontains")
     blocked = django_filters.BooleanFilter(method="_filter_blocked")
@@ -43,8 +45,14 @@ class StudentFilter(django_filters.FilterSet):
 
     def _filter_teacher(self, qs, name, value):
         from apps.cohorts.selectors import taught_cohorts
+        from apps.teachers.models import TeacherProfile
 
-        cohort_ids = taught_cohorts(user_id=value, include_lesson_teacher=False).values("pk")
+        teacher = TeacherProfile.objects.filter(pk=value).first()
+        if teacher is None:
+            return qs.none()
+        # The public teachers API exposes TeacherProfile ids, not the internal
+        # bridge User id. Accepting the documented id keeps the filter usable.
+        cohort_ids = taught_cohorts(teacher=teacher, include_lesson_teacher=False).values("pk")
         return qs.filter(current_cohort_id__in=cohort_ids).distinct()
 
     def _filter_age_min(self, qs, name, value):

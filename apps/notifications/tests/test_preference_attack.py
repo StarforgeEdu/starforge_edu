@@ -5,10 +5,10 @@ Adversarial coverage of the fan-out (D3-C-5/8):
   - A user who DISABLED SMS for ``payments.payment_completed`` gets the in-app
     delivery but NO SMS — MockEskiz.outbox stays empty, and the SMS channel is
     recorded as ``skipped_pref`` (not silently dropped).
-  - During quiet hours, the SMS channel is deferred: recorded as
-    ``skipped_quiet_hours`` with a ``deferred_to`` eta == the quiet-window end,
-    and ``deliver_single_channel.apply_async`` is called with that eta; in-app
-    still delivers immediately.
+  - During quiet hours, the SMS channel is deferred in a durable database
+    marker with ``deferred_to`` equal to the quiet-window end. The periodic
+    reconciler enqueues it only after that time; in-app still delivers
+    immediately and Redis never holds an hours-long ETA reservation.
   - Double-fire of the same event (same ``dedupe_key``) collapses to ONE
     Notification and ONE SMS send (idempotent dispatch + idempotent fan-out).
 
@@ -16,10 +16,8 @@ Mechanics:
 - ``dispatch()`` queues the fan-out via ``transaction.on_commit``, so tests wrap
   it in ``django_capture_on_commit_callbacks(execute=True)`` to actually run the
   task (the repo convention — see apps/attendance/tests).
-- Celery is eager in tests AND eager ``apply_async`` IGNORES ``eta`` (it would
-  run the deferred SMS immediately). So the quiet-hours test PATCHES
-  ``deliver_single_channel.apply_async`` to capture the eta without executing it
-  — that is the deferral contract under test, not wall-clock sleeping.
+- Celery is eager in tests, so the quiet-hours test invokes the durable
+  reconciler under a second frozen clock at the window boundary.
 - Times use ``time_machine`` with explicit Asia/Tashkent offsets (TESTING.md §5).
 """
 
@@ -37,10 +35,12 @@ EVENT = "payments.payment_completed"  # SMS defaults ON for payments.* (DEFAULT_
 
 
 def _user_with_phone(tenant):
+    from apps.notifications.tests.helpers import ensure_notification_principal
     from apps.users.tests.factories import UserFactory
 
     with schema_context(tenant.schema_name):
-        return UserFactory(phone="+998901112233", email="payer@example.com")
+        user = UserFactory(phone="+998901112233", email="payer@example.com")
+        return ensure_notification_principal(user)
 
 
 def _deliveries(tenant, notification_id):
@@ -109,7 +109,7 @@ def test_default_on_sms_is_sent_when_not_disabled(tenant_a, sms_outbox, django_c
 # Quiet hours: SMS deferred with eta == window end; in-app immediate
 # --------------------------------------------------------------------------- #
 @time_machine.travel("2026-06-16 23:30:00 +05:00", tick=False)
-def test_quiet_hours_sms_deferred_with_eta(
+def test_quiet_hours_sms_uses_durable_outbox_until_window_end(
     tenant_a, sms_outbox, monkeypatch, django_capture_on_commit_callbacks
 ):
     from django.utils import timezone
@@ -120,16 +120,11 @@ def test_quiet_hours_sms_deferred_with_eta(
 
     _set_quiet_hours(tenant_a, start=time(22, 0), end=time(7, 0))
 
-    # Capture the deferral instead of letting eager Celery run it immediately
-    # (eager apply_async ignores eta). This is the deferral contract under test.
-    captured: dict[str, object] = {}
-
-    def fake_apply_async(*args, **kwargs):
-        captured["eta"] = kwargs.get("eta")
-        captured["kwargs"] = kwargs.get("kwargs")
-        return None
-
-    monkeypatch.setattr(nt.deliver_single_channel, "apply_async", fake_apply_async)
+    monkeypatch.setattr(
+        nt.deliver_single_channel,
+        "apply_async",
+        lambda *args, **kwargs: pytest.fail("quiet-hours work must not use a broker ETA"),
+    )
 
     user = _user_with_phone(tenant_a)
     with schema_context(tenant_a.schema_name):
@@ -150,10 +145,28 @@ def test_quiet_hours_sms_deferred_with_eta(
     sms = rows[Channel.SMS]
     assert sms.status == NotificationDelivery.Status.SKIPPED_QUIET_HOURS
     assert sms.provider_response.get("deferred_to") == expected_eta.isoformat()
-    # The deferral was scheduled with eta == quiet-window end (07:00 local).
-    assert captured.get("eta") == expected_eta
     assert expected_eta.hour == 7
     assert expected_eta.minute == 0
+
+    queued: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        nt.deliver_single_channel,
+        "delay",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
+    with (
+        time_machine.travel("2026-06-17 07:00:00 +05:00", tick=False),
+        schema_context(tenant_a.schema_name),
+        django_capture_on_commit_callbacks(execute=True),
+    ):
+        assert nt.reconcile_deferred_notification_deliveries_for_schema() >= 1
+    sms_jobs = [job for job in queued if job[0][1] == Channel.SMS]
+    assert sms_jobs == [
+        (
+            (notif.pk, Channel.SMS),
+            {"deferred_to": expected_eta.isoformat(), "_schema_name": tenant_a.schema_name},
+        )
+    ]
 
 
 def test_quiet_hours_helpers_wraparound():

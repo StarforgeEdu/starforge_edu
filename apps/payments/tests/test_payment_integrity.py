@@ -6,6 +6,7 @@ from threading import Barrier
 
 import pytest
 from django.db import close_old_connections
+from django.db.models import Q
 from django.test import override_settings
 from django_tenants.utils import schema_context
 
@@ -20,6 +21,123 @@ from infrastructure.payments.payme import (
 )
 
 pytestmark = pytest.mark.django_db(transaction=True)
+
+
+def test_provider_transaction_constraint_matches_deployed_migration():
+    constraint = next(
+        item for item in Payment._meta.constraints if item.name == "payment_provider_txn_unique"
+    )
+
+    assert constraint.fields == ("provider", "provider_txn_id")
+    assert constraint.condition == (
+        Q(provider__in=(Payment.Method.CLICK, Payment.Method.PAYME, Payment.Method.UZUM))
+        & ~Q(provider_txn_id="")
+    )
+
+
+@override_settings(FISCALIZATION_ENABLED=False)
+def test_concurrent_cash_receipts_cannot_overpay_one_invoice(tenant_a, user_in):
+    """Both cashiers begin while the same 100k balance is visible.  The invoice
+    row lock must serialize the balance check so only one 70k receipt commits."""
+    from apps.finance import services as finance_services
+    from apps.finance.models import PaymentAllocation
+    from apps.payments import services
+    from apps.payments.tests import _helpers as helpers
+    from core.exceptions import ValidationException
+
+    invoice = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-CASH-BALANCE-RACE-1",
+        amount_uzs="100000.00",
+    )
+    cashier = user_in(tenant_a, roles=["cashier"], branch=invoice.student.branch)
+    with schema_context(tenant_a.schema_name):
+        finance_services.open_cashier_shift(
+            cashier=cashier,
+            branch=invoice.student.branch,
+            opening_cash_uzs=Decimal("0.00"),
+        )
+    barrier = Barrier(2)
+
+    def run(key: str):
+        close_old_connections()
+        try:
+            with schema_context(tenant_a.schema_name):
+                barrier.wait(timeout=10)
+                try:
+                    payment = services.create_cash_payment(
+                        invoice_id=invoice.pk,
+                        cashier=cashier,
+                        amount_uzs=Decimal("70000.00"),
+                        idempotency_key=key,
+                    )
+                    return ("ok", payment.pk)
+                except ValidationException as exc:
+                    return ("validation_error", exc.code)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, ("cash-race-a", "cash-race-b")))
+
+    assert sorted(kind for kind, _value in results) == ["ok", "validation_error"]
+    assert [value for kind, value in results if kind == "validation_error"] == ["cash_exceeds_outstanding"]
+    with schema_context(tenant_a.schema_name):
+        assert (
+            Payment.objects.filter(provider=Payment.Method.CASH, status=Payment.Status.COMPLETED).count() == 1
+        )
+        assert sum(
+            PaymentAllocation.objects.filter(invoice_id=invoice.pk).values_list("amount_uzs", flat=True),
+            Decimal("0"),
+        ) == Decimal("70000.00")
+        invoice.refresh_from_db()
+        assert invoice.status == "partially_paid"
+
+
+@override_settings(FISCALIZATION_ENABLED=False)
+def test_concurrent_cash_idempotent_retries_create_one_receipt(tenant_a, user_in):
+    from apps.finance import services as finance_services
+    from apps.finance.models import PaymentAllocation
+    from apps.payments import services
+    from apps.payments.tests import _helpers as helpers
+
+    invoice = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-CASH-IDEMPOTENT-RACE-1",
+        amount_uzs="100000.00",
+    )
+    cashier = user_in(tenant_a, roles=["cashier"], branch=invoice.student.branch)
+    with schema_context(tenant_a.schema_name):
+        finance_services.open_cashier_shift(
+            cashier=cashier,
+            branch=invoice.student.branch,
+            opening_cash_uzs=Decimal("0.00"),
+        )
+    barrier = Barrier(2)
+
+    def run():
+        close_old_connections()
+        try:
+            with schema_context(tenant_a.schema_name):
+                barrier.wait(timeout=10)
+                payment = services.create_cash_payment(
+                    invoice_id=invoice.pk,
+                    cashier=cashier,
+                    amount_uzs=Decimal("70000.00"),
+                    idempotency_key="cash-same-retry-race",
+                )
+                return payment.pk
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        payment_ids = list(pool.map(lambda _index: run(), range(2)))
+
+    assert len(set(payment_ids)) == 1
+    with schema_context(tenant_a.schema_name):
+        assert Payment.objects.filter(idempotency_key="cash-same-retry-race").count() == 1
+        assert PaymentAllocation.objects.filter(invoice_id=invoice.pk).count() == 1
+        assert PaymentAllocation.objects.get(invoice_id=invoice.pk).amount_uzs == Decimal("70000.00")
 
 
 def test_concurrent_payme_create_allows_one_open_transaction_per_invoice(tenant_a):
@@ -95,6 +213,9 @@ def test_concurrent_payme_perform_cancel_never_resurrects_payment(tenant_a, monk
             provider_created_at_ms=1_700_000_000_000,
             account_ref=invoice.number,
             metadata={"invoice_id": invoice.pk, "student_id": invoice.student_id},
+            branch_at_payment_id=invoice.branch_at_issue_id,
+            department_at_payment_id=invoice.department_at_issue_id,
+            attribution_status="captured",
         )
         payment_id = payment.pk
 
@@ -146,6 +267,7 @@ def test_concurrent_refund_requests_cannot_reserve_the_same_money_twice(tenant_a
     from apps.finance.models import Invoice, Refund
     from apps.payments.tests import _helpers as helpers
     from core.exceptions import ValidationException
+    from core.historical_scope import ScopeAttributionStatus
 
     invoice = helpers.seed_open_invoice(
         tenant_a,
@@ -153,6 +275,18 @@ def test_concurrent_refund_requests_cannot_reserve_the_same_money_twice(tenant_a
         amount_uzs="150000.00",
     )
     with schema_context(tenant_a.schema_name):
+        Payment.objects.create(
+            id=9191,
+            provider=Payment.Method.PAYME,
+            amount_uzs=Decimal("150000.00"),
+            status=Payment.Status.COMPLETED,
+            idempotency_key="refund-race-payment-9191",
+            account_ref=invoice.number,
+            metadata={"invoice_id": invoice.pk, "student_id": invoice.student_id},
+            branch_at_payment_id=invoice.branch_at_issue_id,
+            department_at_payment_id=invoice.department_at_issue_id,
+            attribution_status=ScopeAttributionStatus.CAPTURED,
+        )
         finance_services.allocate_payment(
             payment_id=9191,
             amount_uzs=Decimal("150000.00"),
@@ -209,6 +343,9 @@ def test_provider_confirmed_payme_cancel_records_unallocated_refund(tenant_a):
             provider_state=STATE_PERFORMED,
             account_ref=invoice.number,
             metadata={"invoice_id": invoice.pk, "student_id": invoice.student_id},
+            branch_at_payment_id=invoice.branch_at_issue_id,
+            department_at_payment_id=invoice.department_at_issue_id,
+            attribution_status="captured",
         )
         cancelled = services.PaymeDBStore().cancel_transaction(payment, reason=5)
         assert cancelled.status == Payment.Status.REFUNDED
@@ -381,6 +518,9 @@ def test_branch_staff_cannot_read_or_mutate_other_branch_payments(tenant_a, user
             account_ref=own_invoice.number,
             paid_at=timezone.now(),
             metadata={"invoice_id": own_invoice.pk, "student_id": own_invoice.student_id},
+            branch_at_payment_id=own_invoice.branch_at_issue_id,
+            department_at_payment_id=own_invoice.department_at_issue_id,
+            attribution_status="captured",
         )
         other_payment = Payment.objects.create(
             provider=Payment.Method.CLICK,
@@ -390,6 +530,9 @@ def test_branch_staff_cannot_read_or_mutate_other_branch_payments(tenant_a, user
             account_ref=other_invoice.number,
             paid_at=timezone.now(),
             metadata={"invoice_id": other_invoice.pk, "student_id": other_invoice.student_id},
+            branch_at_payment_id=other_invoice.branch_at_issue_id,
+            department_at_payment_id=other_invoice.department_at_issue_id,
+            attribution_status="captured",
         )
 
     accountant = user_in(tenant_a, roles=["accountant"], branch=own_branch)
@@ -399,24 +542,222 @@ def test_branch_staff_cannot_read_or_mutate_other_branch_payments(tenant_a, user
     assert listing.status_code == 200
     assert listing.json()["pagination"]["total"] == 1
     assert listing.json()["data"][0]["id"] == own_payment.pk
-    assert client.get(f"/api/v1/payments/{other_payment.pk}/").status_code == 403
+    assert client.get(f"/api/v1/payments/{other_payment.pk}/").status_code == 404
     assert (
         client.post(
             "/api/v1/payments/checkout/",
             {"invoice": other_invoice.pk, "provider": "payme"},
             format="json",
         ).status_code
-        == 403
+        == 404
     )
-    assert client.post(f"/api/v1/payments/{other_payment.pk}/refund/", {}).status_code == 403
+    assert client.post(f"/api/v1/payments/{other_payment.pk}/refund/", {}).status_code == 404
     assert (
         client.post(
             f"/api/v1/payments/{own_payment.pk}/allocate/",
             {"allocations": [{"invoice": other_invoice.pk, "amount": "1.00"}]},
             format="json",
         ).status_code
-        == 403
+        == 404
     )
+    reconciliation = client.get(
+        "/api/v1/payments/reconciliation/",
+        {"date": timezone.localdate().isoformat()},
+    )
+    assert reconciliation.status_code == 200
+    assert reconciliation.json()["data"]["total_paid_uzs"] == "100.00"
+
+
+def test_department_scoped_accountant_cannot_cross_department_payment_boundary(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from django.utils import timezone
+
+    from apps.finance.tests.factories import InvoiceFactory
+    from apps.org.tests.factories import BranchFactory, DepartmentFactory
+    from apps.users.models import RoleMembership
+    from core.permissions import Role
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Department payments", slug="department-payments")
+        own_department = DepartmentFactory(branch=branch, name="Own payment department")
+        other_department = DepartmentFactory(branch=branch, name="Other payment department")
+        own_invoice = InvoiceFactory(
+            branch_at_issue=branch,
+            department_at_issue=own_department,
+            total_uzs=Decimal("100.00"),
+        )
+        other_invoice = InvoiceFactory(
+            branch_at_issue=branch,
+            department_at_issue=other_department,
+            total_uzs=Decimal("200.00"),
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=branch,
+            department=own_department,
+            role=Role.ACCOUNTANT,
+        )
+        actor.refresh_from_db()
+        own_payment = Payment.objects.create(
+            provider=Payment.Method.CLICK,
+            amount_uzs=Decimal("100.00"),
+            status=Payment.Status.COMPLETED,
+            idempotency_key="department-payment-own",
+            account_ref=own_invoice.number,
+            paid_at=timezone.now(),
+            branch_at_payment=branch,
+            department_at_payment=own_department,
+            attribution_status="captured",
+        )
+        other_payment = Payment.objects.create(
+            provider=Payment.Method.CLICK,
+            amount_uzs=Decimal("200.00"),
+            status=Payment.Status.COMPLETED,
+            idempotency_key="department-payment-other",
+            account_ref=other_invoice.number,
+            paid_at=timezone.now(),
+            branch_at_payment=branch,
+            department_at_payment=other_department,
+            attribution_status="captured",
+        )
+
+    client = as_user(tenant_a, actor)
+    listing = client.get("/api/v1/payments/")
+    assert listing.status_code == 200, listing.content
+    assert {row["id"] for row in listing.json()["data"]} == {own_payment.pk}
+    assert client.get(f"/api/v1/payments/{other_payment.pk}/").status_code == 404
+    assert (
+        client.post(
+            "/api/v1/payments/checkout/",
+            {"invoice": other_invoice.pk, "provider": "payme"},
+            format="json",
+        ).status_code
+        == 404
+    )
+    reconciliation = client.get(
+        "/api/v1/payments/reconciliation/",
+        {"date": timezone.localdate().isoformat()},
+    )
+    assert reconciliation.status_code == 200
+    assert reconciliation.json()["data"]["total_paid_uzs"] == "100.00"
+
+
+def test_branch_scoped_payment_roles_cannot_manage_tenant_provider_configuration(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.payments.tests import _helpers as helpers
+    from core.permissions import Role
+
+    helpers.seed_provider_configs(tenant_a)
+    actor = user_in(tenant_a, roles=[Role.ACCOUNTANT])
+    client = as_user(tenant_a, actor)
+
+    listing = client.get("/api/v1/payments/provider-configs/")
+    assert listing.status_code == 403
+    assert listing.json()["code"] == "out_of_scope"
+    create = client.post(
+        "/api/v1/payments/provider-configs/",
+        {"provider": "click", "is_active": True},
+        format="json",
+    )
+    assert create.status_code == 403
+    assert create.json()["code"] == "out_of_scope"
+
+
+def test_payment_grant_cannot_borrow_an_unrelated_membership_scope(tenant_a, user_in, as_user):
+    """A grant in branch A must not borrow a grant-less membership in branch B."""
+    from django.utils import timezone
+
+    from apps.access.models import AccountType, AccountTypePermission
+    from apps.payments.tests import _helpers as helpers
+    from apps.users.models import RoleMembership
+
+    own_invoice = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-PAYMENT-BOUND-GRANT",
+        amount_uzs="100.00",
+    )
+    other_invoice = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-PAYMENT-UNRELATED-SCOPE",
+        amount_uzs="200.00",
+    )
+    with schema_context(tenant_a.schema_name):
+        granting_type = AccountType.objects.create(
+            name="Branch payment operator",
+            slug="branch-payment-operator",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        AccountTypePermission.objects.bulk_create(
+            [
+                AccountTypePermission(account_type=granting_type, permission="payments:read"),
+                AccountTypePermission(account_type=granting_type, permission="payments:write"),
+            ]
+        )
+        unrelated_type = AccountType.objects.create(
+            name="Unrelated branch membership",
+            slug="unrelated-payment-membership",
+            account_kind=AccountType.AccountKind.STAFF,
+        )
+        actor = user_in(tenant_a)
+        RoleMembership.objects.create(
+            user=actor,
+            branch=own_invoice.student.branch,
+            account_type=granting_type,
+            role=granting_type.compatibility_role,
+        )
+        RoleMembership.objects.create(
+            user=actor,
+            branch=other_invoice.student.branch,
+            account_type=unrelated_type,
+            role=unrelated_type.compatibility_role,
+        )
+        actor.refresh_from_db()
+        own_payment = Payment.objects.create(
+            provider=Payment.Method.CLICK,
+            amount_uzs=Decimal("100.00"),
+            status=Payment.Status.COMPLETED,
+            idempotency_key="payment-bound-grant-own",
+            account_ref=own_invoice.number,
+            paid_at=timezone.now(),
+            metadata={"invoice_id": own_invoice.pk, "student_id": own_invoice.student_id},
+            branch_at_payment_id=own_invoice.branch_at_issue_id,
+            department_at_payment_id=own_invoice.department_at_issue_id,
+            attribution_status="captured",
+        )
+        other_payment = Payment.objects.create(
+            provider=Payment.Method.CLICK,
+            amount_uzs=Decimal("200.00"),
+            status=Payment.Status.COMPLETED,
+            idempotency_key="payment-bound-grant-other",
+            account_ref=other_invoice.number,
+            paid_at=timezone.now(),
+            metadata={"invoice_id": other_invoice.pk, "student_id": other_invoice.student_id},
+            branch_at_payment_id=other_invoice.branch_at_issue_id,
+            department_at_payment_id=other_invoice.department_at_issue_id,
+            attribution_status="captured",
+        )
+
+    client = as_user(tenant_a, actor)
+    listing = client.get("/api/v1/payments/")
+    assert listing.status_code == 200, listing.content
+    assert {row["id"] for row in listing.json()["data"]} == {own_payment.pk}
+    assert client.get(f"/api/v1/payments/{other_payment.pk}/").status_code == 404
+    assert (
+        client.post(
+            "/api/v1/payments/checkout/",
+            {"invoice": other_invoice.pk, "provider": "payme"},
+            format="json",
+        ).status_code
+        == 404
+    )
+    assert client.post(f"/api/v1/payments/{other_payment.pk}/refund/", {}).status_code == 404
     reconciliation = client.get(
         "/api/v1/payments/reconciliation/",
         {"date": timezone.localdate().isoformat()},

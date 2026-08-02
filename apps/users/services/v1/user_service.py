@@ -8,21 +8,29 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db import transaction
 from django.db.models import QuerySet
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from apps.auth.interfaces.repositories import ISessionRepository
 from apps.users import services as users_domain
 from apps.users.interfaces.repositories import IDeviceRepository, IUserRepository
 from apps.users.interfaces.services import IUserService
-from apps.users.models import Device, User
+from apps.users.models import Device, Session, User
 from core.exceptions import ValidationException
 
 
 class UserService(IUserService):
-    def __init__(self, user_repository: IUserRepository, device_repository: IDeviceRepository) -> None:
+    def __init__(
+        self,
+        user_repository: IUserRepository,
+        device_repository: IDeviceRepository,
+        session_repository: ISessionRepository,
+    ) -> None:
         self._users = user_repository
         self._devices = device_repository
+        self._sessions = session_repository
 
     # --- directory ---
     def query(self) -> QuerySet[User]:
@@ -79,4 +87,45 @@ class UserService(IUserService):
         # so a shared or signed-out installation cannot be targeted again.
         device.push_token = ""
         device.save(update_fields=["revoked_at", "push_token"])
+        return True
+
+    # --- sessions (self-scoped to the exact authenticated principal) ---
+    def sessions_for(
+        self,
+        *,
+        user: User,
+        principal_kind: str,
+        principal_id: int | None,
+    ) -> QuerySet[Session]:
+        return self._sessions.active_for_principal(
+            user=user,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
+        )
+
+    @transaction.atomic
+    def revoke_session(
+        self,
+        *,
+        user: User,
+        principal_kind: str,
+        principal_id: int | None,
+        session_id: int,
+    ) -> bool:
+        changed = self._sessions.revoke_for_principal(
+            user=user,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
+            session_id=session_id,
+        )
+        if not changed:
+            return False
+        from apps.audit.services import audit_log
+
+        audit_log(
+            actor=user,
+            action="session.revoked",
+            resource_type="users.Session",
+            resource_id=str(session_id),
+        )
         return True

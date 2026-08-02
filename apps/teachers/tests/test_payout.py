@@ -33,6 +33,12 @@ def _wide_period():
     return today - timedelta(days=1), today + timedelta(days=1)
 
 
+def _completed_month():
+    first_this_month = timezone.localdate().replace(day=1)
+    last_completed_month = first_this_month - timedelta(days=1)
+    return last_completed_month.replace(day=1), last_completed_month
+
+
 # --- policy CRUD + validation --------------------------------------------
 def test_set_and_get_hourly_policy(tenant_a, as_role):
     director, _ = as_role(Role.DIRECTOR)
@@ -44,6 +50,17 @@ def test_set_and_get_hourly_policy(tenant_a, as_role):
     assert r.json()["data"]["method"] == "hourly"
     assert r.json()["data"]["hourly_rate_uzs"] == "50000.00"
     assert director.get(POLICY.format(teacher.id)).json()["data"]["hourly_rate_uzs"] == "50000.00"
+
+
+def test_directory_reader_cannot_read_payout_policy(tenant_a, user_in, as_user):
+    from apps.teachers.services import set_payout_policy
+
+    teacher, branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        set_payout_policy(teacher=teacher, method="flat_monthly", flat_amount_uzs=Decimal("3000000"))
+    registrar = as_user(tenant_a, user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch))
+
+    assert registrar.get(POLICY.format(teacher.id)).status_code == 403
 
 
 def test_method_requires_its_params(tenant_a, as_role):
@@ -82,6 +99,7 @@ def test_compute_hourly(tenant_a):
                 title="L",
                 starts_at=start,
                 ends_at=start + timedelta(hours=1),
+                status=Lesson.Status.COMPLETED,
             )
         set_payout_policy(teacher=teacher, method="hourly", hourly_rate_uzs=Decimal("50000"))
         start_d, end_d = _wide_period()
@@ -90,15 +108,92 @@ def test_compute_hourly(tenant_a):
         assert result["amount_uzs"] == Decimal("100000.00")  # 2h x 50000
 
 
+def test_hourly_payout_counts_only_completed_work_and_rounds_money_once(tenant_a):
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.schedule.models import Lesson
+    from apps.schedule.tests.factories import TermFactory
+    from apps.teachers.services import compute_payout, set_payout_policy
+
+    teacher, branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        cohort = CohortFactory(branch=branch, primary_teacher=teacher)
+        term = TermFactory()
+        base = timezone.now() - timedelta(hours=2)
+        # One delivered minute at 60,000/hour is exactly 1,000. Pre-rounding
+        # hours to 0.02 would incorrectly pay 1,200.
+        Lesson.objects.create(
+            term=term,
+            cohort=cohort,
+            teacher=teacher,
+            title="Delivered",
+            starts_at=base,
+            ends_at=base + timedelta(minutes=1),
+            status=Lesson.Status.COMPLETED,
+        )
+        # A scheduled hour is not evidence of delivered work and must not be
+        # turned into a salary liability.
+        Lesson.objects.create(
+            term=term,
+            cohort=cohort,
+            teacher=teacher,
+            title="Scheduled only",
+            starts_at=base + timedelta(hours=1),
+            ends_at=base + timedelta(hours=2),
+            status=Lesson.Status.SCHEDULED,
+        )
+        set_payout_policy(teacher=teacher, method="hourly", hourly_rate_uzs=Decimal("60000"))
+        start_d, end_d = _wide_period()
+
+        result = compute_payout(teacher=teacher, period_start=start_d, period_end=end_d)
+
+    assert result["amount_uzs"] == Decimal("1000.00")
+    assert result["breakdown"]["hours"] == "0.0167"
+
+
 def test_compute_flat(tenant_a):
     from apps.teachers.services import compute_payout, set_payout_policy
 
     teacher, _b = _teacher(tenant_a)
     with schema_context(tenant_a.schema_name):
         set_payout_policy(teacher=teacher, method="flat_monthly", flat_amount_uzs=Decimal("3000000"))
-        start_d, end_d = _wide_period()
+        start_d, end_d = _completed_month()
         result = compute_payout(teacher=teacher, period_start=start_d, period_end=end_d)
         assert result["amount_uzs"] == Decimal("3000000.00")
+
+
+def test_flat_monthly_rejects_partial_or_open_months(tenant_a, as_role):
+    director, _ = as_role(Role.DIRECTOR)
+    teacher, _branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        set_payout_policy_flat(teacher)
+    today = timezone.localdate()
+
+    partial = director.post(
+        PREPARE.format(teacher.pk),
+        {
+            "period_start": (today - timedelta(days=2)).isoformat(),
+            "period_end": (today - timedelta(days=1)).isoformat(),
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-partial-month-0001",
+    )
+    first_this_month = today.replace(day=1)
+    open_month = director.post(
+        PREPARE.format(teacher.pk),
+        {
+            "period_start": first_this_month.isoformat(),
+            "period_end": (
+                (first_this_month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            ).isoformat(),
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-open-month-0001",
+    )
+
+    assert partial.status_code == 400
+    assert set(partial.json()["errors"]) == {"period_start", "period_end"}
+    assert open_month.status_code == 400
+    assert set(open_month.json()["errors"]) == {"period_end"}
 
 
 def test_compute_percent_of_collected_tuition(tenant_a):
@@ -122,6 +217,25 @@ def test_compute_percent_of_collected_tuition(tenant_a):
         start_d, end_d = _wide_period()
         result = compute_payout(teacher=teacher, period_start=start_d, period_end=end_d)
         assert result["amount_uzs"] == Decimal("160000.00")  # 40% of 400,000
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["hourly", "percent_of_collected_tuition", "flat_monthly", "corrupt-method"],
+)
+def test_compute_payout_fails_closed_on_corrupt_active_policy(tenant_a, method):
+    from apps.teachers.models import PayoutPolicy
+    from apps.teachers.services import compute_payout
+    from core.exceptions import UnprocessableEntity
+
+    teacher, _branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        PayoutPolicy.objects.create(teacher=teacher, method=method)
+        start_d, end_d = _completed_month()
+        with pytest.raises(UnprocessableEntity) as exc:
+            compute_payout(teacher=teacher, period_start=start_d, period_end=end_d)
+
+    assert exc.value.code == "invalid_payout_policy"
 
 
 def test_percent_payout_uses_custom_typed_cohort_assignment(tenant_a):
@@ -206,6 +320,7 @@ def test_prepare_salary_rejects_a_max_year_period(tenant_a, as_role):
         PREPARE.format(teacher.id),
         {"period_start": "2020-01-01", "period_end": "9999-12-31"},
         format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-max-date-0001",
     )
     assert r.status_code == 400
     assert r.json()["code"] == "validation_error"
@@ -244,12 +359,13 @@ def test_prepare_salary_creates_and_flows_through_approvals(tenant_a, as_role):
     teacher, _b = _teacher(tenant_a)
     with schema_context(tenant_a.schema_name):
         set_payout_policy(teacher=teacher, method="flat_monthly", flat_amount_uzs=Decimal("2500000"))
-    start_d, end_d = _wide_period()
+    start_d, end_d = _completed_month()
 
     r = director.post(
         PREPARE.format(teacher.id),
         {"period_start": start_d.isoformat(), "period_end": end_d.isoformat()},
         format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-prepare-flow-0001",
     )
     assert r.status_code == 201, r.content
     body = r.json()["data"]
@@ -261,6 +377,221 @@ def test_prepare_salary_creates_and_flows_through_approvals(tenant_a, as_role):
         assert req.kind == "salary_prep"
         assert req.amount_uzs == Decimal("2500000.00")
         assert req.payload["teacher_profile_id"] == teacher.id  # SoD beneficiary pinned
+
+
+def test_prepare_salary_is_idempotent_by_key_and_teacher_period(tenant_a, as_role):
+    from apps.approvals.models import ApprovalRequest
+    from apps.teachers.services import set_payout_policy
+
+    director, _ = as_role(Role.DIRECTOR)
+    teacher, _branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        set_payout_policy(
+            teacher=teacher,
+            method="flat_monthly",
+            flat_amount_uzs=Decimal("2500000"),
+        )
+    start_d, end_d = _completed_month()
+    payload = {"period_start": start_d.isoformat(), "period_end": end_d.isoformat()}
+
+    first = director.post(
+        PREPARE.format(teacher.id),
+        payload,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-idempotency-0001",
+    )
+    same_key = director.post(
+        PREPARE.format(teacher.id),
+        payload,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-idempotency-0001",
+    )
+    new_key_same_period = director.post(
+        PREPARE.format(teacher.id),
+        payload,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-idempotency-0002",
+    )
+
+    assert first.status_code == same_key.status_code == new_key_same_period.status_code == 201
+    request_ids = {
+        response.json()["data"]["request_id"] for response in (first, same_key, new_key_same_period)
+    }
+    assert len(request_ids) == 1
+    with schema_context(tenant_a.schema_name):
+        request = ApprovalRequest.objects.get(pk=request_ids.pop())
+        assert ApprovalRequest.objects.filter(kind="salary_prep").count() == 1
+        assert request.idempotency_key_hash != "salary-idempotency-0001"
+        assert len(request.idempotency_key_hash or "") == 64
+
+
+def test_prepare_salary_rejects_overlapping_periods(tenant_a, as_role):
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.schedule.models import Lesson
+    from apps.schedule.tests.factories import TermFactory
+    from apps.teachers.services import set_payout_policy
+
+    director, _ = as_role(Role.DIRECTOR)
+    teacher, branch = _teacher(tenant_a)
+    today = timezone.localdate()
+    with schema_context(tenant_a.schema_name):
+        cohort = CohortFactory(branch=branch, primary_teacher=teacher)
+        start = timezone.now() - timedelta(hours=1)
+        Lesson.objects.create(
+            term=TermFactory(),
+            cohort=cohort,
+            teacher=teacher,
+            title="Delivered",
+            starts_at=start,
+            ends_at=start + timedelta(minutes=30),
+            status=Lesson.Status.COMPLETED,
+        )
+        set_payout_policy(teacher=teacher, method="hourly", hourly_rate_uzs=Decimal("50000"))
+
+    first = director.post(
+        PREPARE.format(teacher.pk),
+        {
+            "period_start": (today - timedelta(days=2)).isoformat(),
+            "period_end": today.isoformat(),
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-overlap-first-0001",
+    )
+    overlap = director.post(
+        PREPARE.format(teacher.pk),
+        {
+            "period_start": today.isoformat(),
+            "period_end": (today + timedelta(days=1)).isoformat(),
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-overlap-next-0001",
+    )
+
+    assert first.status_code == 201, first.content
+    assert overlap.status_code == 409
+    assert overlap.json()["code"] == "salary_period_overlap"
+
+
+def test_prepare_salary_rejects_missing_or_reused_mismatched_idempotency_key(
+    tenant_a,
+    as_role,
+):
+    from apps.teachers.services import set_payout_policy
+
+    director, _ = as_role(Role.DIRECTOR)
+    teacher, _branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        set_payout_policy(
+            teacher=teacher,
+            method="flat_monthly",
+            flat_amount_uzs=Decimal("2500000"),
+        )
+    start_d, end_d = _completed_month()
+
+    missing = director.post(
+        PREPARE.format(teacher.id),
+        {"period_start": start_d.isoformat(), "period_end": end_d.isoformat()},
+        format="json",
+    )
+    first = director.post(
+        PREPARE.format(teacher.id),
+        {"period_start": start_d.isoformat(), "period_end": end_d.isoformat()},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-mismatch-0001",
+    )
+    mismatched = director.post(
+        PREPARE.format(teacher.id),
+        {
+            "period_start": (start_d - timedelta(days=10)).isoformat(),
+            "period_end": (end_d - timedelta(days=10)).isoformat(),
+        },
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-mismatch-0001",
+    )
+    padded = director.post(
+        PREPARE.format(teacher.id),
+        {"period_start": start_d.isoformat(), "period_end": end_d.isoformat()},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY=" salary-mismatch-0002 ",
+    )
+
+    assert missing.status_code == 400
+    assert set(missing.json()["errors"]) == {"Idempotency-Key"}
+    assert padded.status_code == 400
+    assert set(padded.json()["errors"]) == {"Idempotency-Key"}
+    assert first.status_code == 201
+    assert mismatched.status_code == 409
+    assert mismatched.json()["code"] == "idempotency_mismatch"
+
+
+def test_prepare_salary_checks_key_owner_before_lower_id_domain_match(
+    tenant_a,
+    as_role,
+):
+    """A lower-id domain match must not hide that another request owns the key."""
+    from apps.approvals.models import ApprovalRequest
+    from apps.teachers.services import set_payout_policy
+
+    director, _ = as_role(Role.DIRECTOR)
+    first_teacher, _first_branch = _teacher(tenant_a)
+    key_owner_teacher, _owner_branch = _teacher(tenant_a)
+    with schema_context(tenant_a.schema_name):
+        for teacher in (first_teacher, key_owner_teacher):
+            set_payout_policy(
+                teacher=teacher,
+                method="flat_monthly",
+                flat_amount_uzs=Decimal("2500000"),
+            )
+    start_d, end_d = _completed_month()
+    payload = {"period_start": start_d.isoformat(), "period_end": end_d.isoformat()}
+
+    lower_id_domain = director.post(
+        PREPARE.format(first_teacher.pk),
+        payload,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-domain-first-0001",
+    )
+    key_owner = director.post(
+        PREPARE.format(key_owner_teacher.pk),
+        payload,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-shared-owner-0001",
+    )
+    assert lower_id_domain.status_code == key_owner.status_code == 201
+    assert lower_id_domain.json()["data"]["request_id"] < key_owner.json()["data"]["request_id"]
+
+    reused_for_lower_id_domain = director.post(
+        PREPARE.format(first_teacher.pk),
+        payload,
+        format="json",
+        HTTP_IDEMPOTENCY_KEY="salary-shared-owner-0001",
+    )
+
+    assert reused_for_lower_id_domain.status_code == 409
+    assert reused_for_lower_id_domain.json()["code"] == "idempotency_mismatch"
+    with schema_context(tenant_a.schema_name):
+        assert ApprovalRequest.objects.filter(kind="salary_prep").count() == 2
+
+
+def test_payout_policy_rejects_json_numbers_and_silent_rounding(tenant_a, as_role):
+    director, _ = as_role(Role.DIRECTOR)
+    teacher, _branch = _teacher(tenant_a)
+
+    json_number = director.put(
+        POLICY.format(teacher.id),
+        {"method": "hourly", "hourly_rate_uzs": 50000},
+        format="json",
+    )
+    subunit = director.put(
+        POLICY.format(teacher.id),
+        {"method": "hourly", "hourly_rate_uzs": "50000.001"},
+        format="json",
+    )
+
+    assert json_number.status_code == 400
+    assert set(json_number.json()["errors"]) == {"hourly_rate_uzs"}
+    assert subunit.status_code == 400
+    assert set(subunit.json()["errors"]) == {"hourly_rate_uzs"}
 
 
 def test_teacher_cannot_approve_their_own_salary(tenant_a, user_in, as_user):
@@ -278,7 +609,7 @@ def test_teacher_cannot_approve_their_own_salary(tenant_a, user_in, as_user):
 
         teacher = TeacherProfile.objects.create(user=teacher_user, branch=BranchFactory())
         set_payout_policy(teacher=teacher, method="flat_monthly", flat_amount_uzs=Decimal("1000000"))
-        start_d, end_d = _wide_period()
+        start_d, end_d = _completed_month()
         req = prepare_salary(teacher=teacher, period_start=start_d, period_end=end_d, requested_by=None)
         with pytest.raises(PermissionException) as exc:
             approve(request_id=req.pk, actor=teacher_user)

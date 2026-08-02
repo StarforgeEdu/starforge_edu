@@ -17,6 +17,7 @@ from apps.finance.models import (
 from apps.org.tests.factories import BranchFactory
 from apps.students.tests.factories import StudentProfileFactory
 from apps.users.tests.factories import UserFactory
+from core.historical_scope import ScopeAttributionStatus
 
 
 class FeeScheduleFactory(factory.django.DjangoModelFactory[FeeSchedule]):
@@ -37,6 +38,20 @@ class InvoiceFactory(factory.django.DjangoModelFactory[Invoice]):
 
     number = factory.Sequence(lambda n: f"INV-2026-{n + 1:06d}")
     student = factory.SubFactory(StudentProfileFactory)
+    cohort = None
+    branch_at_issue = factory.LazyAttribute(lambda invoice: invoice.student.branch)
+    department_at_issue = factory.LazyAttribute(
+        lambda invoice: (
+            invoice.cohort.department
+            if invoice.cohort is not None
+            else (
+                invoice.student.current_cohort.department
+                if invoice.student.current_cohort is not None
+                else None
+            )
+        )
+    )
+    attribution_status = ScopeAttributionStatus.CAPTURED
     status = Invoice.Status.ISSUED
     issue_date = date(2026, 6, 1)
     due_date = date(2026, 6, 5)

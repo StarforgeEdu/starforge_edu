@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 import phonenumbers
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
@@ -16,6 +18,20 @@ def validate_phone(value: str) -> None:
         raise ValidationError(_("Invalid phone number.")) from exc
     if not phonenumbers.is_valid_number(parsed):
         raise ValidationError(_("Invalid phone number."))
+
+
+def validate_iana_timezone(value: str) -> None:
+    """Require a timezone name understood by the installed IANA tz database.
+
+    Organization dates are security- and money-relevant boundaries, so silently
+    accepting an unknown value and falling back to a process/browser timezone is
+    unsafe. ``ZoneInfo`` also rejects absolute paths and path traversal.
+    """
+
+    try:
+        ZoneInfo(value)
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValidationError(_("Enter a valid IANA timezone name."), code="invalid_timezone") from exc
 
 
 def normalize_phone(value: str) -> str:

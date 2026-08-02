@@ -12,7 +12,7 @@ from typing import Any
 from django.db.models import Count, F, Sum
 
 from apps.content.models import LessonFile
-from apps.reports.generators.base import ReportGenerator
+from apps.reports.generators.base import ReportGenerator, assert_report_generation_authorized
 
 
 class StorageUsageGenerator(ReportGenerator):
@@ -21,6 +21,7 @@ class StorageUsageGenerator(ReportGenerator):
     template_base = "storage_usage"
 
     def collect(self, params: dict[str, Any], *, user, roles: set[str]) -> dict[str, Any]:
+        assert_report_generation_authorized(report_key=self.key, user=user, roles=roles)
         clean = LessonFile.objects.filter(status=LessonFile.Status.CLEAN)
 
         # A file hangs off a lesson (module->course->library) OR a folder

@@ -76,7 +76,20 @@ def payment_allocation_to_dict(a: PaymentAllocation) -> dict[str, Any]:
     }
 
 
-def invoice_to_dict(inv: Invoice) -> dict[str, Any]:
+def _invoice_outstanding(inv: Invoice, *, allocated_uzs: Decimal) -> Decimal:
+    # Drafts are not yet receivable; void/paid invoices no longer belong in
+    # outstanding debt even if historical data is imperfect.  Open statuses are
+    # clamped at zero so corrupt legacy over-allocation is never shown as credit.
+    if inv.status not in (
+        Invoice.Status.ISSUED,
+        Invoice.Status.PARTIALLY_PAID,
+        Invoice.Status.OVERDUE,
+    ):
+        return Decimal("0.00")
+    return max(inv.total_uzs - allocated_uzs, Decimal("0.00"))
+
+
+def _invoice_summary_payload(inv: Invoice, *, allocated_uzs: Decimal) -> dict[str, Any]:
     return {
         "id": inv.id,
         "number": inv.number,
@@ -84,6 +97,11 @@ def invoice_to_dict(inv: Invoice) -> dict[str, Any]:
         "student_name": inv.student.get_full_name() if inv.student_id else "",
         "cohort": inv.cohort_id,
         "cohort_name": inv.cohort.name if inv.cohort else None,
+        "branch_at_issue": inv.branch_at_issue_id,
+        "branch_at_issue_name": inv.branch_at_issue.name if inv.branch_at_issue else None,
+        "department_at_issue": inv.department_at_issue_id,
+        "department_at_issue_name": (inv.department_at_issue.name if inv.department_at_issue else None),
+        "attribution_status": inv.attribution_status,
         "fee_schedule": inv.fee_schedule_id,
         "fee_schedule_name": inv.fee_schedule.name if inv.fee_schedule else None,
         "period": inv.period,
@@ -92,15 +110,36 @@ def invoice_to_dict(inv: Invoice) -> dict[str, Any]:
         "due_date": _iso(inv.due_date),
         "currency": inv.currency,
         "total_uzs": _money(inv.total_uzs),
+        "outstanding_uzs": _money(_invoice_outstanding(inv, allocated_uzs=allocated_uzs)),
         "fx_rate_usd": _rate(inv.fx_rate_usd),
         "fx_source": inv.fx_source,
         "total_usd": _money(inv.total_usd),
         "created_by": inv.created_by_id,
         "created_by_name": inv.created_by.get_full_name() if inv.created_by else None,
         "created_at": _iso(inv.created_at),
-        "lines": [invoice_line_to_dict(line) for line in inv.lines.all()],
-        "allocations": [payment_allocation_to_dict(a) for a in inv.allocations.all()],
     }
+
+
+def invoice_list_to_dict(inv: Invoice) -> dict[str, Any]:
+    """Lightweight invoice-register row: scalar summary fields only.
+
+    ``scoped_invoice_summaries`` annotates the exact allocation total in the same
+    SQL query; intentionally do not access either reverse collection here.
+    """
+    allocated_uzs = Decimal(getattr(inv, "allocated_uzs", Decimal("0.00")))
+    return _invoice_summary_payload(inv, allocated_uzs=allocated_uzs)
+
+
+def invoice_to_dict(inv: Invoice) -> dict[str, Any]:
+    """Full invoice detail including its line items and payment allocations."""
+    allocations = list(inv.allocations.all())
+    allocated_uzs = sum((allocation.amount_uzs for allocation in allocations), Decimal("0.00"))
+    payload = _invoice_summary_payload(inv, allocated_uzs=allocated_uzs)
+    payload.update(
+        lines=[invoice_line_to_dict(line) for line in inv.lines.all()],
+        allocations=[payment_allocation_to_dict(allocation) for allocation in allocations],
+    )
+    return payload
 
 
 def discount_to_dict(d: Discount) -> dict[str, Any]:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import Any
 
 from django.conf import settings
@@ -57,8 +58,19 @@ class SoliqClient(FiscalClient):
     """Real GNK/Soliq client. Uses ``requests`` (available) with a timeout on
     every call (CODE-GUIDE §6); never call from a request handler — Celery only."""
 
-    def __init__(self, *, base_url: str, token: str) -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, *, base_url: str, token: str, allowed_hosts: Iterable[str]) -> None:
+        from infrastructure.http_client import validate_https_endpoint
+
+        self.allowed_hosts = tuple(allowed_hosts)
+        self.base_url = validate_https_endpoint(base_url, allowed_hosts=self.allowed_hosts).rstrip("/")
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 4096
+            or token.strip() != token
+            or any(ord(character) < 32 or ord(character) == 127 for character in token)
+        ):
+            raise ValueError("Soliq credential is invalid.")
         self.token = token
 
     def fiscalize(
@@ -66,14 +78,19 @@ class SoliqClient(FiscalClient):
     ) -> dict[str, Any]:
         import requests  # available; kept local to mirror the lazy-transport pattern
 
-        resp = requests.post(
+        from infrastructure.http_client import InvalidProviderResponse, request_json_limited
+
+        data = request_json_limited(
+            requests.post,
             f"{self.base_url}/v1/receipt",
-            json={"amount": amount_uzs, "items": items, "external_id": idempotency_key},
+            allowed_hosts=self.allowed_hosts,
+            json_body={"amount": amount_uzs, "items": items, "external_id": idempotency_key},
             headers={"Authorization": f"Bearer {self.token}", "Idempotency-Key": idempotency_key},
-            timeout=15,
+            timeout=(3.05, 15.0),
+            max_response_bytes=64 * 1024,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        if not isinstance(data, dict):
+            raise InvalidProviderResponse("Soliq returned a non-object JSON response.")
         return {"fiscal_sign": data["fiscal_sign"], "qr_url": data["qr_url"], "raw": data}
 
 
@@ -83,4 +100,5 @@ def get_fiscal_client() -> FiscalClient:
     return SoliqClient(
         base_url=getattr(settings, "SOLIQ_API_URL", ""),
         token=getattr(settings, "SOLIQ_API_TOKEN", ""),
+        allowed_hosts=getattr(settings, "SOLIQ_API_ALLOWED_HOSTS", ()),
     )

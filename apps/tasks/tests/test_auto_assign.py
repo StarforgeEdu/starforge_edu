@@ -142,7 +142,43 @@ def test_free_mode_unassigns(tenant_a, as_role, user_in):
     with schema_context(tenant_a.schema_name):
         from apps.tasks.models import Task
 
-        assert Task.objects.get(pk=tid).assignee_id is None  # now claimable
+        task = Task.objects.get(pk=tid)
+        assert task.assignee_id is None  # now claimable
+        assert task.assignee_principal_kind == ""
+        assert task.assignee_principal_id is None
+        assert task.assignee_attribution_status == "captured"
+
+
+def test_quarantined_legacy_assignments_do_not_distort_fair_load(tenant_a, as_role, user_in):
+    from apps.org.tests.factories import BranchFactory
+    from apps.tasks.models import Task
+
+    director, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+    dept = _dept(tenant_a, branch)
+    first = _staff_in(tenant_a, user_in, branch, dept)
+    second = _staff_in(tenant_a, user_in, branch, dept)
+    with schema_context(tenant_a.schema_name):
+        Task.objects.create(
+            title="Ambiguous legacy work",
+            branch=branch,
+            department=dept,
+            assignee=first,
+            assignee_attribution_status="quarantined",
+        )
+    task_ids = _open_tasks(director, dept, 2)
+
+    result = director.post(
+        AUTO,
+        {"task_ids": task_ids, "department": dept.pk, "mode": "fair"},
+        format="json",
+    )
+    assert result.status_code == 200, result.content
+    assert {row["assignee"] for row in result.json()["data"]["assignments"]} == {
+        first.pk,
+        second.pk,
+    }
 
 
 def test_no_open_tasks_in_department(tenant_a, as_role, user_in):

@@ -13,6 +13,166 @@ from core.permissions import Role
 
 pytestmark = pytest.mark.django_db
 
+STAFF_URL = "/api/v1/org/staff/"
+
+
+def _staff_permission_user(tenant, *, user_in, branch, permissions):
+    from apps.access.models import AccountTypePermission
+    from apps.users.models import RoleMembership
+
+    user = user_in(tenant)
+    account_type = AccountType.objects.create(
+        name=f"Staff API test role {user.pk}",
+        slug=f"staff-api-test-role-{user.pk}",
+        account_kind=AccountType.AccountKind.STAFF,
+    )
+    AccountTypePermission.objects.bulk_create(
+        [
+            AccountTypePermission(account_type=account_type, permission=permission)
+            for permission in permissions
+        ]
+    )
+    RoleMembership.objects.create(
+        user=user,
+        account_type=account_type,
+        role=account_type.compatibility_role,
+        branch=branch,
+    )
+    user.refresh_from_db()
+    return user
+
+
+def test_staff_directory_does_not_borrow_other_principal_or_hidden_branch_memberships(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.teachers.models import TeacherProfile
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        visible_branch = BranchFactory()
+        hidden_branch = BranchFactory()
+        target_user = user_in(tenant_a, roles=[Role.CASHIER], branch=hidden_branch)
+        target = StaffProfile.objects.create(
+            user=target_user,
+            username="multi.profile.staff",
+            first_name="Hidden",
+        )
+        TeacherProfile.objects.create(
+            user=target_user,
+            username="multi.profile.teacher",
+            branch=visible_branch,
+        )
+        # This teacher assignment previously made the staff profile visible.
+        RoleMembership.objects.create(
+            user=target_user,
+            role=Role.TEACHER,
+            branch=visible_branch,
+        )
+        reader = _staff_permission_user(
+            tenant_a,
+            user_in=user_in,
+            branch=visible_branch,
+            permissions={"users:read"},
+        )
+
+    client = as_user(tenant_a, reader)
+    hidden = client.get(STAFF_URL, {"page_size": 100})
+    assert hidden.status_code == 200, hidden.content
+    assert target.pk not in {row["id"] for row in hidden.json()["data"]}
+
+    with schema_context(tenant_a.schema_name):
+        RoleMembership.objects.create(
+            user=target_user,
+            role=Role.CASHIER,
+            branch=visible_branch,
+        )
+    visible = client.get(STAFF_URL, {"page_size": 100})
+    row = next(item for item in visible.json()["data"] if item["id"] == target.pk)
+    assert {membership["branch"] for membership in row["role_memberships"]} == {visible_branch.pk}
+    assert "teacher" not in str(row["role_memberships"])
+    assert hidden_branch.pk not in {membership["branch"] for membership in row["role_memberships"]}
+
+
+def test_scoped_users_writer_cannot_mint_privileged_staff_account(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        owner_type = AccountType.objects.get(is_system=True, slug=Role.DIRECTOR)
+        writer = _staff_permission_user(
+            tenant_a,
+            user_in=user_in,
+            branch=branch,
+            permissions={"users:write"},
+        )
+
+    response = as_user(tenant_a, writer).post(
+        STAFF_URL,
+        {
+            "account_type": owner_type.pk,
+            "branch": branch.pk,
+            "phone": "+998901112299",
+            "username": "forged.owner",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403
+    with schema_context(tenant_a.schema_name):
+        assert not StaffProfile.objects.filter(username="forged.owner").exists()
+
+
+def test_one_branch_writer_cannot_take_over_multi_branch_staff_identity(
+    tenant_a,
+    user_in,
+    as_user,
+):
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        visible_branch = BranchFactory()
+        hidden_branch = BranchFactory()
+        target_user = user_in(tenant_a, roles=[Role.CASHIER], branch=visible_branch)
+        RoleMembership.objects.create(
+            user=target_user,
+            role=Role.CASHIER,
+            branch=hidden_branch,
+        )
+        target = StaffProfile.objects.create(
+            user=target_user,
+            username="protected.multi.branch",
+            first_name="Original",
+        )
+        writer = _staff_permission_user(
+            tenant_a,
+            user_in=user_in,
+            branch=visible_branch,
+            permissions={"users:read", "users:write"},
+        )
+
+    client = as_user(tenant_a, writer)
+    update = client.patch(
+        f"{STAFF_URL}{target.pk}/",
+        {"first_name": "Taken over"},
+        format="json",
+    )
+    credentials = client.post(
+        f"{STAFF_URL}{target.pk}/credentials/",
+        {},
+        format="json",
+    )
+    delete = client.delete(f"{STAFF_URL}{target.pk}/")
+
+    assert update.status_code == credentials.status_code == delete.status_code == 404
+    with schema_context(tenant_a.schema_name):
+        target.refresh_from_db()
+        assert target.first_name == "Original"
+        assert target.is_active is True
+
 
 def test_staff_account_api_and_role_owned_credentials(tenant_a, as_role, client_for):
     director, _user = as_role(Role.DIRECTOR)

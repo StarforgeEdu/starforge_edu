@@ -16,7 +16,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.db import connection, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -48,16 +48,24 @@ def _ensure_sms_enabled() -> None:
 
 def _resolve_phone(student: StudentProfile) -> str:
     """The number a student's message goes to: the primary guardian's (else any
-    guardian's), falling back to the student's own. Uses the prefetched guardian list
-    so building a campaign stays a fixed number of queries."""
-    guardians = list(student.guardians.all())
+    guardian's), falling back to the student's own role-native contact. Revoked
+    or inactive family accounts are excluded. Uses the prefetched active list so
+    building a campaign stays a fixed number of queries."""
+    guardians = getattr(student, "_active_campaign_guardians", None)
+    if guardians is None:
+        guardians = list(
+            student.guardians.filter(
+                revoked_at__isnull=True,
+                parent__is_active=True,
+                parent__user__is_active=True,
+            ).select_related("parent")
+        )
     guardians.sort(key=lambda g: not g.is_primary)  # primary first
     for g in guardians:
-        parent_user = getattr(g.parent, "user", None)
-        if parent_user and parent_user.phone:
-            return parent_user.phone
-    if student.user and student.user.phone:
-        return student.user.phone
+        if g.parent.is_active and g.parent.phone:
+            return g.parent.phone
+    if student.is_active and student.user.is_active and student.phone:
+        return student.phone
     return ""
 
 
@@ -95,8 +103,23 @@ def create_campaign(
     ``dispatch_due_campaigns`` beat task sends it once the time arrives. A null means the
     campaign is sent manually via the send endpoint (unchanged behaviour)."""
     segment = {k: v for k, v in (segment or {}).items() if k in ("status", "cohort") and v not in (None, "")}
+    from apps.parents.models import Guardian
+
     students = list(
-        _segment_queryset(segment, branch).select_related("user").prefetch_related("guardians__parent__user")
+        _segment_queryset(segment, branch)
+        .filter(is_active=True)
+        .select_related("user")
+        .prefetch_related(
+            Prefetch(
+                "guardians",
+                queryset=Guardian.objects.filter(
+                    revoked_at__isnull=True,
+                    parent__is_active=True,
+                    parent__user__is_active=True,
+                ).select_related("parent"),
+                to_attr="_active_campaign_guardians",
+            )
+        )
     )
     campaign = Campaign.objects.create(
         name=name,
@@ -208,14 +231,20 @@ def _enqueue_campaign_delivery(campaign: Campaign) -> None:
     except Exception as exc:
         # The durable SENDING row is the outbox. Make the lease immediately stale so
         # the periodic dispatcher retries publication instead of stranding the blast.
-        logger.exception("Could not enqueue campaign %s delivery", campaign.pk)
+        logger.warning(
+            "Could not enqueue campaign %s delivery (%s)",
+            campaign.pk,
+            type(exc).__name__,
+        )
         Campaign.objects.filter(
             pk=campaign.pk,
             status=Campaign.Status.SENDING,
             send_claim_token=campaign.send_claim_token,
         ).update(
             send_heartbeat_at=None,
-            last_error=f"queue: {exc}"[:255],
+            # Provider/broker messages can contain credentials, hosts, or payload
+            # fragments. Keep those in restricted logs, never in product rows.
+            last_error="queue_delivery_failed",
         )
 
 
@@ -310,9 +339,18 @@ def _process_campaign_delivery_owned(*, campaign_id: int, claim_token: str) -> s
                 client.send(phone=recipient.phone, text=campaign.message)
                 texted.add(recipient.phone)
         except Exception as exc:
+            # Provider exception text and response bodies can contain phone
+            # numbers, message fragments, or credentials. Keep only the class
+            # and internal row identifiers in application logs.
+            logger.warning(
+                "Campaign %s recipient %s delivery failed (%s)",
+                campaign_id,
+                recipient.pk,
+                type(exc).__name__,
+            )
             CampaignRecipient.objects.filter(pk=recipient.pk).update(
                 status=R.FAILED,
-                error=str(exc)[:255],
+                error="delivery_failed",
                 sent_at=now,
             )
 
@@ -351,7 +389,7 @@ def _finalize_campaign_delivery(*, campaign_id: int, claim_token: str) -> str | 
         campaign.send_heartbeat_at = None
         if by.get(R.PENDING, 0):
             campaign.status = Campaign.Status.SENDING
-            campaign.last_error = "pending recipients remain"
+            campaign.last_error = "delivery_pending"
         elif campaign.sent_count == 0 and campaign.failed_count > 0:
             campaign.status = Campaign.Status.FAILED
             campaign.sent_at = timezone.now()
@@ -376,11 +414,16 @@ def _finalize_campaign_delivery(*, campaign_id: int, claim_token: str) -> str | 
 
 
 def record_campaign_delivery_error(*, campaign_id: int, claim_token: str, error: Exception) -> None:
+    logger.warning(
+        "Campaign %s worker delivery failed (%s)",
+        campaign_id,
+        type(error).__name__,
+    )
     Campaign.objects.filter(
         pk=campaign_id,
         status=Campaign.Status.SENDING,
         send_claim_token=claim_token,
-    ).update(last_error=str(error)[:255])
+    ).update(last_error="delivery_failed")
 
 
 def dispatch_due_campaigns() -> int:
@@ -443,22 +486,22 @@ def update_template(*, template_id: int, fields: dict) -> MessageTemplate:
     return tpl
 
 
-def request_template_generation(*, template: MessageTemplate, requested_by=None):
+def request_template_generation(*, template: MessageTemplate, requested_by=None, requested_principal=None):
     """Ask the AI to draft the template's body from its purpose (low-cost). Budget-
     reserved + enqueued on commit; the task fills the body, which the staff then edits +
     reuses. Like every AI-gen feature the request is idempotent on its source — the AI
     drafts the body ONCE; to revise it, edit the body (PATCH) directly."""
     from apps.ai.models import AIFeature
-    from apps.ai.services import active_prompt, check_and_reserve_budget
+    from apps.ai.services import check_and_reserve_budget
     from core.utils import current_schema
 
-    prompt = active_prompt(AIFeature.TEMPLATE_GENERATION)
     ai_request = check_and_reserve_budget(
         feature=AIFeature.TEMPLATE_GENERATION,
-        estimated_tokens=prompt.token_cost_cap,
         requested_by=requested_by,
+        requested_principal=requested_principal,
         source_app="campaigns",
         source_id=template.id,
+        params={"name": template.name, "purpose": template.purpose},
     )
     if getattr(ai_request, "_should_enqueue", False):
         schema = current_schema()
@@ -478,7 +521,7 @@ def apply_generated_template(*, template_id: int, output_text: str) -> bool:
     """Write the AI's drafted text onto the template's body (F10-2). Locked + bounded;
     a vanished template is a no-op (returns False). Idempotent — a retry re-writes the
     same body."""
-    tpl = MessageTemplate.objects.select_for_update().filter(pk=template_id).first()
+    tpl = MessageTemplate.objects.select_for_update().filter(pk=template_id, is_active=True).first()
     if tpl is None:
         return False
     tpl.body = (output_text or "").strip()[:_MAX_TEMPLATE_CHARS]

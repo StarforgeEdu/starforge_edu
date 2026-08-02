@@ -13,10 +13,22 @@ from typing import Any
 
 from django.db.models import QuerySet
 
+from apps.intelligence.dto import ExecutiveSummaryContext
+
 
 class IIntelligenceService(ABC):
     @abstractmethod
-    def risk_list(self, *, students: QuerySet, include_finance: bool) -> dict[str, Any]: ...
+    def executive_summary(self, *, context: ExecutiveSummaryContext) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def risk_list(
+        self,
+        *,
+        students: QuerySet,
+        include_finance: bool,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]: ...
 
     @abstractmethod
     def risk_detail(self, *, student, include_finance: bool) -> dict[str, Any]: ...
@@ -31,7 +43,13 @@ class IIntelligenceService(ABC):
     def student_journey(self, *, student, include_finance: bool) -> dict[str, Any]: ...
 
     @abstractmethod
-    def teacher_engagement(self, *, teachers: QuerySet) -> dict[str, Any]: ...
+    def teacher_engagement(
+        self,
+        *,
+        teachers: QuerySet,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]: ...
 
     @abstractmethod
     def rules(self) -> dict[str, Any]: ...

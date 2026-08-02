@@ -13,6 +13,9 @@ urlpatterns = [
     path("exams/", views.exams_collection_view, name="exam-list"),
     path("exams/<int:pk>/results/import-csv/", views.exam_import_csv_view, name="exam-import-csv"),
     path("exams/<int:pk>/results/", views.exam_results_view, name="exam-results"),
+    path("exams/<int:pk>/readiness/", views.exam_readiness_view, name="exam-readiness"),
+    path("exams/<int:pk>/correct/", views.exam_correction_view, name="exam-correct"),
+    path("exams/<int:pk>/history/", views.exam_history_view, name="exam-history"),
     path("exams/<int:pk>/publish/", views.exam_publish_view, name="exam-publish"),
     path("exams/<int:pk>/", views.exam_detail_view, name="exam-detail"),
     # Grades (read-only computed) + recompute — recompute BEFORE the <pk> route
