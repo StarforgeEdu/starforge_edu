@@ -227,6 +227,11 @@ DROP FUNCTION IF EXISTS tasks_staff_principal_is_owned(text, bigint, bigint);
 
 
 class Migration(migrations.Migration):
+    # The principal backfill updates rows guarded by deferred foreign-key
+    # triggers. Commit those updates before PostgreSQL builds the following
+    # index and constraints, otherwise CREATE INDEX sees pending trigger events.
+    atomic = False
+
     dependencies = [
         ("staff_tasks", "0002_task_task_created_idx"),
         ("org", "0021_durable_center_settings"),

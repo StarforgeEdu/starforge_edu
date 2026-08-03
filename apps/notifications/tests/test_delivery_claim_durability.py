@@ -39,7 +39,7 @@ def test_provider_claim_schema_has_bounded_sweep_index_and_active_uniqueness():
     from apps.notifications.models import NotificationDelivery
 
     indexes = {index.name: index for index in NotificationDelivery._meta.indexes}
-    assert indexes["notif_delivery_status_created_idx"].fields == ["status", "created_at"]
+    assert indexes["notif_delivery_status_created"].fields == ["status", "created_at"]
     constraints = {constraint.name: constraint for constraint in NotificationDelivery._meta.constraints}
     claim_constraint = constraints["notif_one_provider_contact_per_destination"]
     assert claim_constraint.fields == ("notification", "channel", "delivery_key")

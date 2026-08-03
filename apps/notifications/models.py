@@ -339,7 +339,7 @@ class NotificationDelivery(models.Model):
             models.Index(fields=("notification", "channel")),
             models.Index(
                 fields=("status", "created_at"),
-                name="notif_delivery_status_created_idx",
+                name="notif_delivery_status_created",
             ),
             # Push dead-token tracking looks up the newest three attempts for one
             # provider device id. The id lives in JSON, so the ordinary delivery
