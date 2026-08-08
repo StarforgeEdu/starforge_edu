@@ -151,6 +151,8 @@ class CenterSettingsService(ICenterSettingsService):
 
     @staticmethod
     def _clean_allowed_file_types(raw: Any) -> list[str]:
+        from core.attachment_storage import allowed_attachment_mime_types
+
         if not isinstance(raw, list):
             raise _verr("allowed_file_types", "Must be a list of file-type slugs.")
         if len(raw) > 64:
@@ -166,6 +168,11 @@ class CenterSettingsService(ICenterSettingsService):
                 validate_slug(item)
             except DjangoValidationError as exc:
                 raise _verr("allowed_file_types", f"'{item}' is not a valid slug.") from exc
+            if not allowed_attachment_mime_types(f"upload.{item}"):
+                raise _verr(
+                    "allowed_file_types",
+                    f"'{item}' has no reviewed file-signature mapping.",
+                )
             if item in normalized:
                 raise _verr("allowed_file_types", "Duplicate file types are not allowed.")
             normalized.append(item)

@@ -40,6 +40,19 @@ class Sale(models.Model):
         "approvals.LedgerEntry", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
     sold_by = models.ForeignKey("users.User", on_delete=models.SET_NULL, null=True, related_name="+")
+    sold_by_principal_kind = models.CharField(max_length=16, blank=True, editable=False)
+    sold_by_principal_id = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    # Only a tenant/role-principal-scoped hash is retained. The raw retry key is
+    # capability-like input and must not appear in database dumps or admin pages.
+    idempotency_key_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        editable=False,
+    )
+    operation_fingerprint = models.CharField(max_length=64, blank=True, editable=False)
+    creation_response_snapshot = models.JSONField(null=True, blank=True, editable=False)
     refunded_by = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
@@ -57,6 +70,25 @@ class Sale(models.Model):
         constraints = [
             models.CheckConstraint(condition=models.Q(quantity__gt=0), name="sale_quantity_positive"),
             models.CheckConstraint(condition=models.Q(amount_uzs__gt=0), name="sale_amount_positive"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        sold_by_principal_kind="",
+                        sold_by_principal_id__isnull=True,
+                        idempotency_key_hash__isnull=True,
+                        operation_fingerprint="",
+                        creation_response_snapshot__isnull=True,
+                    )
+                    | (
+                        models.Q(sold_by_principal_kind__in=("staff", "teacher"))
+                        & models.Q(sold_by_principal_id__isnull=False)
+                        & models.Q(idempotency_key_hash__isnull=False)
+                        & ~models.Q(operation_fingerprint="")
+                        & models.Q(creation_response_snapshot__isnull=False)
+                    )
+                ),
+                name="sale_idempotency_shape",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover

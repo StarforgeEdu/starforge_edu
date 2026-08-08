@@ -34,6 +34,7 @@ from apps.content.storage_keys import (
 )
 from apps.org.models import CenterSettings
 from apps.org.selectors import get_center_settings
+from core.attachment_storage import allowed_attachment_mime_types
 from core.exceptions import (
     ConflictException,
     NotFoundException,
@@ -52,18 +53,6 @@ from infrastructure.storage.s3_client import (
     upload_bytes,
 )
 
-# Declared content-type must be consistent with the extension for known types.
-_EXT_MIME: dict[str, set[str]] = {
-    "pdf": {"application/pdf"},
-    "mp4": {"video/mp4"},
-    "pptx": {"application/vnd.openxmlformats-officedocument.presentationml.presentation"},
-    "docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
-    "mp3": {"audio/mpeg"},
-    "jpg": {"image/jpeg"},
-    "jpeg": {"image/jpeg"},
-    "png": {"image/png"},
-    "webp": {"image/webp"},
-}
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 _THUMB_MAX_EDGE = 320
 _IMAGE_MAX_PIXELS = 25_000_000
@@ -112,8 +101,14 @@ def _validate_upload_inputs(*, filename: str, content_type: str, size_bytes: int
             code="file_type_not_allowed",
             fields={"filename": [f"Extension '.{ext}' is not allowed."]},
         )
-    expected = _EXT_MIME.get(ext)
-    if expected is not None and content_type not in expected:
+    expected = allowed_attachment_mime_types(filename)
+    if not expected:
+        raise UnprocessableEntity(
+            _("That file type is not supported for uploads."),
+            code="file_type_not_allowed",
+            fields={"filename": [f"Extension '.{ext}' has no reviewed file signature."]},
+        )
+    if content_type not in expected:
         raise UnprocessableEntity(
             _("The declared content type does not match the file extension."),
             code="file_type_not_allowed",
@@ -250,12 +245,10 @@ def _ext_of(filename: str) -> str:
 
 def _sniff_matches(*, sniffed: str, declared: str, ext: str) -> bool:
     """The libmagic sniff must match the exact MIME(s) allowed for the file's
-    extension (D2-E-4); fall back to the declared family for extensions not in
-    `_EXT_MIME` (no exact map to enforce)."""
-    expected = _EXT_MIME.get(ext)
-    if expected is not None:
-        return sniffed in expected
-    return sniffed.split("/")[0] == declared.split("/")[0]
+    extension (D2-E-4). Unknown organization-configured extensions fail closed
+    instead of relying on a broad top-level MIME family."""
+    expected = allowed_attachment_mime_types(f"upload.{ext}")
+    return bool(expected) and declared in expected and sniffed in expected
 
 
 def _bounded_image_payload(key: str, *, max_bytes: int) -> bytes:

@@ -13,19 +13,21 @@ from decimal import Decimal
 from typing import Any
 
 from django.http import HttpRequest, HttpResponse
-from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.sales.dto.sale_dto import RecordSaleDTO
 from apps.sales.interfaces.services import ISaleService
-from apps.sales.presenters import sale_to_dict
+from apps.sales.openapi_contracts import SALES_COLLECTION_CONTRACTS
+from apps.sales.presenters import sale_creation_to_dict, sale_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
-from core.exceptions import NotFoundException, PermissionException, ValidationException
-from core.http import decimal_field, int_field, read_json, trimmed_str_field
+from core.exceptions import NotFoundException, ValidationException
+from core.http import decimal_field, int_field, read_json, reject_unknown_fields, trimmed_str_field
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.responses import created, error, paginated, success
+from core.role_principals import STAFF_PRINCIPAL_KINDS, request_role_principal
 from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 
 _RESOURCE = "sale"
@@ -47,6 +49,10 @@ def _scope(request: HttpRequest, permission: str) -> tuple[bool, set[int]]:
     )
 
 
+@openapi_contract(
+    path="/api/v1/sales/",
+    operations=SALES_COLLECTION_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def sales_collection_view(request: HttpRequest) -> HttpResponse:
@@ -64,7 +70,7 @@ def sales_collection_view(request: HttpRequest) -> HttpResponse:
         return paginated([sale_to_dict(s) for s in items], total=total, page=page, page_size=size)
     if request.method == "POST":
         check_perm(request, f"{_RESOURCE}:write")
-        return _create_sale(request)
+        return _create_sale(request, body=read_json(request))
     return error("Method not allowed.", code="method_not_allowed", status=405)
 
 
@@ -101,8 +107,11 @@ def sale_refund_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 # --- helpers ---------------------------------------------------------------
-def _create_sale(request: HttpRequest) -> HttpResponse:
-    body = read_json(request)
+def _create_sale(request: HttpRequest, *, body: dict[str, Any]) -> HttpResponse:
+    reject_unknown_fields(
+        body,
+        allowed={"item", "quantity", "unit_price_uzs", "student", "payment_method", "note"},
+    )
     item = trimmed_str_field(body, "item", max_length=200, required=True)
     if not item:
         raise ValidationException(
@@ -133,14 +142,8 @@ def _create_sale(request: HttpRequest) -> HttpResponse:
 
     student = _service().get_student(student_id=student_id)  # type: ignore[arg-type]
     if student is None:
-        raise ValidationException(
-            "Unknown student.", code="validation_error", fields={"student": ["No such student."]}
-        )
+        raise NotFoundException(code="not_found")
     unscoped, branch_ids = _scope(request, "sale:write")
-    if not unscoped and student.branch_id not in branch_ids:
-        raise PermissionException(
-            _("You can only sell to a student in your own branch."), code="branch_out_of_scope"
-        )
 
     dto = RecordSaleDTO(
         item=item,
@@ -149,5 +152,13 @@ def _create_sale(request: HttpRequest) -> HttpResponse:
         payment_method_id=payment_method_id,  # type: ignore[arg-type]  # required=True -> never None
         note=trimmed_str_field(body, "note", max_length=255),
     )
-    sale = _service().record(dto, student=student, sold_by=request.user)
-    return created(sale_to_dict(sale))
+    sale = _service().record(
+        dto,
+        student=student,
+        sold_by=request.user,
+        principal=request_role_principal(request, allowed_kinds=STAFF_PRINCIPAL_KINDS),
+        idempotency_key=request.headers.get("Idempotency-Key", ""),
+        is_unscoped=unscoped,
+        branch_ids=branch_ids,
+    )
+    return created(sale_creation_to_dict(sale))

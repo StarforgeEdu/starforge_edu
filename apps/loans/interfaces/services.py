@@ -12,6 +12,7 @@ from apps.loans.dto.loan_dto import CreateLoanDTO
 from apps.loans.models import LoanRepayment
 from apps.org.models import Branch
 from apps.users.models import User
+from core.role_principals import RolePrincipal
 
 
 class ILoanService(ABC):
@@ -50,5 +51,15 @@ class ILoanService(ABC):
 
     @abstractmethod
     def repay(
-        self, *, loan_id: int, amount_uzs: Decimal, payment_method_id: int, actor, note: str
+        self,
+        *,
+        loan_id: int,
+        amount_uzs: Decimal,
+        payment_method_id: int,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+        note: str,
     ) -> LoanRepayment: ...

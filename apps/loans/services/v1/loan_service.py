@@ -15,6 +15,7 @@ from apps.loans.models import LoanRepayment
 from apps.loans.services import record_repayment, request_loan
 from apps.org.models import Branch
 from apps.users.models import User
+from core.role_principals import RolePrincipal
 
 
 class LoanService(ILoanService):
@@ -67,12 +68,26 @@ class LoanService(ILoanService):
         )
 
     def repay(
-        self, *, loan_id: int, amount_uzs: Decimal, payment_method_id: int, actor, note: str
+        self,
+        *,
+        loan_id: int,
+        amount_uzs: Decimal,
+        payment_method_id: int,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+        note: str,
     ) -> LoanRepayment:
         return record_repayment(
             loan_id=loan_id,
             amount_uzs=amount_uzs,
             payment_method_id=payment_method_id,
             actor=actor,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            is_unscoped=is_unscoped,
+            branch_ids=branch_ids,
             note=note,
         )

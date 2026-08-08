@@ -37,3 +37,29 @@ def sale_to_dict(sale: Sale) -> dict:
         "note": sale.note,
         "created_at": sale.created_at.isoformat(),
     }
+
+
+def sale_creation_to_dict(sale: Sale) -> dict:
+    """Return the immutable result of the sale-creation operation.
+
+    A later refund mutates workflow fields on ``Sale``. An exact response-loss
+    retry of POST /sales/ must nevertheless reproduce the original successful
+    creation response, not make it look as if the retry performed the refund.
+    """
+
+    if isinstance(sale.creation_response_snapshot, dict):
+        return dict(sale.creation_response_snapshot)
+
+    # Compatibility for pre-cutover rows, which cannot be reached by a keyed
+    # replay but remain renderable in migrations/admin repair tooling.
+    payload = sale_to_dict(sale)
+    payload.update(
+        {
+            "status": Sale.Status.COMPLETED,
+            "refund_ledger_entry": None,
+            "refunded_by": None,
+            "refunded_at": None,
+            "refund_reason": "",
+        }
+    )
+    return payload

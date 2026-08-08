@@ -18,7 +18,8 @@ from apps.cards.interfaces.repositories import (
 from apps.cards.interfaces.services import ICardService, ICardTypeService, IWalletService
 from apps.cards.models import Card, CardType, WalletTransaction
 from apps.students.models import StudentProfile
-from core.exceptions import NotFoundException, PermissionException
+from core.exceptions import NotFoundException
+from core.role_principals import RolePrincipal
 
 
 class CardTypeService(ICardTypeService):
@@ -112,22 +113,72 @@ class WalletService(IWalletService):
         if student is None:
             raise NotFoundException(_("Student not found."), code="student_not_found")
         if not is_director and student.branch_id not in branch_ids:
-            raise PermissionException(
-                _("You can only manage a student in your own branch."), code="branch_out_of_scope"
-            )
+            raise NotFoundException(_("Student not found."), code="student_not_found")
         return student
 
-    def top_up(self, data: WalletAmountDTO, *, student, actor) -> WalletTransaction:
-        return domain.top_up(student=student, amount=data.amount, actor=actor, note=data.note)
-
-    def spend(self, data: WalletAmountDTO, *, student, actor) -> WalletTransaction:
-        return domain.spend(student=student, amount=data.amount, actor=actor, note=data.note)
-
-    def refund(self, data: WalletAmountDTO, *, student, actor) -> WalletTransaction:
+    def top_up(
+        self,
+        data: WalletAmountDTO,
+        *,
+        student,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> WalletTransaction:
         return domain.top_up(
             student=student,
             amount=data.amount,
             actor=actor,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            is_unscoped=is_unscoped,
+            branch_ids=branch_ids,
+            note=data.note,
+        )
+
+    def spend(
+        self,
+        data: WalletAmountDTO,
+        *,
+        student,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> WalletTransaction:
+        return domain.spend(
+            student=student,
+            amount=data.amount,
+            actor=actor,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            is_unscoped=is_unscoped,
+            branch_ids=branch_ids,
+            note=data.note,
+        )
+
+    def refund(
+        self,
+        data: WalletAmountDTO,
+        *,
+        student,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> WalletTransaction:
+        return domain.top_up(
+            student=student,
+            amount=data.amount,
+            actor=actor,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            is_unscoped=is_unscoped,
+            branch_ids=branch_ids,
             note=data.note,
             refund=True,
         )

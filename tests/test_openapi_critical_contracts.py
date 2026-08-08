@@ -562,6 +562,37 @@ def test_compensation_contract_is_separate_typed_and_idempotent():
     )
 
 
+def test_wallet_mutations_publish_mandatory_retry_key_and_closed_dto():
+    schema = build_schema(None)
+    request_schema = schema["components"]["schemas"]["WalletAmountRequest"]
+    assert request_schema["additionalProperties"] is False
+    assert request_schema["required"] == ["amount"]
+    assert set(request_schema["properties"]) == {"amount", "note"}
+
+    for action in ("topup", "spend", "refund"):
+        path = schema["paths"][f"/api/v1/cards/wallets/{{student_id}}/{action}/"]
+        assert _operation_methods(path) == {"post"}
+        operation = path["post"]
+        assert operation["security"] == [
+            {"sessionAuth": []},
+            {"cookieSession": [], "csrfHeader": []},
+        ]
+        parameters = {parameter["name"]: parameter for parameter in operation["parameters"]}
+        assert set(parameters) == {"student_id", "Idempotency-Key"}
+        assert parameters["Idempotency-Key"]["required"] is True
+        assert parameters["Idempotency-Key"]["schema"] == {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 128,
+        }
+        assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/WalletAmountRequest"
+        }
+        assert {"201", "400", "401", "402", "403", "404", "409", "422", "429"}.issubset(
+            operation["responses"]
+        )
+
+
 def test_runtime_gate_responses_and_warning_dtos_are_published_globally():
     schema = build_schema(None)
     paths = schema["paths"]

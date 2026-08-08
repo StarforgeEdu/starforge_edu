@@ -39,6 +39,34 @@ class LoanRepayment(models.Model):
         "approvals.LedgerEntry", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
     recorded_by = models.ForeignKey("users.User", on_delete=models.SET_NULL, null=True, related_name="+")
+    recorded_by_principal_kind = models.CharField(max_length=16, blank=True, editable=False)
+    recorded_by_principal_id = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    idempotency_key_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        editable=False,
+    )
+    operation_fingerprint = models.CharField(max_length=64, blank=True, editable=False)
+    response_snapshot = models.JSONField(null=True, blank=True, editable=False)
+    # Stable aggregate values returned by POST /repay/.  A later repayment must
+    # not make an exact response-loss retry appear to have created a different
+    # result.
+    repaid_after_uzs = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+    outstanding_after_uzs = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        editable=False,
+    )
     note = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -50,6 +78,29 @@ class LoanRepayment(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(amount_uzs__gt=0), name="loan_repayment_amount_positive"
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        recorded_by_principal_kind="",
+                        recorded_by_principal_id__isnull=True,
+                        idempotency_key_hash__isnull=True,
+                        operation_fingerprint="",
+                        response_snapshot__isnull=True,
+                        repaid_after_uzs__isnull=True,
+                        outstanding_after_uzs__isnull=True,
+                    )
+                    | (
+                        models.Q(recorded_by_principal_kind__in=("staff", "teacher"))
+                        & models.Q(recorded_by_principal_id__isnull=False)
+                        & models.Q(idempotency_key_hash__isnull=False)
+                        & ~models.Q(operation_fingerprint="")
+                        & models.Q(response_snapshot__isnull=False)
+                        & models.Q(repaid_after_uzs__isnull=False)
+                        & models.Q(outstanding_after_uzs__isnull=False)
+                    )
+                ),
+                name="loan_repay_idempotency_shape",
             ),
         ]
 

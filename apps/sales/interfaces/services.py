@@ -9,6 +9,7 @@ from django.db.models import QuerySet
 from apps.sales.dto.sale_dto import RecordSaleDTO
 from apps.sales.models import Sale
 from apps.students.models import StudentProfile
+from core.role_principals import RolePrincipal
 
 
 class ISaleService(ABC):
@@ -22,7 +23,17 @@ class ISaleService(ABC):
     def get_student(self, *, student_id: int) -> StudentProfile | None: ...
 
     @abstractmethod
-    def record(self, data: RecordSaleDTO, *, student, sold_by) -> Sale: ...
+    def record(
+        self,
+        data: RecordSaleDTO,
+        *,
+        student,
+        sold_by,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> Sale: ...
 
     @abstractmethod
     def refund(self, sale: Sale, *, actor, reason: str) -> Sale: ...

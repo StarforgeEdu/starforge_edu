@@ -43,8 +43,10 @@ class LoanRepository(BaseRepository[ApprovalRequest], ILoanRepository):
         if is_unscoped:
             return qs
         if is_collector:
-            # Finance handlers see their branches' loans (plus centre-wide ones).
-            return qs.filter(Q(branch_id__in=branch_ids) | Q(branch__isnull=True))
+            # Null-branch legacy money has no reviewed ownership snapshot. Keep it
+            # quarantined from every scoped handler until an explicit backfill
+            # resolves it; only genuinely tenant-wide authority may see it.
+            return qs.filter(branch_id__in=branch_ids)
         # A borrower sees only their own loans (raised by or for them).
         return qs.filter(Q(requested_by=user) | Q(payload__borrower_id=user.id))
 

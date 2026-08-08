@@ -18,7 +18,13 @@ from django.views.decorators.csrf import csrf_exempt
 
 from apps.cards.dto.card_dto import WalletAmountDTO
 from apps.cards.interfaces.services import ICardService, ICardTypeService, IWalletService
-from apps.cards.openapi_contracts import STUDENT_WALLET_CONTRACTS, WALLET_ME_CONTRACTS
+from apps.cards.openapi_contracts import (
+    STUDENT_WALLET_CONTRACTS,
+    WALLET_ME_CONTRACTS,
+    WALLET_REFUND_CONTRACTS,
+    WALLET_SPEND_CONTRACTS,
+    WALLET_TOPUP_CONTRACTS,
+)
 from apps.cards.presenters import (
     card_scan_to_dict,
     card_to_dict,
@@ -36,6 +42,7 @@ from core.listing import apply_filters, paginate
 from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles, has_permission_code
 from core.responses import created, error, paginated, success
+from core.role_principals import STAFF_PRINCIPAL_KINDS, request_role_principal
 from core.scoping import is_permission_unscoped, permission_membership_branch_ids
 
 _MIN_AMOUNT = Decimal("0.01")
@@ -269,40 +276,78 @@ def student_wallet_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "wallet:read")
-    student = _student_in_scope(request, student_id, "wallet:read")
+    student, _is_unscoped, _branch_ids = _student_in_scope(
+        request, student_id, "wallet:read"
+    )
     return success(wallet_payload_to_dict(_wallet_service().wallet_payload(student=student)))
 
 
+@openapi_contract(
+    path="/api/v1/cards/wallets/{student_id}/topup/",
+    operations=WALLET_TOPUP_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def wallet_topup_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "wallet:write")
-    student = _student_in_scope(request, student_id, "wallet:write")
-    txn = _wallet_service().top_up(_amount_dto(read_json(request)), student=student, actor=request.user)
+    student, is_unscoped, branch_ids = _student_in_scope(request, student_id, "wallet:write")
+    txn = _wallet_service().top_up(
+        _amount_dto(read_json(request)),
+        student=student,
+        actor=request.user,
+        principal=request_role_principal(request, allowed_kinds=STAFF_PRINCIPAL_KINDS),
+        idempotency_key=request.headers.get("Idempotency-Key", ""),
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+    )
     return created(wallet_txn_to_dict(txn))
 
 
+@openapi_contract(
+    path="/api/v1/cards/wallets/{student_id}/spend/",
+    operations=WALLET_SPEND_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def wallet_spend_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "wallet:write")
-    student = _student_in_scope(request, student_id, "wallet:write")
-    txn = _wallet_service().spend(_amount_dto(read_json(request)), student=student, actor=request.user)
+    student, is_unscoped, branch_ids = _student_in_scope(request, student_id, "wallet:write")
+    txn = _wallet_service().spend(
+        _amount_dto(read_json(request)),
+        student=student,
+        actor=request.user,
+        principal=request_role_principal(request, allowed_kinds=STAFF_PRINCIPAL_KINDS),
+        idempotency_key=request.headers.get("Idempotency-Key", ""),
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+    )
     return created(wallet_txn_to_dict(txn))
 
 
+@openapi_contract(
+    path="/api/v1/cards/wallets/{student_id}/refund/",
+    operations=WALLET_REFUND_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def wallet_refund_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method != "POST":
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "wallet:write")
-    student = _student_in_scope(request, student_id, "wallet:write")
-    txn = _wallet_service().refund(_amount_dto(read_json(request)), student=student, actor=request.user)
+    student, is_unscoped, branch_ids = _student_in_scope(request, student_id, "wallet:write")
+    txn = _wallet_service().refund(
+        _amount_dto(read_json(request)),
+        student=student,
+        actor=request.user,
+        principal=request_role_principal(request, allowed_kinds=STAFF_PRINCIPAL_KINDS),
+        idempotency_key=request.headers.get("Idempotency-Key", ""),
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+    )
     return created(wallet_txn_to_dict(txn))
 
 
@@ -334,12 +379,20 @@ def _issue_card(request: HttpRequest) -> HttpResponse:
 
 def _student_in_scope(request: HttpRequest, student_id: int, permission: str):
     is_director, branch_ids = _wallet_scope(request, permission)
-    return _wallet_service().get_student_in_scope(
+    student = _wallet_service().get_student_in_scope(
         student_id=student_id, is_director=is_director, branch_ids=branch_ids
     )
+    return student, is_director, branch_ids
 
 
 def _amount_dto(body: dict[str, Any]) -> WalletAmountDTO:
+    unknown = sorted(set(body) - {"amount", "note"})
+    if unknown:
+        raise ValidationException(
+            "Unknown wallet-operation field.",
+            code="validation_error",
+            fields={field: ["Unknown field."] for field in unknown},
+        )
     amount = decimal_field(body, "amount", max_digits=18)
     if amount is None or amount < _MIN_AMOUNT:
         raise ValidationException(

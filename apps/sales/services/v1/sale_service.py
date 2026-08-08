@@ -11,6 +11,7 @@ from apps.sales.interfaces.services import ISaleService
 from apps.sales.models import Sale
 from apps.sales.services import record_sale, refund_sale
 from apps.students.models import StudentProfile
+from core.role_principals import RolePrincipal
 
 
 class SaleService(ISaleService):
@@ -26,7 +27,17 @@ class SaleService(ISaleService):
     def get_student(self, *, student_id: int) -> StudentProfile | None:
         return self.repository.get_student(student_id=student_id)
 
-    def record(self, data: RecordSaleDTO, *, student, sold_by) -> Sale:
+    def record(
+        self,
+        data: RecordSaleDTO,
+        *,
+        student,
+        sold_by,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> Sale:
         return record_sale(
             item=data.item,
             quantity=data.quantity,
@@ -34,6 +45,10 @@ class SaleService(ISaleService):
             student=student,
             payment_method_id=data.payment_method_id,
             sold_by=sold_by,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            is_unscoped=is_unscoped,
+            branch_ids=branch_ids,
             note=data.note,
         )
 

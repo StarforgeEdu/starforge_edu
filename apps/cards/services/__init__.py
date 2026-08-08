@@ -2,20 +2,31 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 from decimal import Decimal, InvalidOperation
 
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from apps.cards.models import Card, CardScan, CardType, Wallet, WalletTransaction
-from core.exceptions import NotFoundException, UnprocessableEntity
+from core.exceptions import (
+    ConflictException,
+    NotFoundException,
+    PermissionException,
+    UnprocessableEntity,
+    ValidationException,
+)
+from core.role_principals import RolePrincipal
+from core.utils import current_schema, stable_hash
 
 logger = logging.getLogger(__name__)
 
 _CENT = Decimal("0.01")
+_IDEMPOTENCY_KEY_MIN_LENGTH = 16
+_IDEMPOTENCY_KEY_MAX_LENGTH = 128
 
 
 @transaction.atomic
@@ -151,7 +162,17 @@ def _locked_wallet(student) -> Wallet:
     return Wallet.objects.select_for_update().get(student=student)
 
 
-def _post(wallet: Wallet, *, kind, amount: Decimal, actor, note: str) -> WalletTransaction:
+def _post(
+    wallet: Wallet,
+    *,
+    kind: str,
+    amount: Decimal,
+    actor,
+    principal: RolePrincipal,
+    note: str,
+    idempotency_key_hash: str,
+    operation_fingerprint: str,
+) -> WalletTransaction:
     wallet.save(update_fields=["balance_uzs", "updated_at"])
     return WalletTransaction.objects.create(
         wallet=wallet,
@@ -159,35 +180,237 @@ def _post(wallet: Wallet, *, kind, amount: Decimal, actor, note: str) -> WalletT
         amount_uzs=amount,
         balance_after_uzs=wallet.balance_uzs,
         created_by=actor,
+        actor_principal_kind=principal.kind,
+        actor_principal_id=principal.principal_id,
+        idempotency_key_hash=idempotency_key_hash,
+        operation_fingerprint=operation_fingerprint,
         note=(note or "")[:255],
     )
 
 
-@transaction.atomic
-def top_up(*, student, amount, actor=None, note: str = "", refund: bool = False) -> WalletTransaction:
-    """Load money onto a student's wallet (or REFUND money back). Locked balance update +
-    an append-only transaction. `refund=True` records it as a refund rather than a top-up."""
-    amt = _clean_amount(amount)
-    wallet = _locked_wallet(student)
-    new_balance = wallet.balance_uzs + amt
-    # NUMERIC(18,2) ceiling: a single amount is bounded, but the CUMULATIVE balance must
-    # be too — reject an overflowing total as a clean 422 rather than a DB-overflow 500.
-    if new_balance >= Decimal("1e16"):
-        raise UnprocessableEntity(
-            _("That would exceed the wallet's maximum balance."), code="balance_overflow"
+def validate_wallet_idempotency_key(raw: str | None) -> str:
+    """Return one canonical client retry key without ever normalizing ambiguity away."""
+
+    if (
+        not isinstance(raw, str)
+        or not _IDEMPOTENCY_KEY_MIN_LENGTH <= len(raw) <= _IDEMPOTENCY_KEY_MAX_LENGTH
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in raw)
+    ):
+        raise ValidationException(
+            _("Idempotency-Key must contain 16 to 128 visible ASCII characters."),
+            code="invalid_idempotency_key",
+            fields={"Idempotency-Key": [_("Use 16 to 128 visible ASCII characters.")]},
         )
-    wallet.balance_uzs = new_balance
-    kind = WalletTransaction.Kind.REFUND if refund else WalletTransaction.Kind.TOPUP
-    return _post(wallet, kind=kind, amount=amt, actor=actor, note=note)
+    return raw
+
+
+def _wallet_key_hash(*, principal: RolePrincipal, raw: str) -> str:
+    return stable_hash(
+        f"wallet-key:v1:{current_schema()}:{principal.kind}:{principal.principal_id}:{raw}"
+    )
+
+
+def _wallet_operation_fingerprint(
+    *,
+    kind: str,
+    student_id: int,
+    amount: Decimal,
+    note: str,
+) -> str:
+    payload = {
+        "amount_uzs": str(amount),
+        "kind": kind,
+        "note": note,
+        "student_id": student_id,
+    }
+    return stable_hash(
+        "wallet-operation:v1:"
+        + json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    )
+
+
+def _lock_wallet_operation(*, principal: RolePrincipal, key_hash: str) -> None:
+    """Serialize one principal/key before any balance mutation.
+
+    The unique constraint is the durable backstop.  The transaction-scoped advisory
+    lock also makes a concurrent retry return the committed winner instead of first
+    executing a second balance change and then colliding at insert time.
+    """
+
+    lock_hash = stable_hash(
+        f"wallet-lock:v1:{current_schema()}:{principal.kind}:{principal.principal_id}:{key_hash}"
+    )
+    lock_id = int(lock_hash[:15], 16)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", [lock_id])
+
+
+def _existing_wallet_operation(
+    *,
+    principal: RolePrincipal,
+    key_hash: str,
+    operation_fingerprint: str,
+) -> WalletTransaction | None:
+    existing = WalletTransaction.objects.filter(idempotency_key_hash=key_hash).first()
+    if existing is None:
+        return None
+    if (
+        existing.actor_principal_kind != principal.kind
+        or existing.actor_principal_id != principal.principal_id
+        or existing.operation_fingerprint != operation_fingerprint
+    ):
+        raise ConflictException(
+            _("This idempotency key belongs to a different wallet operation."),
+            code="idempotency_key_reused",
+        )
+    return existing
+
+
+def _assert_actor_matches_principal(*, actor, principal: RolePrincipal) -> None:
+    if getattr(actor, "pk", None) != principal.user_id:
+        raise PermissionException(
+            _("This wallet operation is unavailable for the active account session."),
+            code="principal_unavailable",
+        )
+
+
+def _locked_student_in_scope(
+    *, student_id: int, is_unscoped: bool, branch_ids: set[int]
+):
+    """Lock and reauthorize the student's current placement inside the money transaction."""
+
+    from apps.students.models import StudentProfile
+
+    student = (
+        StudentProfile.objects.select_for_update()
+        .only("pk", "branch_id")
+        .filter(pk=student_id)
+        .first()
+    )
+    if student is None or (not is_unscoped and student.branch_id not in branch_ids):
+        # Absent and out-of-scope identifiers are intentionally indistinguishable.
+        raise NotFoundException(_("Student not found."), code="student_not_found")
+    return student
 
 
 @transaction.atomic
-def spend(*, student, amount, actor=None, note: str = "") -> WalletTransaction:
+def _wallet_operation(
+    *,
+    student,
+    amount,
+    actor,
+    principal: RolePrincipal,
+    idempotency_key: str,
+    is_unscoped: bool,
+    branch_ids: set[int],
+    note: str,
+    kind: str,
+) -> WalletTransaction:
+    _assert_actor_matches_principal(actor=actor, principal=principal)
+    amt = _clean_amount(amount)
+    clean_note = (note or "")[:255]
+    raw_key = validate_wallet_idempotency_key(idempotency_key)
+    key_hash = _wallet_key_hash(principal=principal, raw=raw_key)
+    fingerprint = _wallet_operation_fingerprint(
+        kind=kind,
+        student_id=student.pk,
+        amount=amt,
+        note=clean_note,
+    )
+    # The view's scope check is a fast rejection only. A student can transfer
+    # concurrently, so lock and recheck current placement before replay lookup
+    # or any wallet mutation.
+    locked_student = _locked_student_in_scope(
+        student_id=student.pk,
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+    )
+    _lock_wallet_operation(principal=principal, key_hash=key_hash)
+    existing = _existing_wallet_operation(
+        principal=principal,
+        key_hash=key_hash,
+        operation_fingerprint=fingerprint,
+    )
+    if existing is not None:
+        return existing
+
+    wallet = _locked_wallet(locked_student)
+    if kind == WalletTransaction.Kind.SPEND:
+        if wallet.balance_uzs < amt:
+            raise UnprocessableEntity(
+                _("Insufficient wallet balance."), code="insufficient_funds"
+            )
+        wallet.balance_uzs -= amt
+    else:
+        new_balance = wallet.balance_uzs + amt
+        # NUMERIC(18,2) ceiling: a single amount is bounded, but the CUMULATIVE
+        # balance must be too — reject a clean 422 rather than a DB-overflow 500.
+        if new_balance >= Decimal("1e16"):
+            raise UnprocessableEntity(
+                _("That would exceed the wallet's maximum balance."), code="balance_overflow"
+            )
+        wallet.balance_uzs = new_balance
+    return _post(
+        wallet,
+        kind=kind,
+        amount=amt,
+        actor=actor,
+        principal=principal,
+        note=clean_note,
+        idempotency_key_hash=key_hash,
+        operation_fingerprint=fingerprint,
+    )
+
+
+def top_up(
+    *,
+    student,
+    amount,
+    actor,
+    principal: RolePrincipal,
+    idempotency_key: str,
+    is_unscoped: bool,
+    branch_ids: set[int],
+    note: str = "",
+    refund: bool = False,
+) -> WalletTransaction:
+    """Load or refund once for an exact principal/key/body tuple."""
+
+    return _wallet_operation(
+        student=student,
+        amount=amount,
+        actor=actor,
+        principal=principal,
+        idempotency_key=idempotency_key,
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+        note=note,
+        kind=WalletTransaction.Kind.REFUND if refund else WalletTransaction.Kind.TOPUP,
+    )
+
+
+def spend(
+    *,
+    student,
+    amount,
+    actor,
+    principal: RolePrincipal,
+    idempotency_key: str,
+    is_unscoped: bool,
+    branch_ids: set[int],
+    note: str = "",
+) -> WalletTransaction:
     """Charge a student's wallet (e.g. a canteen purchase). The row lock + the
     insufficient-funds check make an overdraw impossible even under concurrent spends."""
-    amt = _clean_amount(amount)
-    wallet = _locked_wallet(student)
-    if wallet.balance_uzs < amt:
-        raise UnprocessableEntity(_("Insufficient wallet balance."), code="insufficient_funds")
-    wallet.balance_uzs = wallet.balance_uzs - amt
-    return _post(wallet, kind=WalletTransaction.Kind.SPEND, amount=amt, actor=actor, note=note)
+
+    return _wallet_operation(
+        student=student,
+        amount=amount,
+        actor=actor,
+        principal=principal,
+        idempotency_key=idempotency_key,
+        is_unscoped=is_unscoped,
+        branch_ids=branch_ids,
+        note=note,
+        kind=WalletTransaction.Kind.SPEND,
+    )

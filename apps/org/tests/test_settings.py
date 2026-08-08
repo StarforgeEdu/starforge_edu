@@ -176,6 +176,13 @@ def test_settings_json_policy_is_bounded_and_normalized(as_role):
         ).status_code
         == 400
     )
+    unsupported = client.patch(
+        URL,
+        {"allowed_file_types": ["pdf", "exe"]},
+        format="json",
+    )
+    assert unsupported.status_code == 400
+    assert "allowed_file_types" in unsupported.json()["errors"]
 
 
 def test_settings_and_system_control_require_organization_wide_grants(

@@ -17,7 +17,15 @@ from django.utils.translation import gettext_lazy as _
 from apps.approvals.models import ApprovalRequest, LedgerEntry
 from apps.approvals.services import KIND_LOAN, create_request
 from apps.loans.models import LoanRepayment
-from core.exceptions import NotFoundException, UnprocessableEntity
+from core.exceptions import ConflictException, NotFoundException, UnprocessableEntity
+from core.idempotency import (
+    assert_principal_actor,
+    lock_idempotency_key,
+    operation_fingerprint,
+    principal_scoped_key_hash,
+    validate_idempotency_key,
+)
+from core.role_principals import STAFF_PRINCIPAL_KINDS, RolePrincipal
 
 
 def request_loan(
@@ -68,14 +76,65 @@ def _locked_loan(loan_id: int) -> ApprovalRequest:
 
 @transaction.atomic
 def record_repayment(
-    *, loan_id: int, amount_uzs: Decimal, payment_method_id: int, actor=None, note: str = ""
+    *,
+    loan_id: int,
+    amount_uzs: Decimal,
+    payment_method_id: int,
+    actor,
+    principal: RolePrincipal,
+    idempotency_key: str,
+    is_unscoped: bool,
+    branch_ids: set[int],
+    note: str = "",
 ) -> LoanRepayment:
     """Record a repayment against a disbursed loan: writes one immutable money-IN
     LedgerEntry and links it. The loan row is locked, so two concurrent repayments
     serialize and can never together exceed the outstanding balance."""
     from apps.finance.models import PaymentMethod
 
+    assert_principal_actor(
+        actor=actor,
+        principal=principal,
+        allowed_kinds=STAFF_PRINCIPAL_KINDS,
+    )
+    amount = amount_uzs.quantize(Decimal("0.01"))
+    clean_note = (note or "")[:255]
+    raw_key = validate_idempotency_key(idempotency_key)
+    key_hash = principal_scoped_key_hash(namespace="loan-repayment", principal=principal, raw=raw_key)
+    fingerprint = operation_fingerprint(
+        namespace="loan-repayment",
+        action="repay",
+        resource={"loan_id": loan_id},
+        body={
+            "amount_uzs": str(amount),
+            "note": clean_note,
+            "payment_method_id": payment_method_id,
+        },
+    )
+    lock_idempotency_key(namespace="loan-repayment", principal=principal, key_hash=key_hash)
     loan = _locked_loan(loan_id)
+    # Match the collector repository's current visibility against the locked row.
+    # Null-branch legacy money stays quarantined from scoped handlers until its
+    # historical ownership has been reviewed and backfilled.
+    if not is_unscoped and loan.branch_id not in branch_ids:
+        raise NotFoundException(code="not_found")
+
+    existing = LoanRepayment.objects.filter(idempotency_key_hash=key_hash).first()
+    if existing is not None:
+        if (
+            existing.recorded_by_principal_kind != principal.kind
+            or existing.recorded_by_principal_id != principal.principal_id
+            or existing.operation_fingerprint != fingerprint
+        ):
+            raise ConflictException(
+                _("This idempotency key belongs to a different loan repayment."),
+                code="idempotency_key_reused",
+            )
+        # Current collection scope was rechecked against the locked loan above. Return
+        # before mutable loan/provider validation so a settled loan or retired payment
+        # method cannot make a successful response-loss retry fail.
+        return existing
+
     if loan.status != ApprovalRequest.Status.DISBURSED:
         raise UnprocessableEntity(_("Only a disbursed loan can be repaid."), code="loan_not_disbursed")
     if loan.amount_uzs is None:  # a disbursed loan always carries its amount; defensive
@@ -84,7 +143,7 @@ def record_repayment(
     outstanding = loan.amount_uzs - repaid_total(loan)
     if outstanding <= 0:
         raise UnprocessableEntity(_("This loan is already settled."), code="loan_already_settled")
-    if amount_uzs > outstanding:
+    if amount > outstanding:
         raise UnprocessableEntity(
             _("A repayment cannot exceed the outstanding balance."), code="loan_repayment_exceeds"
         )
@@ -96,7 +155,7 @@ def record_repayment(
     entry = LedgerEntry.objects.create(
         direction=LedgerEntry.Direction.IN,
         entry_type="loan_repayment",
-        amount_uzs=amount_uzs,
+        amount_uzs=amount,
         branch=loan.branch,
         # Name the borrower (stamped into the payload at request time), so the IN
         # rows reconcile against the OUT disbursement for the same person.
@@ -108,15 +167,31 @@ def record_repayment(
         payment_method=method,
         source_kind="approval_request",
         source_id=loan.pk,
-        note=(note or loan.title)[:255],
+        note=(clean_note or loan.title)[:255],
         created_by=actor,
+    )
+    repaid_after = loan.amount_uzs - outstanding + amount
+    outstanding_after = outstanding - amount
+    from apps.loans.presenters import loan_to_dict
+
+    response_snapshot = loan_to_dict(
+        loan,
+        repaid_uzs=repaid_after,
+        outstanding_uzs=outstanding_after,
     )
     return LoanRepayment.objects.create(
         loan=loan,
-        amount_uzs=amount_uzs,
+        amount_uzs=amount,
         branch=loan.branch,
         payment_method=method,
         ledger_entry=entry,
         recorded_by=actor,
-        note=note,
+        recorded_by_principal_kind=principal.kind,
+        recorded_by_principal_id=principal.principal_id,
+        idempotency_key_hash=key_hash,
+        operation_fingerprint=fingerprint,
+        response_snapshot=response_snapshot,
+        repaid_after_uzs=repaid_after,
+        outstanding_after_uzs=outstanding_after,
+        note=clean_note,
     )

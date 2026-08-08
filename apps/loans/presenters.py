@@ -28,11 +28,20 @@ def _repaid(loan: ApprovalRequest) -> Decimal:
     return annotated if annotated is not None else repaid_total(loan)
 
 
-def loan_to_dict(loan: ApprovalRequest) -> dict:
-    repaid = _repaid(loan)
+def loan_to_dict(
+    loan: ApprovalRequest,
+    *,
+    repaid_uzs: Decimal | None = None,
+    outstanding_uzs: Decimal | None = None,
+) -> dict:
+    """Render a loan, optionally using a repayment's immutable response snapshot."""
+
+    repaid = repaid_uzs if repaid_uzs is not None else _repaid(loan)
     # outstanding/settled only make sense once the money has gone out.
     outstanding: Decimal | None = None
-    if loan.status == ApprovalRequest.Status.DISBURSED and loan.amount_uzs is not None:
+    if outstanding_uzs is not None:
+        outstanding = outstanding_uzs
+    elif loan.status == ApprovalRequest.Status.DISBURSED and loan.amount_uzs is not None:
         outstanding = loan.amount_uzs - repaid
     return {
         "id": loan.id,

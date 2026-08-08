@@ -77,6 +77,28 @@ def test_upload_url_allowlist_size_quota_rejections(tenant_a, monkeypatch):
         assert quota.value.code == "storage_quota_exceeded"
 
 
+def test_configured_extension_without_reviewed_signature_still_fails_closed(
+    tenant_a, monkeypatch
+):
+    _stub_s3(monkeypatch)
+    with schema_context(tenant_a.schema_name):
+        folder: Any = FolderFactory()
+        settings = CenterSettings.load()
+        settings.allowed_file_types = [*settings.allowed_file_types, "exe"]
+        settings.save(update_fields=["allowed_file_types"])
+
+        with pytest.raises(UnprocessableEntity) as unsupported:
+            services.request_upload(
+                filename="tool.exe",
+                content_type="application/octet-stream",
+                size_bytes=10,
+                folder=folder,
+            )
+
+        assert unsupported.value.code == "file_type_not_allowed"
+        assert LessonFile.objects.count() == 0
+
+
 def test_every_issued_key_starts_with_schema_name(tenant_a, monkeypatch):
     _stub_s3(monkeypatch)
     with schema_context(tenant_a.schema_name):

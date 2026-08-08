@@ -15,7 +15,15 @@ from django.utils.translation import gettext_lazy as _
 
 from apps.approvals.models import LedgerEntry
 from apps.sales.models import Sale
-from core.exceptions import NotFoundException, UnprocessableEntity, ValidationException
+from core.exceptions import ConflictException, NotFoundException, UnprocessableEntity, ValidationException
+from core.idempotency import (
+    assert_principal_actor,
+    lock_idempotency_key,
+    operation_fingerprint,
+    principal_scoped_key_hash,
+    validate_idempotency_key,
+)
+from core.role_principals import STAFF_PRINCIPAL_KINDS, RolePrincipal
 
 _TWO_PLACES = Decimal("0.01")
 _MAX_AMOUNT = Decimal("1e16")  # NUMERIC(18,2): at most 16 integer digits
@@ -35,17 +43,85 @@ def record_sale(
     student,
     payment_method_id: int,
     sold_by,
+    principal: RolePrincipal,
+    idempotency_key: str,
+    is_unscoped: bool,
+    branch_ids: set[int],
     note: str = "",
 ) -> Sale:
-    """Record a sale (the takings go straight to the ledger as money IN). The branch is
-    the student's, so the cash is attributable to the right till."""
+    """Record or replay one sale without duplicating its money-IN ledger row."""
     from apps.finance.models import PaymentMethod
 
+    assert_principal_actor(
+        actor=sold_by,
+        principal=principal,
+        allowed_kinds=STAFF_PRINCIPAL_KINDS,
+    )
     amount = (Decimal(quantity) * unit_price_uzs).quantize(_TWO_PLACES)
     if amount <= 0:
         raise ValidationException(_("A sale total must be positive."), code="sale_amount_positive")
     if amount >= _MAX_AMOUNT:
         raise ValidationException(_("The sale total is too large."), code="sale_amount_too_large")
+    clean_note = (note or "")[:255]
+    raw_key = validate_idempotency_key(idempotency_key)
+    key_hash = principal_scoped_key_hash(namespace="sale-create", principal=principal, raw=raw_key)
+    fingerprint = operation_fingerprint(
+        namespace="sale-create",
+        action="create",
+        resource={"student_id": student.pk},
+        body={
+            "item": item,
+            "note": clean_note,
+            "payment_method_id": payment_method_id,
+            "quantity": quantity,
+            "unit_price_uzs": str(unit_price_uzs.quantize(_TWO_PLACES)),
+        },
+    )
+    lock_idempotency_key(namespace="sale-create", principal=principal, key_hash=key_hash)
+
+    existing = Sale.objects.filter(idempotency_key_hash=key_hash).first()
+    if existing is not None:
+        if (
+            existing.sold_by_principal_kind != principal.kind
+            or existing.sold_by_principal_id != principal.principal_id
+        ):
+            raise ConflictException(
+                _("This idempotency key belongs to a different sale operation."),
+                code="idempotency_key_reused",
+            )
+        # A retry returns an immutable historical sale payload, so authorize the
+        # historical branch stamped on that sale—not the student's mutable current
+        # placement. This both preserves a legitimate retry after transfer and
+        # prevents a new-branch cashier from receiving old-branch finance data.
+        if not is_unscoped and existing.branch_id not in branch_ids:
+            raise NotFoundException(code="not_found")
+        if existing.operation_fingerprint != fingerprint:
+            raise ConflictException(
+                _("This idempotency key belongs to a different sale operation."),
+                code="idempotency_key_reused",
+            )
+        # Mutable provider/business state intentionally is not revalidated:
+        # deactivating a payment method after success must not break an exact retry.
+        return existing
+
+    # Reload under a row lock after the view's cheap lookup. A concurrent transfer
+    # may have changed the student's branch while the request was being parsed; the
+    # historical money snapshot must use the locked current branch and may never
+    # borrow the stale view object.
+    from apps.students.models import StudentProfile
+
+    locked_student = (
+        StudentProfile.objects.select_for_update()
+        .select_related("branch")
+        .filter(pk=student.pk)
+        .first()
+    )
+    if locked_student is None or (
+        not is_unscoped and locked_student.branch_id not in branch_ids
+    ):
+        raise NotFoundException(code="not_found")
+    student = locked_student
+
     method = PaymentMethod.objects.filter(pk=payment_method_id, is_active=True).first()
     if method is None:
         raise UnprocessableEntity(_("Unknown or inactive payment method."), code="payment_method_invalid")
@@ -59,7 +135,7 @@ def record_sale(
         branch=student.branch,
         payment_method=method,
         sold_by=sold_by,
-        note=note,
+        note=clean_note,
     )
     entry = LedgerEntry.objects.create(
         direction=LedgerEntry.Direction.IN,
@@ -74,7 +150,23 @@ def record_sale(
         created_by=sold_by,
     )
     sale.ledger_entry = entry
-    sale.save(update_fields=["ledger_entry"])
+    sale.sold_by_principal_kind = principal.kind
+    sale.sold_by_principal_id = principal.principal_id
+    sale.idempotency_key_hash = key_hash
+    sale.operation_fingerprint = fingerprint
+    from apps.sales.presenters import sale_to_dict
+
+    sale.creation_response_snapshot = sale_to_dict(sale)
+    sale.save(
+        update_fields=[
+            "ledger_entry",
+            "sold_by_principal_kind",
+            "sold_by_principal_id",
+            "idempotency_key_hash",
+            "operation_fingerprint",
+            "creation_response_snapshot",
+        ]
+    )
     return sale
 
 

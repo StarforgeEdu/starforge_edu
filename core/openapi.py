@@ -444,8 +444,10 @@ def _components() -> dict:
     from apps.audit.openapi_contracts import OPENAPI_SCHEMAS as AUDIT_SCHEMAS
     from apps.finance.openapi_contracts import OPENAPI_SCHEMAS as FINANCE_SCHEMAS
     from apps.forms.openapi_contracts import OPENAPI_SCHEMAS as FORM_SCHEMAS
+    from apps.loans.openapi_contracts import OPENAPI_SCHEMAS as LOAN_SCHEMAS
     from apps.meetings.openapi_contracts import OPENAPI_SCHEMAS as MEETING_SCHEMAS
     from apps.payroll.openapi_contracts import PAYROLL_SCHEMAS
+    from apps.sales.openapi_contracts import OPENAPI_SCHEMAS as SALES_SCHEMAS
     from apps.students.openapi_contracts import OPENAPI_SCHEMAS as STUDENT_SCHEMAS
     from apps.tasks.openapi_contracts import OPENAPI_SCHEMAS as TASK_SCHEMAS
     from apps.users.openapi_contracts import OPENAPI_SCHEMAS as USER_SCHEMAS
@@ -456,8 +458,10 @@ def _components() -> dict:
         AUDIT_SCHEMAS,
         FORM_SCHEMAS,
         FINANCE_SCHEMAS,
+        LOAN_SCHEMAS,
         MEETING_SCHEMAS,
         PAYROLL_SCHEMAS,
+        SALES_SCHEMAS,
         STUDENT_SCHEMAS,
         TASK_SCHEMAS,
         USER_SCHEMAS,
@@ -1901,6 +1905,29 @@ def _components() -> dict:
                     "note",
                     "created_at",
                 ],
+            },
+            "WalletAmountRequest": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "amount": {
+                        "type": "string",
+                        "description": (
+                            "Positive decimal-major UZS amount with at most two decimal places."
+                        ),
+                    },
+                    "note": {"type": "string", "maxLength": 255},
+                },
+                "required": ["amount"],
+            },
+            "WalletTransactionResponse": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "success": {"type": "boolean", "enum": [True]},
+                    "data": {"$ref": "#/components/schemas/WalletTransaction"},
+                },
+                "required": ["success", "data"],
             },
             "WalletPayloadData": {
                 "type": "object",

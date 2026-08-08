@@ -115,6 +115,21 @@ class WalletTransaction(models.Model):
     created_by = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
+    # The bridge user alone is not an exact login identity: one user can back more
+    # than one role-native account.  New wallet mutations capture the authenticated
+    # principal and only persist a tenant/principal-scoped hash of the client key.
+    # These fields remain nullable solely for transactions created before the
+    # idempotency cutover.
+    actor_principal_kind = models.CharField(max_length=16, blank=True, editable=False)
+    actor_principal_id = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    idempotency_key_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        editable=False,
+    )
+    operation_fingerprint = models.CharField(max_length=64, blank=True, editable=False)
     note = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -124,6 +139,23 @@ class WalletTransaction(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(amount_uzs__gt=Decimal("0")), name="wallet_txn_amount_positive"
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        actor_principal_kind="",
+                        actor_principal_id__isnull=True,
+                        idempotency_key_hash__isnull=True,
+                        operation_fingerprint="",
+                    )
+                    | (
+                        ~models.Q(actor_principal_kind="")
+                        & models.Q(actor_principal_id__isnull=False)
+                        & models.Q(idempotency_key_hash__isnull=False)
+                        & ~models.Q(operation_fingerprint="")
+                    )
+                ),
+                name="wallet_txn_idempotency_shape",
             ),
         ]
 

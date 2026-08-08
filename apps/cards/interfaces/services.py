@@ -10,6 +10,7 @@ from django.db.models import QuerySet
 from apps.cards.dto.card_dto import WalletAmountDTO
 from apps.cards.models import Card, CardScan, CardType, WalletTransaction
 from apps.students.models import StudentProfile
+from core.role_principals import RolePrincipal
 
 
 class ICardTypeService(ABC):
@@ -72,10 +73,40 @@ class IWalletService(ABC):
     def get_student_in_scope(self, *, student_id: int, is_director: bool, branch_ids: set[int]): ...
 
     @abstractmethod
-    def top_up(self, data: WalletAmountDTO, *, student, actor) -> WalletTransaction: ...
+    def top_up(
+        self,
+        data: WalletAmountDTO,
+        *,
+        student,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> WalletTransaction: ...
 
     @abstractmethod
-    def spend(self, data: WalletAmountDTO, *, student, actor) -> WalletTransaction: ...
+    def spend(
+        self,
+        data: WalletAmountDTO,
+        *,
+        student,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> WalletTransaction: ...
 
     @abstractmethod
-    def refund(self, data: WalletAmountDTO, *, student, actor) -> WalletTransaction: ...
+    def refund(
+        self,
+        data: WalletAmountDTO,
+        *,
+        student,
+        actor,
+        principal: RolePrincipal,
+        idempotency_key: str,
+        is_unscoped: bool,
+        branch_ids: set[int],
+    ) -> WalletTransaction: ...
