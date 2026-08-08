@@ -29,6 +29,7 @@ FINANCE_ENDPOINTS = [
     ("post", "/api/v1/finance/discounts/"),
     ("get", "/api/v1/finance/outstanding/?student=1"),
     ("post", "/api/v1/finance/cashier-shifts/open/"),
+    ("get", "/api/v1/finance/cashier-shifts/me/"),
     ("post", "/api/v1/finance/cashier-shifts/1/close/"),
     ("get", "/api/v1/finance/cashier-shifts/1/report/"),
     ("post", "/api/v1/finance/students/1/statement/"),

@@ -748,6 +748,33 @@ def test_cashier_can_only_read_and_close_own_shift(tenant_a, user_in, as_user):
     )
 
 
+def test_cashier_shift_me_is_current_operator_only_for_mixed_finance_roles(tenant_a, user_in, as_user):
+    """A finance register can contain other cashiers; the till self route cannot."""
+    from apps.finance import services
+    from apps.org.tests.factories import BranchFactory
+    from apps.users.models import RoleMembership
+
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="Till branch", slug="till-branch")
+    actor = user_in(tenant_a, roles=[Role.CASHIER], branch=branch)
+    other = user_in(tenant_a, roles=[Role.CASHIER], branch=branch)
+    with schema_context(tenant_a.schema_name):
+        # A second accounting membership makes the general register broad for
+        # this actor, which is exactly why a POS must use the self endpoint.
+        RoleMembership.objects.create(user=actor, branch=branch, role=Role.ACCOUNTANT)
+        own_shift = services.open_cashier_shift(cashier=actor, branch=branch)
+        other_shift = services.open_cashier_shift(cashier=other, branch=branch)
+
+    client = as_user(tenant_a, actor)
+    broad = client.get("/api/v1/finance/cashier-shifts/")
+    assert broad.status_code == 200, broad.content
+    assert {row["id"] for row in broad.json()["data"]} == {own_shift.pk, other_shift.pk}
+
+    mine = client.get("/api/v1/finance/cashier-shifts/me/?status=open")
+    assert mine.status_code == 200, mine.content
+    assert [row["id"] for row in mine.json()["data"]] == [own_shift.pk]
+
+
 def test_cashier_scope_cannot_borrow_remote_accountant_identity(tenant_a, user_in, as_user):
     from apps.finance import services
     from apps.org.tests.factories import BranchFactory

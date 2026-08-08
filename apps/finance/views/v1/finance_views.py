@@ -1005,6 +1005,42 @@ def cashier_shifts_collection_view(request: HttpRequest) -> HttpResponse:
 
 @csrf_exempt
 @require_auth
+def cashier_shifts_me_view(request: HttpRequest) -> HttpResponse:
+    """List only shifts opened by the authenticated bridge user.
+
+    The general register is intentionally wider for finance operators: an
+    accountant may see every in-scope cashier shift. A till cannot infer its
+    current shift from that register, because a visible row may belong to a
+    different cashier. This explicit self route keeps the caller identity on
+    the server side and avoids exposing or depending on a bridge ``User`` id
+    in the mobile authorization bootstrap.
+    """
+    if request.method not in ("GET", "HEAD"):
+        return _method_not_allowed()
+    check_perm(request, "finance:read")
+    shifts = _scope_cashier_shifts(
+        request,
+        _service().cashier_shifts(),
+        permission="finance:read",
+    ).filter(cashier=request.user)
+    qs = apply_filters(
+        request,
+        shifts,
+        filter_fields=("status", "branch"),
+        ordering_fields=("opened_at", "closed_at"),
+        default_ordering="-opened_at",
+    )
+    items, total, page, size = paginate(request, qs)
+    return paginated(
+        [cashier_shift_to_dict(shift) for shift in items],
+        total=total,
+        page=page,
+        page_size=size,
+    )
+
+
+@csrf_exempt
+@require_auth
 def cashier_shift_open_view(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()

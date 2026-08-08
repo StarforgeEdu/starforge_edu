@@ -42,6 +42,7 @@ urlpatterns = [
     path("refunds/<int:pk>/", views.refund_detail_view, name="finance-refund-detail"),
     # cashier shifts
     path("cashier-shifts/", views.cashier_shifts_collection_view, name="finance-cashier-shift-collection"),
+    path("cashier-shifts/me/", views.cashier_shifts_me_view, name="finance-cashier-shift-self-collection"),
     path("cashier-shifts/open/", views.cashier_shift_open_view, name="finance-cashier-shift-open"),
     path(
         "cashier-shifts/<int:pk>/close/", views.cashier_shift_close_view, name="finance-cashier-shift-close"
