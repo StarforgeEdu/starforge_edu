@@ -1,0 +1,318 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "StarForge vs Edutizim: product gap and build priorities",
+    "description": "A source-backed comparison of public Edutizim capabilities with the inspected StarForge backend, leadership console, and staff mobile application.",
+    "generatedAt": "2026-08-09T02:19:25+05:00",
+    "charts": [
+      {
+        "id": "opportunity_priority_chart",
+        "title": "Prioritized product opportunities",
+        "subtitle": "Planning score from 0 to 10; this is a transparent product rubric, not market size or measured adoption.",
+        "showDescription": true,
+        "type": "bar",
+        "dataset": "priority_opportunities",
+        "sourceId": "priority_rubric",
+        "encodings": {
+          "x": {
+            "field": "opportunity",
+            "type": "nominal",
+            "label": "Opportunity"
+          },
+          "y": {
+            "field": "priority_score",
+            "type": "quantitative",
+            "label": "Priority score"
+          },
+          "tooltip": [
+            { "field": "priority_score", "type": "quantitative", "label": "Priority score" },
+            { "field": "horizon", "type": "text", "label": "Horizon" },
+            { "field": "starforge_state", "type": "text", "label": "StarForge state" }
+          ]
+        },
+        "xAxisTitle": "Opportunity",
+        "yAxisTitle": "Planning priority (0–10)",
+        "valueFormat": "number",
+        "layout": "full",
+        "maxRows": 10,
+        "emptyState": "No reviewed product opportunities are available."
+      }
+    ],
+    "tables": [
+      {
+        "id": "opportunity_priority_table",
+        "title": "Opportunity evidence and recommended horizon",
+        "subtitle": "Public competitor evidence compared with StarForge revision cd1623b and the current client revisions.",
+        "showDescription": true,
+        "dataset": "priority_opportunities",
+        "sourceId": "priority_rubric",
+        "defaultSort": {
+          "field": "priority_score",
+          "direction": "desc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "opportunity", "label": "Opportunity", "type": "text" },
+          { "field": "priority_score", "label": "Priority", "format": "number" },
+          { "field": "horizon", "label": "Horizon", "type": "text" },
+          { "field": "starforge_state", "label": "Verified StarForge state", "type": "text" },
+          { "field": "decision", "label": "Product decision", "type": "text" }
+        ]
+      }
+    ],
+    "sources": [
+      { "id": "priority_rubric", "label": "Reviewed opportunity-priority rubric" },
+      { "id": "edutizim_official", "label": "Edutizim official product site", "href": "https://www.edutizim.uz/" },
+      { "id": "edutizim_employee", "label": "Edutizim Employee — Google Play", "href": "https://play.google.com/store/apps/details?id=uz.unical.edusystem.teacher&hl=en_US" },
+      { "id": "edutizim_student", "label": "Edutizim Student — Google Play", "href": "https://play.google.com/store/apps/details?id=uz.unical.edusystem.student&hl=en_US" },
+      { "id": "edutizim_superapp", "label": "Edutizim Superapp — Apple App Store", "href": "https://apps.apple.com/uz/app/edutizim-superapp/id1612775698" },
+      { "id": "it_park", "label": "IT Park Uzbekistan adoption evidence", "href": "https://www.it-park.uz/en/itpark/news/results-of-the-president-tech-award-2024-in-numbers-participation-of-538-startups" },
+      { "id": "starforge_backend", "label": "StarForge backend implementation revision f9f33d6", "href": "https://github.com/MythicalCosmic/starforge_edu/commit/f9f33d690f615c3dc43dcb2dce46236648064424" },
+      { "id": "starforge_ceo", "label": "StarForge leadership console revision 23e2789", "href": "https://github.com/MythicalCosmic/starforge_ceo/commit/23e2789239de307b06b0619f9ad9981ccaaa9323" },
+      { "id": "starforge_mobile", "label": "StarForge staff mobile revision 26d6f2b", "href": "https://github.com/MythicalCosmic/teachers_app/commit/26d6f2b23dd5fc2f2a368943d329d22d29338590" }
+    ],
+    "blocks": [
+      {
+        "id": "report_title",
+        "type": "markdown",
+        "body": "# StarForge vs Edutizim: product gap and build priorities",
+        "layout": "full"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "body": "## Executive Summary\n\n- **Do not rebuild capabilities StarForge already owns.** The inspected backend already has a real CRM, payroll periods and adjustments, Click/Payme payment handling, a permission-pruned executive snapshot, live permission scopes, messaging recovery, audits, rewards, tasks, academics, and family self-service APIs.\n- **The largest commercial gap is product delivery, not backend breadth.** Edutizim presents one locally integrated ecosystem: family and employee apps, automated documents, offline work, migrations, and Uzbek provider integrations. StarForge has stronger trust foundations but does not yet turn them into equally complete daily journeys.\n- **Build the family superapp, offline-safe staff commands, and a permission-pruned action center first.** They reach the most users, reuse existing backend capabilities, and let StarForge differentiate on evidence, authorization, and safe execution rather than feature-count marketing.\n- **Treat biometrics, child location, and call recording as governed later bets.** Copying them without consent, retention, safeguarding, and data-residency controls would weaken StarForge's strongest advantage: trustworthy operations.",
+        "layout": "full"
+      },
+      {
+        "id": "verified_foundation",
+        "type": "markdown",
+        "body": "## StarForge already has more backend depth than the competitor checklist suggests\n\nThe current backend is not merely a teacher API. It supports configurable account types and exact scopes, finance and payment workflows, CRM lead history and follow-ups, payroll periods and immutable evidence, student and parent self-service, executive intelligence, realtime thread events with durable recovery, notification delivery, audits, tasks, schedules, assessments, content, print operations, rewards, cards, and approvals.\n\nThe correct product move is to compose these capabilities into audience-specific workflows. A generic endpoint catalog or hard-coded role menu wastes this advantage and creates 403-heavy experiences; each screen and action must use the exact effective grant and scope returned by the signed-in profile.",
+        "layout": "full"
+      },
+      {
+        "id": "engineering_findings",
+        "type": "markdown",
+        "body": "## Serious engineering findings from the source audit\n\n- **Closed in the current worktree:** wallet top-up, spend, and refund retries could repeat a balance mutation after a lost response. They now require a principal-scoped idempotency key, serialize with a PostgreSQL transaction lock, reject changed replays, recheck current scope, and publish an explicit contract.\n- **Closed in the current worktree:** POS sale creation and loan repayments now use the same retry-safe pattern, immutable response snapshots, exact role-principal ownership, locked scope rechecks, and explicit OpenAPI contracts. Loan reads were also corrected so a branch-scoped borrower cannot see colleagues' balances and unattributed legacy loans remain quarantined.\n- **Closed in the current worktree:** an organization-configured file extension without a reviewed signature map could pass content validation through a broad MIME-family fallback. Settings and upload validation now share one fail-closed signature registry.\n- **Still open before high-confidence money operations:** wallet refunds are retry-safe but are not yet bound or cumulatively capped against an original spend; campaign delivery can record SENT before provider acceptance.\n- **Still open for scale and operations:** two intelligence paths materialize full scoped populations before paging, most OpenAPI operations remain inferred rather than executable contracts, and production metrics for HTTP, queues, providers, and uncertain financial states are incomplete.\n\nThe open items are deliberately not disguised as quick CRUD work. They require transaction semantics, migrations, reconciliation states, operator workflows, and production-scale verification.",
+        "layout": "full"
+      },
+      {
+        "id": "priority_explanation",
+        "type": "markdown",
+        "body": "## The highest-value roadmap closes delivery gaps before adding risky domains\n\nThe chart ranks opportunities with a declared 10-point planning rubric: customer reach (0–3), competitive necessity (0–3), reuse readiness (0–2), and trust or differentiation value (0–2). It is an ordinal prioritization aid, not a forecast of revenue, engineering duration, or competitor usage.\n\nFamily self-service ranks first because the backend already exposes much of the required data while no complete family client is present. The action center, offline-safe employee workflows, and provider platform follow because they improve daily reliability across many roles. Biometric and location features remain deliberately low until governance is designed.",
+        "layout": "full"
+      },
+      {
+        "id": "opportunity_priority_chart_block",
+        "type": "chart",
+        "chartId": "opportunity_priority_chart",
+        "layout": "full"
+      },
+      {
+        "id": "priority_table_explanation",
+        "type": "markdown",
+        "body": "## Each priority has a different build strategy\n\nThe table distinguishes missing domains from missing delivery surfaces. “Compose” means the backend foundation exists and the product should build a coherent client journey. “Extend” means existing models and services can anchor an additive contract. “New governed domain” means implementation should wait for explicit policy, security, and operational ownership.",
+        "layout": "full"
+      },
+      {
+        "id": "opportunity_priority_table_block",
+        "type": "table",
+        "tableId": "opportunity_priority_table",
+        "layout": "full"
+      },
+      {
+        "id": "competitor_strength",
+        "type": "markdown",
+        "body": "## Edutizim wins today through local completeness and implementation service\n\nIts public position combines lead CRM, finance, HR and payroll, academics and LMS, white-label family and employee apps, automated contracts and QR certificates, offline employee use, and integrations with local payment, SMS, telephony, enrollment, and access-control providers. It also markets hands-on migration and setup rather than leaving customers to interpret an API.\n\nThat is credible evidence of product positioning and distribution, but not proof that every workflow is reliable or secure. Public store descriptions are inconsistent, current pricing is not published, and the Android Student and iOS Superapp privacy declarations conflict. StarForge should learn from the ecosystem strategy while competing on a much clearer executable security and data contract.\n\nSources reviewed: [Edutizim official site](https://www.edutizim.uz/), [Employee app](https://play.google.com/store/apps/details?id=uz.unical.edusystem.teacher&hl=en_US), [Student app](https://play.google.com/store/apps/details?id=uz.unical.edusystem.student&hl=en_US), [Superapp](https://apps.apple.com/uz/app/edutizim-superapp/id1612775698), and [independent IT Park adoption evidence](https://www.it-park.uz/en/itpark/news/results-of-the-president-tech-award-2024-in-numbers-participation-of-538-startups). Inspected StarForge revisions: [backend implementation](https://github.com/MythicalCosmic/starforge_edu/commit/f9f33d690f615c3dc43dcb2dce46236648064424), [leadership console](https://github.com/MythicalCosmic/starforge_ceo/commit/23e2789239de307b06b0619f9ad9981ccaaa9323), and [staff mobile app](https://github.com/MythicalCosmic/teachers_app/commit/26d6f2b23dd5fc2f2a368943d329d22d29338590).",
+        "layout": "full"
+      },
+      {
+        "id": "revolutionary_position",
+        "type": "markdown",
+        "body": "## The revolutionary layer is an auditable operations copilot, not a generic chatbot\n\nGive each authorized user one ranked “what needs attention” queue. Every recommendation should include the reason, supporting records, exact scope, freshness, confidence, affected people, proposed action, required approval, and a reversible execution path. Authorization must be checked again when evidence is retrieved and when an action runs.\n\nThis turns StarForge's existing permission, audit, intelligence, messaging, approval, and ledger infrastructure into a defensible product: leadership sees trustworthy exceptions, staff see only executable work, families see one coherent journey, and no missing value is invented as zero.",
+        "layout": "full"
+      },
+      {
+        "id": "delivery_sequence",
+        "type": "markdown",
+        "body": "## Recommended delivery sequence\n\n1. **Now — finish trustworthy daily surfaces.** Ship one parent/student shell with multi-child switching; connect all server-backed staff routes; make mobile attendance, tasks, and cash commands restart-safe; move leadership briefs onto the consolidated snapshot; and eliminate permission-blind fan-out.\n2. **Next — automate paper and growth.** Add versioned document templates, immutable generated contracts and certificates, expiring downloads, QR verification, referral links and attributed conversions, and guided migration with preview, quarantine, reconciliation totals, and rollback.\n3. **Then — broaden the integration platform.** Standardize provider adapters, an event outbox, webhook replay and dead letters, tenant credential rotation, delivery logs, health monitoring, and additional local rails only when an operator owns them.\n4. **Later — governed workforce and communications.** Add staff timekeeping and leave, then consent-first telephony. Keep face recognition and child location out of the critical path until legal, safeguarding, retention, and access rules are approved.",
+        "layout": "full"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## Further questions that should change sequencing\n\n- Which audience creates renewal value fastest: parents, students, reception, or cashiers?\n- Can the first family release reuse the staff Flutter shell safely, or does safeguarding justify a separate application boundary?\n- Which three migration formats and legacy systems cover most launch customers?\n- Which offline mutations are truly required during network loss, and which should remain blocked because reconciliation is unsafe?\n- Who owns provider credential rotation, webhook incidents, and certificate or document legal wording?\n- What consent, residency, and retention policy would be required before any location, telephony recording, or biometric feature enters discovery?",
+        "layout": "full"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "body": "## Caveats and assumptions\n\nThis comparison was prepared on 9 August 2026 from public marketing pages, current store listings, external institutional coverage, and source inspection of the three named StarForge repositories. Competitor capabilities are advertised or store-listed claims; no private demo, tenant account, source code, or security assessment was available. Download counts are distribution signals, not active users.\n\nThe priority score is a documented product judgment, not empirical demand sizing. It should be recalibrated with customer interviews, support-ticket frequency, funnel and retention data, implementation effort, and willingness-to-pay evidence. Quantitative outcome claims on the competitor site were excluded because their methodology and dynamic counter behavior could not be verified.",
+        "layout": "full"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-09T02:19:25+05:00",
+    "status": "ready",
+    "datasets": {
+      "priority_opportunities": [
+        {
+          "opportunity": "Family superapp",
+          "priority_score": 10,
+          "customer_reach": 3,
+          "competitive_necessity": 3,
+          "reuse_readiness": 2,
+          "trust_differentiation": 2,
+          "horizon": "Now",
+          "starforge_state": "Parent/student APIs exist; no complete shipped family client was found.",
+          "competitor_evidence": "White-label parent/student Superapp is a central public product promise.",
+          "decision": "Compose existing schedule, attendance, learning, finance, document, notification, and session contracts into one safeguarded family shell."
+        },
+        {
+          "opportunity": "Permission-pruned action center",
+          "priority_score": 9,
+          "customer_reach": 3,
+          "competitive_necessity": 2,
+          "reuse_readiness": 2,
+          "trust_differentiation": 2,
+          "horizon": "Now",
+          "starforge_state": "Executive snapshot, permissions, audits, approvals, tasks, messaging, and risk evidence exist; no unified evidence-to-action queue exists.",
+          "competitor_evidence": "Edutizim markets consolidated realtime operations and churn warnings.",
+          "decision": "Compose a cited, scoped exception queue with reversible actions instead of a generic chatbot."
+        },
+        {
+          "opportunity": "Offline-safe employee workflows",
+          "priority_score": 9,
+          "customer_reach": 3,
+          "competitive_necessity": 3,
+          "reuse_readiness": 1,
+          "trust_differentiation": 2,
+          "horizon": "Now",
+          "starforge_state": "Staff mobile is online-first; no durable encrypted command queue or restart reconciliation contract was found.",
+          "competitor_evidence": "Employee store listings explicitly advertise offline work and later synchronization.",
+          "decision": "Extend attendance, tasks, notes, and carefully bounded cash intents with persistent idempotency and explicit conflict states."
+        },
+        {
+          "opportunity": "Provider integration platform",
+          "priority_score": 9,
+          "customer_reach": 3,
+          "competitive_necessity": 3,
+          "reuse_readiness": 1,
+          "trust_differentiation": 2,
+          "horizon": "Now",
+          "starforge_state": "Click, Payme, Eskiz, secure webhooks, and delivery infrastructure exist, but provider lifecycle management is not yet a general product platform.",
+          "competitor_evidence": "The official site advertises payment, SMS, telephony, enrollment, CRM, and Hikvision integrations.",
+          "decision": "Extract provider adapters, outbox, replay, dead-letter, credential rotation, delivery evidence, and health contracts before adding more logos."
+        },
+        {
+          "opportunity": "Document and QR automation",
+          "priority_score": 8,
+          "customer_reach": 2,
+          "competitive_necessity": 3,
+          "reuse_readiness": 1,
+          "trust_differentiation": 2,
+          "horizon": "Next",
+          "starforge_state": "Printing and reports exist; no versioned contract/certificate template and QR verification domain was found.",
+          "competitor_evidence": "Automated contracts, receipts, and QR certificates are first-class public claims.",
+          "decision": "Build approved templates, immutable generated versions, audited issuance, expiring downloads, and public QR verification."
+        },
+        {
+          "opportunity": "Guided migration and onboarding",
+          "priority_score": 8,
+          "customer_reach": 3,
+          "competitive_necessity": 3,
+          "reuse_readiness": 1,
+          "trust_differentiation": 1,
+          "horizon": "Next",
+          "starforge_state": "Import primitives exist, but no end-to-end tenant migration preview, quarantine, reconciliation, and rollback product was found.",
+          "competitor_evidence": "Edutizim markets hands-on migration within a short onboarding window.",
+          "decision": "Productize mappings, validation, duplicate review, ambiguous-row quarantine, totals, audit evidence, and rollback."
+        },
+        {
+          "opportunity": "Referral growth loop",
+          "priority_score": 7,
+          "customer_reach": 2,
+          "competitive_necessity": 2,
+          "reuse_readiness": 1,
+          "trust_differentiation": 2,
+          "horizon": "Next",
+          "starforge_state": "CRM attribution, campaigns, rewards, and student identities exist; referral link, conversion, and fraud-control contracts do not.",
+          "competitor_evidence": "A real education-center channel documented personal student referral links and reward fulfillment.",
+          "decision": "Extend CRM attribution with signed referral codes, conversion evidence, anti-abuse rules, capped rewards, and ledger attribution."
+        },
+        {
+          "opportunity": "Staff timekeeping and leave",
+          "priority_score": 6,
+          "customer_reach": 2,
+          "competitive_necessity": 2,
+          "reuse_readiness": 1,
+          "trust_differentiation": 1,
+          "horizon": "Later",
+          "starforge_state": "Payroll, teacher delivery, tasks, and schedules exist; general staff shifts, timesheets, and leave are incomplete.",
+          "competitor_evidence": "Employee hours, shifts, attendance, and salary inputs are advertised.",
+          "decision": "Extend workforce evidence without turning teacher outcomes into causal employee rankings."
+        },
+        {
+          "opportunity": "Consent-first telephony",
+          "priority_score": 5,
+          "customer_reach": 2,
+          "competitive_necessity": 2,
+          "reuse_readiness": 0,
+          "trust_differentiation": 1,
+          "horizon": "Later",
+          "starforge_state": "CRM touches and messaging exist; no telephony or recording domain was found.",
+          "competitor_evidence": "IP telephony, call recording, and call quality control are advertised.",
+          "decision": "Start with call outcome and consent logs; add recording only with legal, residency, disclosure, retention, and access controls."
+        },
+        {
+          "opportunity": "Biometrics and child location",
+          "priority_score": 3,
+          "customer_reach": 1,
+          "competitive_necessity": 2,
+          "reuse_readiness": 0,
+          "trust_differentiation": 0,
+          "horizon": "Defer",
+          "starforge_state": "Card scanning exists; face recognition and child location are not implemented.",
+          "competitor_evidence": "Hikvision face access and child location are advertised without a public governance contract.",
+          "decision": "Do not copy by default; require consent, necessity, child safeguarding, domestic residency, short retention, and independent review."
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "priority_rubric",
+      "label": "Reviewed opportunity-priority rubric",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "id": "starforge-edutizim-priority-2026-08-09",
+        "executed_at": "2026-08-09T02:19:25+05:00",
+        "description": "Reproduces the ordinal product-priority scores from the reviewed competitor evidence and inspected StarForge revisions.",
+        "sql": "SELECT opportunity, customer_reach + competitive_necessity + reuse_readiness + trust_differentiation AS priority_score, customer_reach, competitive_necessity, reuse_readiness, trust_differentiation, horizon, starforge_state, competitor_evidence, decision FROM (VALUES ('Family superapp',3,3,2,2,'Now','Parent/student APIs exist; no complete shipped family client was found.','White-label parent/student Superapp is a central public product promise.','Compose existing contracts into one safeguarded family shell.'),('Permission-pruned action center',3,2,2,2,'Now','Executive snapshot and evidence domains exist; no unified queue exists.','Consolidated operations and churn warnings are marketed.','Compose a cited, scoped exception queue.'),('Offline-safe employee workflows',3,3,1,2,'Now','No durable encrypted command queue was found.','Employee listings advertise offline synchronization.','Extend bounded commands with persistent idempotency and conflict states.'),('Provider integration platform',3,3,1,2,'Now','Several providers and secure webhook foundations exist.','A broad local integration catalogue is advertised.','Extract a governed provider lifecycle platform.'),('Document and QR automation',2,3,1,2,'Next','No versioned contract/certificate domain was found.','Automated contracts and QR certificates are advertised.','Build immutable, audited document issuance.'),('Guided migration and onboarding',3,3,1,1,'Next','No complete migration product was found.','Hands-on rapid migration is marketed.','Productize preview, quarantine, reconciliation, and rollback.'),('Referral growth loop',2,2,1,2,'Next','Supporting CRM and reward domains exist; referral contracts do not.','Personal referral links are externally evidenced.','Extend CRM attribution with fraud-safe referrals.'),('Staff timekeeping and leave',2,2,1,1,'Later','General shifts, timesheets, and leave are incomplete.','Staff hours and shifts are advertised.','Extend workforce evidence carefully.'),('Consent-first telephony',2,2,0,1,'Later','No telephony domain was found.','Call recording and quality control are advertised.','Start with consent and outcome logs.'),('Biometrics and child location',1,2,0,0,'Defer','Card scanning exists; biometrics and location do not.','Face access and child location are advertised.','Require governance before discovery.')) AS t(opportunity,customer_reach,competitive_necessity,reuse_readiness,trust_differentiation,horizon,starforge_state,competitor_evidence,decision) ORDER BY priority_score DESC, opportunity",
+        "filters": [
+          "Only capabilities evidenced by inspected public sources or the named StarForge revisions are included.",
+          "No competitor outcome counter or testimonial is treated as measured performance.",
+          "Biometric and child-location urgency is reduced because governance is not publicly demonstrated."
+        ],
+        "metric_definitions": [
+          "Priority score = customer reach (0–3) + competitive necessity (0–3) + StarForge reuse readiness (0–2) + trust/differentiation value (0–2).",
+          "The score is ordinal product judgment, not revenue, market size, engineering effort, or measured feature adoption."
+        ]
+      }
+    },
+    { "id": "edutizim_official", "label": "Edutizim official product site", "href": "https://www.edutizim.uz/" },
+    { "id": "edutizim_employee", "label": "Edutizim Employee — Google Play", "href": "https://play.google.com/store/apps/details?id=uz.unical.edusystem.teacher&hl=en_US" },
+    { "id": "edutizim_student", "label": "Edutizim Student — Google Play", "href": "https://play.google.com/store/apps/details?id=uz.unical.edusystem.student&hl=en_US" },
+    { "id": "edutizim_superapp", "label": "Edutizim Superapp — Apple App Store", "href": "https://apps.apple.com/uz/app/edutizim-superapp/id1612775698" },
+    { "id": "it_park", "label": "IT Park Uzbekistan adoption evidence", "href": "https://www.it-park.uz/en/itpark/news/results-of-the-president-tech-award-2024-in-numbers-participation-of-538-startups" },
+    { "id": "starforge_backend", "label": "StarForge backend implementation revision f9f33d6", "href": "https://github.com/MythicalCosmic/starforge_edu/commit/f9f33d690f615c3dc43dcb2dce46236648064424" },
+    { "id": "starforge_ceo", "label": "StarForge leadership console revision 23e2789", "href": "https://github.com/MythicalCosmic/starforge_ceo/commit/23e2789239de307b06b0619f9ad9981ccaaa9323" },
+    { "id": "starforge_mobile", "label": "StarForge staff mobile revision 26d6f2b", "href": "https://github.com/MythicalCosmic/teachers_app/commit/26d6f2b23dd5fc2f2a368943d329d22d29338590" }
+  ]
+}
