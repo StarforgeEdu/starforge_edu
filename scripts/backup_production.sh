@@ -5,7 +5,7 @@ umask 077
 
 DEPLOY_DIR="${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}"
 REPO_DIR="${STARFORGE_REPO_DIR:-/root/starforge_edu}"
-COMPOSE_FILE="${REPO_DIR}/docker/docker-compose.production.yml"
+compose_file="${REPO_DIR}/docker/docker-compose.production.yml"
 COMPOSE_ENV="${DEPLOY_DIR}/compose.env"
 DB_ENV="${DEPLOY_DIR}/postgres.env"
 MINIO_ENV="${DEPLOY_DIR}/minio.env"
@@ -28,7 +28,7 @@ source "$ENV_HELPER"
 [[ "$EUID" -eq 0 ]] || { echo "Production backup must run as root" >&2; exit 1; }
 [[ ! -L "$DEPLOY_DIR" ]] || { echo "Deployment directory must not be a symbolic link" >&2; exit 1; }
 
-[[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || {
+[[ -f "$compose_file" && ! -L "$compose_file" ]] || {
   echo "Production Compose file is unavailable" >&2
   exit 1
 }
@@ -176,7 +176,7 @@ case "$BACKUP_MODE" in
     ;;
 esac
 
-compose=(docker compose --env-file "$COMPOSE_ENV" -f "$COMPOSE_FILE")
+compose=(docker compose --env-file "$COMPOSE_ENV" -f "$compose_file")
 export STARFORGE_DEPLOY_DIR="$DEPLOY_DIR"
 project_name="$("${compose[@]}" config --format json | python3 -c \
   'import json, sys; print(json.load(sys.stdin).get("name", ""))')"

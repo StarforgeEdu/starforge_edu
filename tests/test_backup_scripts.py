@@ -43,8 +43,14 @@ def test_backup_is_locked_capacity_gated_and_validates_dump_before_snapshot():
 
 
 def test_backup_targets_only_the_reviewed_starforge_compose_project():
-    assert 'COMPOSE_FILE="${REPO_DIR}/docker/docker-compose.production.yml"' in BACKUP_SCRIPT
+    compose_path = BACKUP_SCRIPT.index('compose_file="${REPO_DIR}/docker/docker-compose.production.yml"')
+    environment_reset = BACKUP_SCRIPT.index("sf_clear_compose_process_overrides")
+    compose_command = BACKUP_SCRIPT.index(
+        'compose=(docker compose --env-file "$COMPOSE_ENV" -f "$compose_file")'
+    )
+    assert compose_path < environment_reset < compose_command
     assert "STARFORGE_COMPOSE_FILE" not in BACKUP_SCRIPT
+    assert 'COMPOSE_FILE="${REPO_DIR}' not in BACKUP_SCRIPT
     assert "sf_clear_compose_process_overrides" in BACKUP_SCRIPT
     assert "sf_export_compose_infrastructure_images" in BACKUP_SCRIPT
     assert 'sf_read_env_values "$COMPOSE_ENV" compose_app_values APP_IMAGE' in BACKUP_SCRIPT
