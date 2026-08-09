@@ -241,7 +241,7 @@ def test_student_cannot_request(tenant_a, as_role):
     assert resp.status_code == 403
 
 
-def test_approval_notifies_requester_and_disburser(tenant_a, user_in, as_user):
+def test_approval_notifies_requester_and_disburser(tenant_a, user_in, as_user, client_for):
     _branch, actors = _same_branch_clients(
         tenant_a,
         user_in,
@@ -250,7 +250,20 @@ def test_approval_notifies_requester_and_disburser(tenant_a, user_in, as_user):
         Role.DIRECTOR,
         Role.CASHIER,
     )
-    (teacher, teacher_user), (director, _), (cashier, _) = actors
+    (teacher, teacher_user), (director, director_user), (cashier, cashier_user) = actors
+
+    # Notification feeds are role-principal private.  Model the same exact
+    # teacher/staff identities that production role-login binds to its sessions;
+    # a bare compatibility User is intentionally denied by the feed boundary.
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
+
+    with schema_context(tenant_a.schema_name):
+        ensure_role_principal(teacher_user, roles=[Role.TEACHER], branch=_branch)
+        ensure_role_principal(director_user, roles=[Role.DIRECTOR], branch=_branch)
+        ensure_role_principal(cashier_user, roles=[Role.CASHIER], branch=_branch)
+    teacher = exact_session_client(client_for, tenant_a, teacher_user)
+    director = exact_session_client(client_for, tenant_a, director_user)
+    cashier = exact_session_client(client_for, tenant_a, cashier_user)
 
     rid = teacher.post(
         REQ,

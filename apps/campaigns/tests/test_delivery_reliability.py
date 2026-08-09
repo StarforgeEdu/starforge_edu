@@ -185,7 +185,8 @@ def test_concurrent_duplicate_workers_are_serialized_per_campaign(
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory.create()
         parent = ParentProfileFactory.create()
-        students = [_student(branch, parent=parent), _student(branch, parent=parent)]
+        _student(branch, parent=parent)
+        _student(branch, parent=parent)
         campaign = create_campaign(
             name="Concurrent",
             message="one text",
@@ -197,10 +198,6 @@ def test_concurrent_duplicate_workers_are_serialized_per_campaign(
         campaign = send_campaign(campaign_id=campaign.pk)
         campaign_id = campaign.pk
         claim_token = str(campaign.send_claim_token)
-        branch_id = branch.pk
-        parent_id = parent.pk
-        student_ids = [student.pk for student in students]
-        user_ids = [parent.user_id, *(student.user_id for student in students)]
 
     entered = Event()
     release = Event()
@@ -239,19 +236,6 @@ def test_concurrent_duplicate_workers_are_serialized_per_campaign(
         campaign = Campaign.objects.get(pk=campaign_id)
         assert campaign.status == Campaign.Status.SENT
         assert campaign.recipients.filter(status=CampaignRecipient.Status.SENT).count() == 2
-        # transaction=True commits tenant rows; pytest only flushes the public schema.
-        # Remove this test's graph explicitly so later campaign audience counts and
-        # factory get_or_create sequences cannot see it.
-        from apps.org.models import Branch
-        from apps.parents.models import ParentProfile
-        from apps.students.models import StudentProfile
-        from apps.users.models import User
-
-        campaign.delete()
-        StudentProfile.objects.filter(pk__in=student_ids).delete()
-        ParentProfile.objects.filter(pk=parent_id).delete()
-        User.objects.filter(pk__in=user_ids).delete()
-        Branch.objects.filter(pk=branch_id).delete()
     assert len(sms_outbox) == 1
 
 

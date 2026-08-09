@@ -255,17 +255,23 @@ def test_cannot_reject_a_fine_the_student_already_paid(tenant_a, as_role):
 
 
 def test_fine_student_deleted_before_approve(tenant_a, as_role):
-    """The target guard at approve time rolls the whole approval back (404,
-    request stays pending, no orphan invoice)."""
+    """A legacy request whose target no longer resolves fails closed at approval.
+
+    Student identities are now immutable history and cannot be hard-deleted.  Alter
+    the stored target to model an imported/pre-hardening request instead of
+    bypassing that production safeguard merely to manufacture a missing row.
+    """
     teacher, teacher_user = as_role(Role.TEACHER)
     director, _ = as_role(Role.DIRECTOR)
     sid = _student_id(tenant_a, teacher_user)
     rid = _raise_fine(teacher, sid).json()["data"]["id"]
 
     with schema_context(tenant_a.schema_name):
-        from apps.students.models import StudentProfile
+        from apps.approvals.models import ApprovalRequest
 
-        StudentProfile.objects.filter(pk=sid).delete()
+        request = ApprovalRequest.objects.get(pk=rid)
+        request.payload = {**request.payload, "student_id": sid + 1_000_000}
+        request.save(update_fields=["payload", "updated_at"])
 
     resp = director.post(f"{REQ}{rid}/approve/", {}, format="json")
     assert resp.status_code == 404

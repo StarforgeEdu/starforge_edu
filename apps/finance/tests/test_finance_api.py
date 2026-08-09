@@ -419,10 +419,12 @@ def test_local_finance_grant_cannot_borrow_stale_owner_membership_scope(
 ):
     """An unrelated owner-shaped assignment cannot globalize another grant.
 
-    This models an incomplete canonical migration: the protected director type
-    remains assigned but its grants were narrowed to finance:write. Read
-    authorization comes only from a separate branch-local account type, so the
-    write membership cannot lend organization scope to the read operation.
+    This models an incomplete legacy import where the denormalized ``role``
+    column still says director but the canonical custom account type grants
+    only finance:write. Read authorization comes only from a separate
+    branch-local account type, so the stale role cannot lend organization
+    scope to the read operation. The protected system owner itself is immutable
+    and must never be weakened to manufacture this fixture.
     """
     from apps.access.models import AccountType, AccountTypePermission
     from apps.cohorts.tests.factories import CohortFactory
@@ -441,11 +443,11 @@ def test_local_finance_grant_cannot_borrow_stale_owner_membership_scope(
             account_type=local_type,
             permission="finance:read",
         )
-        stale_owner_type = AccountType.objects.get(
-            is_system=True,
-            slug=Role.DIRECTOR,
+        stale_owner_type = AccountType.objects.create(
+            name="Imported finance writer",
+            slug="imported-finance-writer",
+            account_kind=AccountType.AccountKind.STAFF,
         )
-        stale_owner_type.permission_rows.all().delete()
         AccountTypePermission.objects.create(
             account_type=stale_owner_type,
             permission="finance:write",

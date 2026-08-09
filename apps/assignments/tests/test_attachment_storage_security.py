@@ -18,6 +18,7 @@ from apps.assignments.tests.factories import AssignmentFactory
 from apps.cohorts.tests.factories import CohortFactory, CohortMembershipFactory
 from apps.org.tests.factories import BranchFactory
 from apps.students.tests.factories import StudentProfileFactory
+from apps.users.tests.factories import UserFactory
 from core.attachment_storage import AttachmentObjectError, VerifiedAttachment
 from core.exceptions import UnprocessableEntity
 
@@ -155,7 +156,11 @@ def test_failed_content_verification_does_not_consume_or_persist_a_key(tenant_a,
 def test_durable_assignment_attachment_survives_uploader_hard_delete(tenant_a):
     with schema_context(tenant_a.schema_name):
         assignment, _student = _submission_target()
-        uploader = StudentProfileFactory().user
+        # Use a deliberately profile-less legacy uploader. Student identities are
+        # immutable history and correctly protect their compatibility User from
+        # hard deletion; the SET_NULL durability contract is about deletable User
+        # rows, not bypassing that identity safeguard.
+        uploader = UserFactory()
         grant = _grant(schema=tenant_a.schema_name, owner=uploader, consumed=True)
         key = final_attachment_key(
             schema=tenant_a.schema_name,

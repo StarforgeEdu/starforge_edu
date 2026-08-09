@@ -423,8 +423,12 @@ def test_single_archived_branch_is_not_auto_selected(tenant_a, user_in, as_user)
         archived = BranchFactory.create(archived_at=timezone.now())
     client = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=archived))
     response = client.post(TASKS, {"title": "Do not pin me"}, format="json")
-    assert response.status_code == 400
-    assert response.json()["code"] == "validation_error"
+    # Archiving the only branch removes the membership's effective write scope.
+    # Authorization therefore rejects the request before branch inference reaches
+    # DTO validation; this must remain a fail-closed 403, not a usable archived
+    # branch or a synthetic organization-wide task.
+    assert response.status_code == 403
+    assert response.json()["code"] == "out_of_scope"
 
 
 def test_task_list_routes_support_head(tenant_a, as_role):

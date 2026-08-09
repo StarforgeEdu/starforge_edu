@@ -274,14 +274,26 @@ def test_empty_student_returns_empty_feed(tenant_a, as_role):
 
 
 def test_journey_orders_by_timestamp_not_source_order(tenant_a, as_role):
+    from unittest.mock import patch
+
     from apps.students.models import EnrollmentEvent
 
     director, _ = as_role(Role.DIRECTOR)
     student = _student_with_events(tenant_a, _branch(tenant_a))
-    # the enrollment event is created FIRST (oldest by source order); force its
-    # timestamp to be the newest and assert the selector sorts by the real time
-    with schema_context(tenant_a.schema_name):
-        EnrollmentEvent.objects.filter(student=student).update(created_at=timezone.now() + timedelta(days=1))
+    # Enrollment history is append-only. Create a second event under a future
+    # clock instead of mutating historical evidence, then prove the merged feed
+    # orders by the immutable timestamp rather than its per-source assembly order.
+    newest_at = timezone.now() + timedelta(days=1)
+    with (
+        schema_context(tenant_a.schema_name),
+        patch("django.utils.timezone.now", return_value=newest_at),
+    ):
+        EnrollmentEvent.objects.create(
+            student=student,
+            from_status="active",
+            to_status="inactive",
+            note="Newest immutable timeline event",
+        )
     events = director.get(_journey_url(student.id)).json()["data"]["events"]
     assert events[0]["type"] == "enrollment"  # newest by timestamp, despite source order
 

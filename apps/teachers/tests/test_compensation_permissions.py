@@ -19,6 +19,12 @@ PREPARE = "/api/v1/teachers/{}/prepare-salary/"
 APPROVALS = "/api/v1/approvals/requests/"
 
 
+def _completed_month():
+    first_this_month = timezone.localdate().replace(day=1)
+    last_completed_month = first_this_month - timedelta(days=1)
+    return last_completed_month.replace(day=1), last_completed_month
+
+
 def _grant_user(tenant, *, user_in, branch_permissions):
     from apps.access.models import AccountType, AccountTypePermission
     from apps.users.models import RoleMembership
@@ -157,12 +163,12 @@ def test_hod_cannot_discover_or_decide_salary_approvals(
             method="flat_monthly",
             flat_amount_uzs=Decimal("2500000"),
         )
-    today = timezone.localdate()
+    period_start, period_end = _completed_month()
     prepared = director.post(
         PREPARE.format(teacher.pk),
         {
-            "period_start": (today - timedelta(days=1)).isoformat(),
-            "period_end": today.isoformat(),
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
         },
         format="json",
         HTTP_IDEMPOTENCY_KEY="salary-hod-privacy-0001",
@@ -203,13 +209,14 @@ def test_cashier_can_disburse_but_cannot_read_or_change_policy(
             method="flat_monthly",
             flat_amount_uzs=Decimal("2500000"),
         )
-    today = timezone.localdate()
+    period_start, period_end = _completed_month()
     prepared = maker.post(
         PREPARE.format(teacher.pk),
-        {"period_start": today.isoformat(), "period_end": today.isoformat()},
+        {"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
         format="json",
         HTTP_IDEMPOTENCY_KEY="salary-cashier-flow-0001",
     )
+    assert prepared.status_code == 201, prepared.content
     request_id = prepared.json()["data"]["request_id"]
 
     approver = as_user(
