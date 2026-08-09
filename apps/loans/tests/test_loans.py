@@ -476,11 +476,14 @@ def test_repayment_exact_retry_returns_original_snapshot_after_loan_is_settled(
     )
     assert first.status_code == 201, first.content
     assert first.json()["data"]["outstanding_uzs"] == "600000.00"
-    assert _repay(
-        cashier,
-        loan_id,
-        {"amount_uzs": "600000.00", "payment_method": method_id},
-    ).status_code == 201
+    assert (
+        _repay(
+            cashier,
+            loan_id,
+            {"amount_uzs": "600000.00", "payment_method": method_id},
+        ).status_code
+        == 201
+    )
     with schema_context(tenant_a.schema_name):
         PaymentMethod.objects.filter(pk=method_id).update(is_active=False)
 
@@ -501,11 +504,14 @@ def test_repayment_exact_retry_returns_original_snapshot_after_loan_is_settled(
         assert rows[0].response_snapshot == first.json()["data"]
         assert rows[0].repaid_after_uzs == 400000
         assert rows[0].outstanding_after_uzs == 600000
-        assert LedgerEntry.objects.filter(
-            entry_type="loan_repayment",
-            source_kind="approval_request",
-            source_id=loan_id,
-        ).count() == 2
+        assert (
+            LedgerEntry.objects.filter(
+                entry_type="loan_repayment",
+                source_kind="approval_request",
+                source_id=loan_id,
+            ).count()
+            == 2
+        )
 
 
 def test_repayment_key_reuse_with_changed_body_or_resource_conflicts(
@@ -543,12 +549,15 @@ def test_repayment_key_reuse_with_changed_body_or_resource_conflicts(
         amount="1000.00",
     )
     key = _key("loan-key-reuse")
-    assert _repay(
-        cashier,
-        first_loan,
-        {"amount_uzs": "100.00", "payment_method": method_id, "note": "Original"},
-        key=key,
-    ).status_code == 201
+    assert (
+        _repay(
+            cashier,
+            first_loan,
+            {"amount_uzs": "100.00", "payment_method": method_id, "note": "Original"},
+            key=key,
+        ).status_code
+        == 201
+    )
 
     changed_body = _repay(
         cashier,
@@ -567,11 +576,14 @@ def test_repayment_key_reuse_with_changed_body_or_resource_conflicts(
         assert response.json()["code"] == "idempotency_key_reused"
     with schema_context(tenant_a.schema_name):
         assert LoanRepayment.objects.filter(loan_id__in=(first_loan, second_loan)).count() == 1
-        assert LedgerEntry.objects.filter(
-            entry_type="loan_repayment",
-            source_kind="approval_request",
-            source_id__in=(first_loan, second_loan),
-        ).count() == 1
+        assert (
+            LedgerEntry.objects.filter(
+                entry_type="loan_repayment",
+                source_kind="approval_request",
+                source_id__in=(first_loan, second_loan),
+            ).count()
+            == 1
+        )
 
 
 def test_repayment_replay_rechecks_current_collect_branch_scope(tenant_a, user_in, client_for):

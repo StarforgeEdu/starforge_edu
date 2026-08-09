@@ -77,9 +77,7 @@ def test_upload_url_allowlist_size_quota_rejections(tenant_a, monkeypatch):
         assert quota.value.code == "storage_quota_exceeded"
 
 
-def test_configured_extension_without_reviewed_signature_still_fails_closed(
-    tenant_a, monkeypatch
-):
+def test_configured_extension_without_reviewed_signature_still_fails_closed(tenant_a, monkeypatch):
     _stub_s3(monkeypatch)
     with schema_context(tenant_a.schema_name):
         folder: Any = FolderFactory()

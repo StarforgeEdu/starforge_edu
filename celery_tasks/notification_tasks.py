@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any, TypedDict, cast
 
 from django.db import transaction
@@ -484,15 +485,15 @@ def _enqueue_reconciled_provider_retries() -> int:
             marker.save(update_fields=["provider_response"])
             notification_id = marker.notification_id
             channel = marker.channel
-            transaction.on_commit(
-                lambda notification_id=notification_id, channel=channel: deliver_single_channel.delay(
-                    notification_id,
-                    channel,
-                    _schema_name=schema,
-                )
-            )
+            transaction.on_commit(partial(_delay_single_channel, notification_id, channel, schema))
             queued += 1
     return queued
+
+
+def _delay_single_channel(notification_id: int, channel: str, schema: str) -> None:
+    """Publish one retry after commit without a late-bound loop closure."""
+
+    deliver_single_channel.delay(notification_id, channel, _schema_name=schema)
 
 
 @app.task

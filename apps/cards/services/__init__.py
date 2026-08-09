@@ -205,9 +205,7 @@ def validate_wallet_idempotency_key(raw: str | None) -> str:
 
 
 def _wallet_key_hash(*, principal: RolePrincipal, raw: str) -> str:
-    return stable_hash(
-        f"wallet-key:v1:{current_schema()}:{principal.kind}:{principal.principal_id}:{raw}"
-    )
+    return stable_hash(f"wallet-key:v1:{current_schema()}:{principal.kind}:{principal.principal_id}:{raw}")
 
 
 def _wallet_operation_fingerprint(
@@ -274,19 +272,12 @@ def _assert_actor_matches_principal(*, actor, principal: RolePrincipal) -> None:
         )
 
 
-def _locked_student_in_scope(
-    *, student_id: int, is_unscoped: bool, branch_ids: set[int]
-):
+def _locked_student_in_scope(*, student_id: int, is_unscoped: bool, branch_ids: set[int]):
     """Lock and reauthorize the student's current placement inside the money transaction."""
 
     from apps.students.models import StudentProfile
 
-    student = (
-        StudentProfile.objects.select_for_update()
-        .only("pk", "branch_id")
-        .filter(pk=student_id)
-        .first()
-    )
+    student = StudentProfile.objects.select_for_update().only("pk", "branch_id").filter(pk=student_id).first()
     if student is None or (not is_unscoped and student.branch_id not in branch_ids):
         # Absent and out-of-scope identifiers are intentionally indistinguishable.
         raise NotFoundException(_("Student not found."), code="student_not_found")
@@ -337,9 +328,7 @@ def _wallet_operation(
     wallet = _locked_wallet(locked_student)
     if kind == WalletTransaction.Kind.SPEND:
         if wallet.balance_uzs < amt:
-            raise UnprocessableEntity(
-                _("Insufficient wallet balance."), code="insufficient_funds"
-            )
+            raise UnprocessableEntity(_("Insufficient wallet balance."), code="insufficient_funds")
         wallet.balance_uzs -= amt
     else:
         new_balance = wallet.balance_uzs + amt

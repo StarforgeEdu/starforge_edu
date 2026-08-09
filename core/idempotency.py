@@ -37,7 +37,7 @@ def validate_idempotency_key(raw: str | None) -> str:
         raise ValidationException(
             _("Idempotency-Key must contain 16 to 128 visible ASCII characters."),
             code="invalid_idempotency_key",
-            fields={"Idempotency-Key": [_('Use 16 to 128 visible ASCII characters.')]},
+            fields={"Idempotency-Key": [_("Use 16 to 128 visible ASCII characters.")]},
         )
     return raw
 
@@ -46,8 +46,7 @@ def principal_scoped_key_hash(*, namespace: str, principal: RolePrincipal, raw: 
     """Hash one key inside the exact tenant, domain, and role-principal namespace."""
 
     return stable_hash(
-        f"idempotency-key:v1:{namespace}:{current_schema()}:{principal.kind}:"
-        f"{principal.principal_id}:{raw}"
+        f"idempotency-key:v1:{namespace}:{current_schema()}:{principal.kind}:{principal.principal_id}:{raw}"
     )
 
 

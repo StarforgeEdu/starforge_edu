@@ -238,8 +238,8 @@ def test_iam_verifier_rejects_additional_policy_or_group_inheritance(tmp_path):
 
 
 def test_read_only_release_verifier_checks_exact_iam_and_behavioral_denials():
-    verify = DEPLOY.index("scripts/verify_production_storage.sh")
-    backup = DEPLOY.index("scripts/backup_production.sh")
+    verify = DEPLOY.index('"$release_dir/scripts/verify_production_storage.sh"')
+    backup = DEPLOY.index('"$release_dir/scripts/backup_production.sh" --preflight')
     migrations = DEPLOY.index('echo "Applying public and tenant migrations..."')
     assert verify < backup < migrations
     assert "scripts/configure_production_storage.sh" not in DEPLOY

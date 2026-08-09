@@ -276,9 +276,7 @@ def student_wallet_view(request: HttpRequest, student_id: int) -> HttpResponse:
     if request.method not in ("GET", "HEAD"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, "wallet:read")
-    student, _is_unscoped, _branch_ids = _student_in_scope(
-        request, student_id, "wallet:read"
-    )
+    student, _is_unscoped, _branch_ids = _student_in_scope(request, student_id, "wallet:read")
     return success(wallet_payload_to_dict(_wallet_service().wallet_payload(student=student)))
 
 

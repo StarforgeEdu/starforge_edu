@@ -292,11 +292,14 @@ def test_sale_exact_retry_returns_original_after_payment_method_is_retired(
         assert sale.sold_by_principal_kind == "staff"
         assert sale.creation_response_snapshot == first.json()["data"]
         assert Sale.objects.filter(pk=sale_id).count() == 1
-        assert LedgerEntry.objects.filter(
-            entry_type="book_sale",
-            source_kind="sale",
-            source_id=sale_id,
-        ).count() == 1
+        assert (
+            LedgerEntry.objects.filter(
+                entry_type="book_sale",
+                source_kind="sale",
+                source_id=sale_id,
+            ).count()
+            == 1
+        )
 
 
 def test_sale_changed_key_reuse_conflicts_without_second_money_row(tenant_a, user_in, client_for):
@@ -313,11 +316,14 @@ def test_sale_changed_key_reuse_conflicts_without_second_money_row(tenant_a, use
     with schema_context(tenant_a.schema_name):
         sales = Sale.objects.filter(student=s["student"])
         assert sales.count() == 1
-        assert LedgerEntry.objects.filter(
-            entry_type="book_sale",
-            source_kind="sale",
-            source_id__in=sales.values("pk"),
-        ).count() == 1
+        assert (
+            LedgerEntry.objects.filter(
+                entry_type="book_sale",
+                source_kind="sale",
+                source_id__in=sales.values("pk"),
+            ).count()
+            == 1
+        )
 
 
 def test_sale_replay_uses_historical_branch_after_student_transfer(tenant_a, user_in, client_for):

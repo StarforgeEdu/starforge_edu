@@ -111,14 +111,9 @@ def record_sale(
     from apps.students.models import StudentProfile
 
     locked_student = (
-        StudentProfile.objects.select_for_update()
-        .select_related("branch")
-        .filter(pk=student.pk)
-        .first()
+        StudentProfile.objects.select_for_update().select_related("branch").filter(pk=student.pk).first()
     )
-    if locked_student is None or (
-        not is_unscoped and locked_student.branch_id not in branch_ids
-    ):
+    if locked_student is None or (not is_unscoped and locked_student.branch_id not in branch_ids):
         raise NotFoundException(code="not_found")
     student = locked_student
 

@@ -85,11 +85,14 @@ def test_concurrent_identical_loan_retries_create_one_repayment_and_ledger_row(t
     assert len(set(result_ids)) == 1
     with schema_context(tenant_a.schema_name):
         assert LoanRepayment.objects.filter(loan_id=loan_id).count() == 1
-        assert LedgerEntry.objects.filter(
-            entry_type="loan_repayment",
-            source_kind="approval_request",
-            source_id=loan_id,
-        ).count() == 1
+        assert (
+            LedgerEntry.objects.filter(
+                entry_type="loan_repayment",
+                source_kind="approval_request",
+                source_id=loan_id,
+            ).count()
+            == 1
+        )
 
 
 def test_loan_repayment_rechecks_stale_view_scope_against_locked_row(tenant_a, user_in):

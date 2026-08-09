@@ -85,11 +85,14 @@ def test_concurrent_identical_sale_retries_create_one_sale_and_ledger_row(tenant
     assert len(set(result_ids)) == 1
     with schema_context(tenant_a.schema_name):
         assert Sale.objects.filter(student_id=student_id).count() == 1
-        assert LedgerEntry.objects.filter(
-            entry_type="book_sale",
-            source_kind="sale",
-            source_id=result_ids[0],
-        ).count() == 1
+        assert (
+            LedgerEntry.objects.filter(
+                entry_type="book_sale",
+                source_kind="sale",
+                source_id=result_ids[0],
+            ).count()
+            == 1
+        )
 
 
 def test_sale_reloads_stale_view_student_under_lock_before_branch_snapshot(tenant_a, user_in):

@@ -18,9 +18,7 @@ IDEMPOTENCY_HEADER = {
     "in": "header",
     "required": True,
     "schema": {"type": "string", "minLength": 16, "maxLength": 128},
-    "description": (
-        "Visible ASCII retry key. Only its tenant/role-principal-scoped SHA-256 hash is stored."
-    ),
+    "description": ("Visible ASCII retry key. Only its tenant/role-principal-scoped SHA-256 hash is stored."),
 }
 
 
@@ -59,9 +57,7 @@ SALES_COLLECTION_CONTRACTS = (
     OperationContract(
         method="GET",
         summary="List sales in the current till scope",
-        description=(
-            "Returns only sales inside the exact branch memberships carrying sale:read."
-        ),
+        description=("Returns only sales inside the exact branch memberships carrying sale:read."),
         permission="sale:read",
         security=SESSION_SECURITY,
         parameters=SALE_LIST_PARAMETERS,

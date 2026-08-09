@@ -1912,9 +1912,7 @@ def _components() -> dict:
                 "properties": {
                     "amount": {
                         "type": "string",
-                        "description": (
-                            "Positive decimal-major UZS amount with at most two decimal places."
-                        ),
+                        "description": ("Positive decimal-major UZS amount with at most two decimal places."),
                     },
                     "note": {"type": "string", "maxLength": 255},
                 },

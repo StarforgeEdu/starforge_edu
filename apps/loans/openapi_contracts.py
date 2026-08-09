@@ -17,9 +17,7 @@ IDEMPOTENCY_HEADER = {
     "in": "header",
     "required": True,
     "schema": {"type": "string", "minLength": 16, "maxLength": 128},
-    "description": (
-        "Visible ASCII retry key. Only its tenant/role-principal-scoped SHA-256 hash is stored."
-    ),
+    "description": ("Visible ASCII retry key. Only its tenant/role-principal-scoped SHA-256 hash is stored."),
 }
 LOAN_ID_PARAMETER = {
     "name": "pk",

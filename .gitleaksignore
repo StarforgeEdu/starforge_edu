@@ -2,6 +2,10 @@
 # one finding, file, line, rule, and commit; it cannot suppress a future secret.
 c02d293b3871cf1a64b67eeef7146a7a3f2457aa:apps/payments/tests/test_payment_integrity.py:generic-api-key:206
 
+# The same historical test-only idempotency label exists on the archived
+# day1-build branch. Keep this exception pinned to its exact commit and line.
+6a0fa13f827e6ce906565d07e405fbd6162bed71:apps/payments/tests/test_payment_integrity.py:generic-api-key:206
+
 # Deterministic CI-only Fernet fixture. It is derived from a public label and
 # cannot protect data; production rejects the known development keys separately.
 88c4cc4c927f28a9953e934b49972c86bbf7122d:.github/workflows/ci.yml:generic-api-key:114

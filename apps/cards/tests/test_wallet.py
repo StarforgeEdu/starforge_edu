@@ -297,9 +297,7 @@ def test_wallet_replay_rechecks_current_branch_scope(tenant_a, user_in, client_f
         assert WalletTransaction.objects.count() == 1
 
 
-def test_wallet_write_rechecks_scope_after_student_lookup(
-    tenant_a, user_in, client_for, monkeypatch
-):
+def test_wallet_write_rechecks_scope_after_student_lookup(tenant_a, user_in, client_for, monkeypatch):
     """A transfer racing the fast view lookup cannot authorize a stale-branch write."""
 
     from apps.cards.models import Wallet, WalletTransaction

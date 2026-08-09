@@ -40,9 +40,10 @@ dependencies = [
     "requests>=2.32",
 
     "daphne>=4.2.2",
+    "h2>=4.4.1",             # Security floor for Daphne/Twisted HTTP/2 support
     "gunicorn>=23.0",
 
-    "cryptography>=48.0.1",    # TD-11 field encryption (Fernet)
+    "cryptography>=50.0.0",    # TD-11 field encryption (Fernet)
     "firebase-admin>=6.6",     # Real FCM client; production must not discover this at send time
     "python-dateutil>=2.9",    # TD-12 recurrence rules (used from Day 2 schedule)
     "icalendar>=6.0",          # TD-16 / D2-A iCal feed
