@@ -18,13 +18,19 @@ def _rows(body):
     return body["data"] if isinstance(body, dict) and "data" in body else body
 
 
-def test_hierarchy_gated_assignment(tenant_a, as_role):
+def test_hierarchy_gated_assignment(tenant_a, as_role, user_in, as_user):
+    from apps.org.tests.factories import BranchFactory
+
     director, _ = as_role(Role.DIRECTOR)
     director.post(GRADES, {"role": "teacher", "level": 2}, format="json")
     director.post(GRADES, {"role": "registrar", "level": 1}, format="json")
 
-    teacher_client, teacher = as_role(Role.TEACHER)
-    registrar_client, registrar = as_role(Role.REGISTRAR)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+    teacher = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    registrar = user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch)
+    teacher_client = as_user(tenant_a, teacher)
+    registrar_client = as_user(tenant_a, registrar)
 
     # teacher (grade 2) may task the registrar (grade 1)
     ok = teacher_client.post(TASKS, {"title": "file these", "assignee": registrar.id}, format="json")
@@ -147,12 +153,17 @@ def test_students_have_no_task_access(tenant_a, as_role):
 # --------------------------------------------------------------------------- #
 # review hardening
 # --------------------------------------------------------------------------- #
-def test_reassign_is_hierarchy_gated(tenant_a, as_role):
+def test_reassign_is_hierarchy_gated(tenant_a, as_role, user_in, as_user):
+    from apps.org.tests.factories import BranchFactory
+
     director, _ = as_role(Role.DIRECTOR)
     director.post(GRADES, {"role": "teacher", "level": 2}, format="json")
     director.post(GRADES, {"role": "registrar", "level": 1}, format="json")
-    registrar_client, _r = as_role(Role.REGISTRAR)
-    _tc, teacher = as_role(Role.TEACHER)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+    registrar = user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch)
+    teacher = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    registrar_client = as_user(tenant_a, registrar)
     tid = registrar_client.post(TASKS, {"title": "x"}, format="json").json()["data"]["id"]
     # the gate applies on reassign too, not just create
     up = registrar_client.post(f"{TASKS}{tid}/assign/", {"assignee": teacher.id}, format="json")
@@ -160,11 +171,16 @@ def test_reassign_is_hierarchy_gated(tenant_a, as_role):
     assert up.json()["code"] == "cannot_assign_grade"
 
 
-def test_ungraded_target_fails_closed_when_hierarchy_configured(tenant_a, as_role):
+def test_ungraded_target_fails_closed_when_hierarchy_configured(tenant_a, as_role, user_in, as_user):
+    from apps.org.tests.factories import BranchFactory
+
     director, _ = as_role(Role.DIRECTOR)
     director.post(GRADES, {"role": "teacher", "level": 2}, format="json")  # hierarchy now in use
-    teacher_client, _t = as_role(Role.TEACHER)
-    _sc, support = as_role(Role.SUPPORT)  # SUPPORT is ungraded
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+    teacher = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+    support = user_in(tenant_a, roles=[Role.SUPPORT], branch=branch)  # SUPPORT is ungraded
+    teacher_client = as_user(tenant_a, teacher)
     # a graded teacher may not task an UNPLACED role (can't exploit a forgotten grade)
     blocked = teacher_client.post(TASKS, {"title": "x", "assignee": support.id}, format="json")
     assert blocked.status_code == 403
@@ -539,7 +555,7 @@ def test_task_creator_uses_exact_principal_and_survives_bridge_deletion(
 
 @pytest.mark.django_db(transaction=True)
 def test_concurrent_terminal_transitions_serialize_on_the_task_row(tenant_a, monkeypatch):
-    """Two valid OPEN transitions cannot both commit from the same stale image."""
+    """The second transition must apply to the committed, locked task image."""
     from concurrent.futures import ThreadPoolExecutor
     from concurrent.futures import TimeoutError as FutureTimeout
     from threading import Event
@@ -604,8 +620,12 @@ def test_concurrent_terminal_transitions_serialize_on_the_task_row(tenant_a, mon
             release_first.set()
         assert second is not None
         assert first.result(timeout=10) == ("ok", Task.Status.DONE)
-        assert second.result(timeout=10) == ("invalid", "invalid_transition")
+        # DONE -> CANCELLED is a declared lifecycle edge.  Serializing on the row
+        # means the second worker applies that edge to DONE instead of overwriting
+        # a stale OPEN image; the sibling lifecycle test intentionally guarantees
+        # this correction workflow remains available.
+        assert second.result(timeout=10) == ("ok", Task.Status.CANCELLED)
 
     with schema_context(tenant_a.schema_name):
-        assert Task.objects.get(pk=task_id).status == Task.Status.DONE
+        assert Task.objects.get(pk=task_id).status == Task.Status.CANCELLED
         Task.objects.filter(pk=task_id).delete()

@@ -1190,33 +1190,35 @@ def _capacity_summary(context: ExecutiveSummaryContext) -> dict[str, int | str]:
         department_field="department_id",
     )
     cohorts = Cohort.objects.filter(scope, is_archived=False).order_by()
-    totals = cohorts.aggregate(
+    # Keep cohort aggregates independent from the reverse student join. Mixing
+    # them into one aggregate multiplies every cohort (and its capacity) by its
+    # current-student count.
+    group_totals = cohorts.aggregate(
         active_group_count=Count("id"),
         groups_with_declared_capacity=Count("id", filter=Q(capacity__isnull=False)),
         groups_without_declared_capacity=Count("id", filter=Q(capacity__isnull=True)),
         declared_seats=Sum("capacity"),
+    )
+    student_totals = StudentProfile.objects.filter(
+        current_cohort__in=cohorts,
+        status=StudentProfile.Status.ACTIVE,
+    ).aggregate(
         active_students=Count(
-            "current_students",
-            filter=Q(current_students__status=StudentProfile.Status.ACTIVE),
-            distinct=True,
+            "id",
         ),
         active_students_in_measured_groups=Count(
-            "current_students",
-            filter=Q(
-                capacity__isnull=False,
-                current_students__status=StudentProfile.Status.ACTIVE,
-            ),
-            distinct=True,
+            "id",
+            filter=Q(current_cohort__capacity__isnull=False),
         ),
     )
-    declared = totals["declared_seats"] or 0
-    measured_students = totals["active_students_in_measured_groups"]
+    declared = group_totals["declared_seats"] or 0
+    measured_students = student_totals["active_students_in_measured_groups"]
     return {
-        "active_group_count": totals["active_group_count"],
-        "groups_with_declared_capacity": totals["groups_with_declared_capacity"],
-        "groups_without_declared_capacity": totals["groups_without_declared_capacity"],
+        "active_group_count": group_totals["active_group_count"],
+        "groups_with_declared_capacity": group_totals["groups_with_declared_capacity"],
+        "groups_without_declared_capacity": group_totals["groups_without_declared_capacity"],
         "declared_seats": declared,
-        "active_students": totals["active_students"],
+        "active_students": student_totals["active_students"],
         "active_students_in_measured_groups": measured_students,
         "seat_balance": declared - measured_students,
         "attribution": "current_group_scope",

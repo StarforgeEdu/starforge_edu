@@ -91,7 +91,9 @@ def test_concurrent_cash_receipts_cannot_overpay_one_invoice(tenant_a, user_in):
             Decimal("0"),
         ) == Decimal("70000.00")
         invoice.refresh_from_db()
-        assert invoice.status == "partially_paid"
+        # A partial receipt must not erase an already-past due invoice's
+        # delinquency classification.
+        assert invoice.status == "overdue"
 
 
 @override_settings(FISCALIZATION_ENABLED=False)

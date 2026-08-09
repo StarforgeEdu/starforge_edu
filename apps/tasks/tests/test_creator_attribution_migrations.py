@@ -11,6 +11,7 @@ from django.utils import timezone
 from django_tenants.utils import schema_context
 
 from core.permissions import Role
+from tests.migration_isolation import IsolatedMigrationHarness
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -19,11 +20,11 @@ LEGACY_TARGETS = (
     ("staff_tasks", "0002_task_task_created_idx"),
     ("meetings", "0001_initial"),
 )
-
-
-def _restore_current_graph() -> None:
-    executor = MigrationExecutor(connection)
-    executor.migrate(executor.loader.graph.leaf_nodes())
+CURRENT_TARGETS = (
+    ("forms_app", "0003_role_principal_attribution"),
+    ("staff_tasks", "0003_task_assignee_principal"),
+    ("meetings", "0002_attendee_principal_attribution"),
+)
 
 
 def _legacy_models():
@@ -44,6 +45,7 @@ def test_creator_backfills_resolve_one_role_and_quarantine_ambiguity(
     from tests.role_principal_helpers import shared_staff_teacher_bridge
 
     row_ids: dict[str, int] = {}
+    migrations = IsolatedMigrationHarness(connection, CURRENT_TARGETS)
     try:
         with schema_context(tenant_a.schema_name):
             branch = BranchFactory()
@@ -53,7 +55,7 @@ def test_creator_backfills_resolve_one_role_and_quarantine_ambiguity(
                 staff_role=Role.SUPPORT,
             )
 
-            MigrationExecutor(connection).migrate(list(LEGACY_TARGETS))
+            migrations.downgrade()
             LegacyForm, LegacyTask, LegacyMeeting = _legacy_models()
             exact_form = LegacyForm.objects.create(
                 title="Exact legacy form",
@@ -99,7 +101,7 @@ def test_creator_backfills_resolve_one_role_and_quarantine_ambiguity(
                 "ambiguous_meeting": ambiguous_meeting.pk,
             }
 
-            _restore_current_graph()
+            migrations.upgrade()
 
             from apps.forms.models import Form
             from apps.meetings.models import StaffMeeting
@@ -140,6 +142,18 @@ def test_creator_backfills_resolve_one_role_and_quarantine_ambiguity(
     finally:
         try:
             with schema_context(tenant_a.schema_name):
-                _restore_current_graph()
+                migrations.downgrade()
+                LegacyForm, LegacyTask, LegacyMeeting = _legacy_models()
+                if row_ids:
+                    LegacyForm.objects.filter(
+                        pk__in=(row_ids["exact_form"], row_ids["ambiguous_form"])
+                    ).delete()
+                    LegacyTask.objects.filter(
+                        pk__in=(row_ids["exact_task"], row_ids["ambiguous_task"])
+                    ).delete()
+                    LegacyMeeting.objects.filter(
+                        pk__in=(row_ids["exact_meeting"], row_ids["ambiguous_meeting"])
+                    ).delete()
+                migrations.upgrade()
         finally:
             connection.set_schema_to_public()

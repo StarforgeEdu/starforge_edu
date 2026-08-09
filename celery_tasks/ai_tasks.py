@@ -689,9 +689,12 @@ def run_placement_generation(self, ai_request_id: int, *, params: dict | None = 
 # Form response analysis (F3-4)
 # ---------------------------------------------------------------------------
 
-# Keep the free-text input within the reserved token budget (cap ~4000 tokens ≈
-# 16k chars; leave headroom for the aggregate + system prompt).
-_MAX_ANALYSIS_COMMENT_CHARS = 12_000
+# Keep the free-text sample inside the prompt's *total* reservation. The common
+# 4,000-token form-analysis contract also reserves up to 1,024 output tokens and
+# a 256-token counting margin; 2k Unicode characters leaves conservative room
+# for the system policy, aggregate, redaction envelope, and token-dense scripts.
+# The provider token-count gate below remains the authoritative final check.
+_MAX_ANALYSIS_COMMENT_CHARS = 2_000
 
 
 @app.task(bind=True, max_retries=3, retry_backoff=True, acks_late=True)

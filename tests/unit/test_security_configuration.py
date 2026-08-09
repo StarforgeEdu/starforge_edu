@@ -149,13 +149,15 @@ def test_production_rejects_invalid_branch_agent_rate_limit():
 @pytest.mark.parametrize(
     ("name", "value"),
     [
+        ("APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS", "0"),
+        ("APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS", "301"),
         ("PRINT_AGENT_LEASE_SECONDS", "59"),
         ("PRINT_AGENT_LEASE_SECONDS", "3601"),
         ("PRINT_STALE_LEASE_SWEEP_BATCH_SIZE", "0"),
         ("PRINT_STALE_LEASE_SWEEP_BATCH_SIZE", "1001"),
     ],
 )
-def test_production_rejects_unsafe_print_lease_configuration(name, value):
+def test_production_rejects_unsafe_cache_and_lease_configuration(name, value):
     environment = _production_import_environment(soliq_allowed_hosts="soliq.example.invalid")
     environment[name] = value
 

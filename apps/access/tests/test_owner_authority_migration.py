@@ -7,6 +7,7 @@ from django_tenants.utils import schema_context
 
 from apps.access.models import AccountType, AccountTypePermission
 from core.permissions import Role
+from tests.migration_isolation import IsolatedMigrationHarness
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -15,6 +16,7 @@ LEGACY_TARGET = ("access", "0004_compensation_permissions")
 CURRENT_TARGET = ("access", "0006_head_of_department_org_read")
 CUSTOM_SLUG = "owner-authority-migration-probe"
 OVERRIDE_NOTE = "owner-authority-migration-probe"
+ACCESS_MIGRATIONS = (HARDENING_TARGET, CURRENT_TARGET)
 
 
 def _historical_models(target):
@@ -27,23 +29,16 @@ def _historical_models(target):
     )
 
 
-def _migrate_current_graph() -> None:
-    """Restore every leaf that an access downgrade may have unapplied."""
-
-    executor = MigrationExecutor(connection)
-    assert CURRENT_TARGET in executor.loader.graph.nodes
-    executor.migrate(executor.loader.graph.leaf_nodes())
-
-
 def test_owner_authority_migration_preflights_applies_and_reverses_cleanly(tenant_a):
     custom_id: int | None = None
     owner_id: int | None = None
     owner_description = ""
+    migrations = IsolatedMigrationHarness(connection, ACCESS_MIGRATIONS)
 
     try:
         with schema_context(tenant_a.schema_name):
             try:
-                MigrationExecutor(connection).migrate([LEGACY_TARGET])
+                migrations.downgrade()
                 LegacyType, LegacyGrant, LegacyOverride = _historical_models(LEGACY_TARGET)
                 owner = LegacyType.objects.get(is_system=True, slug=Role.DIRECTOR)
                 owner_id = owner.pk
@@ -67,14 +62,14 @@ def test_owner_authority_migration_preflights_applies_and_reverses_cleanly(tenan
                     note=OVERRIDE_NOTE,
                 )
                 with pytest.raises(RuntimeError, match="owner-authority preflight failed"):
-                    MigrationExecutor(connection).migrate([HARDENING_TARGET])
+                    migrations.migrate_to(1)
 
                 LegacyGrant.objects.filter(
                     account_type_id=custom_id,
                     permission="access:write",
                 ).delete()
                 LegacyOverride.objects.filter(note=OVERRIDE_NOTE).delete()
-                MigrationExecutor(connection).migrate([HARDENING_TARGET])
+                migrations.migrate_to(1)
 
                 # Normal custom grants and edits remain available after hardening.
                 current_custom = AccountType.objects.get(pk=custom_id)
@@ -112,7 +107,7 @@ def test_owner_authority_migration_preflights_applies_and_reverses_cleanly(tenan
 
                 # Reversal removes both the trigger and check constraint. Prove
                 # the old schema accepts the exact writes, then clean the probe.
-                MigrationExecutor(connection).migrate([LEGACY_TARGET])
+                migrations.downgrade()
                 LegacyType, LegacyGrant, LegacyOverride = _historical_models(LEGACY_TARGET)
                 assert LegacyType.objects.filter(pk=owner_id).update(description="Reverse probe") == 1
                 LegacyGrant.objects.create(account_type_id=custom_id, permission="access:write")
@@ -130,7 +125,7 @@ def test_owner_authority_migration_preflights_applies_and_reverses_cleanly(tenan
             finally:
                 # Always remove probe data under the legacy graph and restore the
                 # current access leaf before leaving this tenant schema.
-                MigrationExecutor(connection).migrate([LEGACY_TARGET])
+                migrations.downgrade()
                 LegacyType, LegacyGrant, LegacyOverride = _historical_models(LEGACY_TARGET)
                 LegacyOverride.objects.filter(note=OVERRIDE_NOTE).delete()
                 if custom_id is not None:
@@ -141,7 +136,7 @@ def test_owner_authority_migration_preflights_applies_and_reverses_cleanly(tenan
                         description=owner_description,
                         is_active=True,
                     )
-                _migrate_current_graph()
+                migrations.upgrade()
     finally:
         # TransactionTestCase flushes whichever schema remains selected during
         # teardown. Never let MigrationExecutor leave a tenant selected.

@@ -148,12 +148,13 @@ def test_status_flips_issued_partially_paid_paid(tenant_a):
         payment, inv_ids = _make_payment_and_invoices(
             tenant_a, amount_uzs="150000.00", issued_totals=["100000.00", "100000.00"]
         )
-        # Pay 150k across two 100k invoices: first -> paid, second -> partially_paid.
+        # Pay 150k across two past-due 100k invoices: first -> paid, second
+        # remains overdue while it still has a balance.
         services.allocate_payment(payment_id=payment.id, amount_uzs=Decimal("150000.00"), invoice_ids=None)
         first = Invoice.objects.get(id=inv_ids[0])
         second = Invoice.objects.get(id=inv_ids[1])
         assert first.status == "paid"
-        assert second.status == "partially_paid"
+        assert second.status == "overdue"
 
         # Top the second up to fully paid with a fresh payment.
         topup = Payment.objects.create(

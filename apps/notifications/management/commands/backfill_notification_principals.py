@@ -228,7 +228,15 @@ def _write_private_report(path: Path, payload: dict[str, Any]) -> None:
                 os.unlink(temporary_name)
 
 
-def _schema_names(requested: list[str] | None) -> list[str]:
+def _schema_names(requested: list[str] | str | None) -> list[str]:
+    # ``argparse`` supplies a list for the repeatable CLI option, while
+    # ``call_command(..., schema="tenant_a")`` supplies the scalar value passed
+    # by the caller.  Normalize both forms before set arithmetic; treating a
+    # scalar string as an iterable would otherwise validate individual
+    # characters as schema names.
+    if isinstance(requested, str):
+        requested = [requested]
+
     public_schema = get_public_schema_name()
     Tenant = get_tenant_model()
     with schema_context(public_schema):

@@ -124,6 +124,22 @@ STATUS_UNAVAILABLE = "unavailable"
 PROTECTED_APPS: frozenset[str] = frozenset({"auth", "users", "org"})
 
 
+def _cache_timeout_seconds() -> int:
+    """Return the validated, finite lifetime for cached tenant policy.
+
+    Production settings reject values outside 1..300 seconds at process startup. Keeping
+    the lookup here (rather than freezing it at import time) also lets Django's settings
+    override machinery exercise the cache contract in tests.
+    """
+    timeout = settings.APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
+        # Non-production settings can still be composed by downstream deployments. Fail
+        # closed instead of accidentally translating an invalid value to Redis' permanent
+        # ``timeout=None`` behavior.
+        raise ValueError("APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS must be between 1 and 300.")
+    return timeout
+
+
 def _global_disabled() -> frozenset[str]:
     """Ops-level disables (the DISABLED_APPS setting) — apply to EVERY tenant and can't be
     re-enabled per-tenant (a broken app is off everywhere)."""
@@ -140,10 +156,19 @@ def disabled_apps() -> set[str]:
     """The apps off for the CURRENT tenant: the global ops default UNION this tenant's
     runtime override (a director toggling apps, no restart needed)."""
     cache_key = _cache_key()
-    override = cache.get(cache_key, _CACHE_MISS)
+    try:
+        override = cache.get(cache_key, _CACHE_MISS)
+    except Exception:
+        # Redis is an optimization, never the authority for a security-sensitive
+        # availability policy. Fall through to PostgreSQL on cache outages.
+        logger.warning("Tenant availability cache read failed.", exc_info=True)
+        override = _CACHE_MISS
     if override is _CACHE_MISS:
         override = _database_disabled_apps()
-        cache.set(cache_key, sorted(override), timeout=None)
+        try:
+            cache.set(cache_key, sorted(override), timeout=_cache_timeout_seconds())
+        except Exception:
+            logger.warning("Tenant availability cache write failed.", exc_info=True)
     return set(_global_disabled()) | set(override)
 
 
@@ -188,7 +213,12 @@ def set_tenant_disabled_apps(apps: set[str]) -> set[str]:
     cached_value = tuple(tenant_set)
 
     def publish_cache() -> None:
-        cache.set(cache_key, list(cached_value), timeout=None)
+        try:
+            cache.set(cache_key, list(cached_value), timeout=_cache_timeout_seconds())
+        except Exception:
+            # The committed row is authoritative and the read path falls back to
+            # it. Do not report a failed policy update merely because Redis is down.
+            logger.warning("Tenant availability cache publication failed.", exc_info=True)
 
     transaction.on_commit(publish_cache)
     return set(tenant_set) | set(_global_disabled())

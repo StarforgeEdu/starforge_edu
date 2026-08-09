@@ -52,18 +52,20 @@ def test_create_checkout_same_key_returns_existing_payment(invoice_a):
         assert Payment.objects.filter(idempotency_key=IDEMP_KEY).count() == 1
 
 
-def test_create_checkout_different_keys_two_payments(invoice_a):
+def test_create_checkout_different_key_is_blocked_while_an_attempt_is_pending(invoice_a):
     tenant_a, inv = invoice_a
     from apps.payments import services
+    from core.exceptions import ConflictException
 
     with schema_context(tenant_a.schema_name):
-        a = services.create_checkout(invoice_id=inv.id, provider="payme", idempotency_key="key-1")
-        b = services.create_checkout(invoice_id=inv.id, provider="payme", idempotency_key="key-2")
-        assert _payment_id(a) != _payment_id(b)
+        services.create_checkout(invoice_id=inv.id, provider="payme", idempotency_key="key-1")
+        with pytest.raises(ConflictException) as exc:
+            services.create_checkout(invoice_id=inv.id, provider="payme", idempotency_key="key-2")
+        assert exc.value.code == "payment_intent_in_progress"
 
         from apps.payments.models import Payment
 
-        assert Payment.objects.filter(idempotency_key__in=["key-1", "key-2"]).count() == 2
+        assert Payment.objects.filter(idempotency_key__in=["key-1", "key-2"]).count() == 1
 
 
 @pytest.mark.parametrize("key", ["", " ", " padded", "padded ", "bad\nkey", "x" * 65])

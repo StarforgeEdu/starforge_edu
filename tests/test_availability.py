@@ -6,6 +6,8 @@ degradation, cache loss, transaction rollback, and control-plane self-lockout pr
 
 from __future__ import annotations
 
+from collections.abc import Hashable
+
 import pytest
 from django.core.cache import cache
 from django.db import DatabaseError
@@ -90,6 +92,9 @@ def test_soft_dependency_down_degrades_with_warnings(tenant_a, as_role):
 
 def test_control_endpoint_lists_and_toggles(tenant_a, as_role):
     cache.clear()
+    # This module uses real commits against a shared tenant fixture. Establish
+    # the durable precondition instead of relying on an earlier test's policy.
+    _disable(tenant_a, set())
     director, _ = as_role(Role.DIRECTOR)
     listing = director.get("/api/v1/org/system/apps/")
     assert listing.status_code == 200
@@ -132,6 +137,88 @@ def test_disabled_apps_persist_across_cache_loss_and_model_writes_invalidate(ten
         settings_row.save(update_fields=("disabled_apps", "updated_at"))
         assert cache.get(key) is None
         assert disabled_apps() == {"notifications"}
+
+
+def test_stale_policy_cache_converges_after_failed_outage_invalidation(tenant_a, monkeypatch):
+    """A Redis outage can lose an invalidation, but never preserve old policy forever."""
+    from core import availability
+
+    class RecoveringCache:
+        def __init__(self) -> None:
+            self.available = True
+            self.now = 0
+            self.entries: dict[Hashable, tuple[object, int]] = {}
+
+        def get(self, key, default=None):
+            if not self.available:
+                raise ConnectionError("cache unavailable")
+            entry = self.entries.get(key)
+            if entry is None:
+                return default
+            value, expires_at = entry
+            if self.now >= expires_at:
+                self.entries.pop(key, None)
+                return default
+            return value
+
+        def set(self, key, value, timeout=None):
+            if not self.available:
+                raise ConnectionError("cache unavailable")
+            assert isinstance(timeout, int)
+            assert 1 <= timeout <= 300
+            self.entries[key] = (value, self.now + timeout)
+            return True
+
+        def delete_many(self, keys):
+            if not self.available:
+                raise ConnectionError("cache unavailable")
+            for key in keys:
+                self.entries.pop(key, None)
+
+        def advance(self, seconds: int) -> None:
+            self.now += seconds
+
+    recovering_cache = RecoveringCache()
+    durable_policy: set[str] = set()
+    monkeypatch.setattr(availability, "cache", recovering_cache)
+    monkeypatch.setattr(availability, "_database_disabled_apps", lambda: set(durable_policy))
+
+    with schema_context(tenant_a.schema_name):
+        key = availability._cache_key()
+        assert availability.disabled_apps() == set()
+
+        # PostgreSQL commits a stricter policy while Redis is unavailable. The attempted
+        # invalidation is lost, so recovery exposes the old cache entry temporarily.
+        durable_policy.add("placement")
+        recovering_cache.available = False
+        with pytest.raises(ConnectionError, match="cache unavailable"):
+            recovering_cache.delete_many((key,))
+        recovering_cache.available = True
+        assert availability.disabled_apps() == set()
+
+        # The finite TTL forces a database reload and restores the durable policy without
+        # any manual cache flush after Redis recovers.
+        recovering_cache.advance(availability._cache_timeout_seconds())
+        assert availability.disabled_apps() == {"placement"}
+        assert recovering_cache.entries[key][1] > recovering_cache.now
+
+
+def test_runtime_policy_publication_uses_finite_cache_ttl(tenant_a, monkeypatch):
+    from core import availability
+
+    writes: list[tuple[str, object, int | None]] = []
+
+    def capture_set(key, value, timeout=None):
+        writes.append((key, value, timeout))
+        return True
+
+    monkeypatch.setattr(availability.cache, "set", capture_set)
+    with schema_context(tenant_a.schema_name):
+        availability.set_tenant_disabled_apps({"placement"})
+
+    assert writes
+    assert writes[-1][1] == ["placement"]
+    assert writes[-1][2] == availability._cache_timeout_seconds()
 
 
 def test_disabled_apps_rollback_never_publishes_uncommitted_cache_state(tenant_a):

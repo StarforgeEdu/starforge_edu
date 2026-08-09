@@ -184,7 +184,7 @@ def test_statement_request_uses_invoice_snapshot_not_current_student_branch(
         branch_a = BranchFactory(slug="statement-history-a")
         branch_b = BranchFactory(slug="statement-history-b")
         student = StudentProfileFactory(branch=branch_a)
-        invoice = finance_services.issue_invoice(
+        finance_services.issue_invoice(
             student_id=student.pk,
             lines=[{"description": "Tuition", "quantity": "1", "unit_price_uzs": "100.00"}],
         )
@@ -192,6 +192,17 @@ def test_statement_request_uses_invoice_snapshot_not_current_student_branch(
 
     accountant_a = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=branch_a)
     accountant_b = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=branch_b)
+    with schema_context(tenant_a.schema_name):
+        from apps.org.models import StaffProfile
+
+        StaffProfile.objects.create(
+            user=accountant_a,
+            username=f"statement-history-a-{accountant_a.pk}",
+        )
+        StaffProfile.objects.create(
+            user=accountant_b,
+            username=f"statement-history-b-{accountant_b.pk}",
+        )
     response_a = as_user(tenant_a, accountant_a).post(
         f"/api/v1/finance/students/{student.pk}/statement/",
         {"locale": "en"},
@@ -205,8 +216,9 @@ def test_statement_request_uses_invoice_snapshot_not_current_student_branch(
     assert response_a.status_code == 202
     assert response_b.status_code == 404
     assert len(queued) == 1
-    assert queued[0][0] == (invoice.student_id,)
-    assert queued[0][1]["requested_by_id"] == accountant_a.pk
+    export_id = response_a.json()["data"]["export_id"]
+    assert queued[0][0] == (export_id,)
+    assert queued[0][1] == {"_schema_name": tenant_a.schema_name}
 
 
 def test_cross_branch_allocation_is_rejected_in_the_domain(tenant_a):

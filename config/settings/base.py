@@ -29,6 +29,7 @@ env = environ.Env(
     WEBSOCKET_USER_CONNECT_RATE_LIMIT=(int, 30),
     WEBSOCKET_MAX_CONNECTIONS_PER_SESSION=(int, 5),
     WEBSOCKET_CONNECTION_LEASE_SECONDS=(int, 90),
+    APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS=(int, 60),
     CORS_ALLOWED_ORIGINS=(list, []),
     CSRF_TRUSTED_ORIGINS=(list, []),
     AWS_STORAGE_BUCKET_NAME=(str, "starforge-media"),
@@ -456,8 +457,14 @@ WEBSOCKET_CONNECTION_LEASE_SECONDS = env("WEBSOCKET_CONNECTION_LEASE_SECONDS")
 # Fault isolation (core.availability): app labels turned OFF at boot (ops default). An
 # organization-wide system operator can additionally persist tenant-specific toggles via
 # /api/v1/org/system/apps/. Redis caches that durable state but is not its source of truth.
-# A disabled app's endpoints answer 503 without taking down unrelated applications.
+# A disabled app's endpoints answer 503 without taking down unrelated applications. Keep
+# the policy cache short-lived: if invalidation is lost during a Redis outage, a recovered
+# cache must converge back to PostgreSQL without an operator having to clear it manually.
 DISABLED_APPS = env.list("DISABLED_APPS", default=[])
+APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS = env.int(
+    "APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS",
+    default=60,
+)
 
 # The Redis connection URL as a SETTING (not just an env read at each use site): the
 # readiness probe + task dead-letter queue go through infrastructure.cache.redis_client.

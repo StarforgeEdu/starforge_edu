@@ -68,13 +68,13 @@ def test_workflow_attribution_report_counts_resolved_and_review_rows(tenant_a, u
         )
         MeetingAttendee.objects.create(meeting=second_meeting, user=user)
 
-        quarantined_task = Task.objects.create(
+        resolved_task = Task.objects.create(
             title="Resolved task",
             assignee=user,
             assignee_principal_kind="staff",
             assignee_principal_id=principal_id,
         )
-        Task.objects.create(
+        quarantined_task = Task.objects.create(
             title="Quarantined task",
             assignee=user,
             assignee_attribution_status="quarantined",
@@ -84,6 +84,8 @@ def test_workflow_attribution_report_counts_resolved_and_review_rows(tenant_a, u
         unresolved_form_payload = form_to_dict(unresolved_form)
         unresolved_meeting_payload = meeting_to_dict(second_meeting)
         quarantined_task_payload = task_to_dict(quarantined_task)
+
+        assert task_to_dict(resolved_task)["assignee"] == user.pk
 
     assert report["form_audience_resolved"] == 1
     assert report["form_audience_unresolved"] == 1
@@ -100,6 +102,7 @@ def test_workflow_attribution_report_counts_resolved_and_review_rows(tenant_a, u
     assert quarantined_task_payload["assignee"] is None
 
 
+@pytest.mark.django_db(transaction=True)
 def test_workflow_report_rejects_wrong_owner_and_inactive_principal_pairs(tenant_a, user_in):
     from django.db import connection
 

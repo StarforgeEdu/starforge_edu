@@ -136,9 +136,13 @@ def test_analyze_bounds_huge_comment_volume(tenant_a, as_role, monkeypatch):
     captured: dict = {}
     _mock_complete(monkeypatch, capture=captured)
     director, director_user = as_role(Role.DIRECTOR)
-    student, _ = as_role(Role.STUDENT)
     fid, field = _published_form(director)
-    _submit(student, fid, field, "x" * 50_000)  # a huge single answer
+    # Individual form answers are intentionally bounded at 20,000 characters.
+    # Use several valid large answers to exercise the aggregate prompt cap
+    # without bypassing the public field contract.
+    for _ in range(3):
+        student, _student_user = as_role(Role.STUDENT)
+        _submit(student, fid, field, "x" * 19_000)
     with schema_context(tenant_a.schema_name):
         from apps.forms.models import Form
         from apps.forms.services import request_form_analysis
@@ -156,6 +160,8 @@ def test_analyze_bounds_huge_comment_volume(tenant_a, as_role, monkeypatch):
             ),
         )
         ai_tasks.run_form_analysis(ai_request.pk, params={"form_id": form.id})
+        ai_request.refresh_from_db()
+        assert ai_request.status == ai_request.Status.SUCCEEDED, ai_request.error_detail
     assert len(captured["text"]) < 20_000  # bounded, not the raw 50k
 
 

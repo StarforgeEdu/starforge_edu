@@ -469,7 +469,11 @@ def _components() -> dict:
         duplicates = set(workflow_schemas).intersection(domain_schemas)
         if duplicates:
             raise OpenAPIContractError(f"Duplicate workflow OpenAPI schemas: {', '.join(sorted(duplicates))}")
-        workflow_schemas.update(domain_schemas)
+        # Runtime-warning enrichment below mutates component properties. Keep
+        # the module-owned contract registries immutable so repeated schema
+        # generation and later domain contract tests cannot observe fields
+        # injected by an earlier build.
+        workflow_schemas.update({name: deepcopy(schema) for name, schema in domain_schemas.items()})
 
     components: dict[str, Any] = {
         "securitySchemes": {

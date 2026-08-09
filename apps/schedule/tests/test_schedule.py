@@ -560,6 +560,7 @@ def test_hod_schedule_scope_honors_department_and_branch_memberships(tenant_a, u
     from apps.org.tests.factories import DepartmentFactory
     from apps.users.models import RoleMembership
     from core.permissions import Role
+    from tests.role_principal_helpers import ensure_role_principal
 
     department_hod = user_in(tenant_a)
     branch_hod = user_in(tenant_a)
@@ -596,6 +597,19 @@ def test_hod_schedule_scope_honors_department_and_branch_memberships(tenant_a, u
             user=branch_hod,
             branch=branch,
             role=Role.HEAD_OF_DEPT,
+        )
+        # Production schedule authorization is role-principal-native. A bare
+        # compatibility User plus membership is not a valid staff session and
+        # must not receive a permission union through the legacy bridge.
+        ensure_role_principal(
+            department_hod,
+            roles=[Role.HEAD_OF_DEPT],
+            branch=branch,
+        )
+        ensure_role_principal(
+            branch_hod,
+            roles=[Role.HEAD_OF_DEPT],
+            branch=branch,
         )
         department_hod.refresh_from_db()
         branch_hod.refresh_from_db()

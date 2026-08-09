@@ -7,11 +7,20 @@ runtime method and authentication guards before it accepts explicit metadata.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 from django.test import RequestFactory
 from django.urls import get_resolver, resolve
 
-from core.openapi import _openapi_path, _runtime_methods, _validate_view_contract, _walk, build_schema
+from core.openapi import (
+    _components,
+    _openapi_path,
+    _runtime_methods,
+    _validate_view_contract,
+    _walk,
+    build_schema,
+)
 from core.openapi_contracts import (
     PUBLIC_SECURITY,
     OpenAPIContractError,
@@ -623,6 +632,14 @@ def test_runtime_gate_responses_and_warning_dtos_are_published_globally():
             "items": {"$ref": "#/components/schemas/RuntimeWarning"},
             "description": "Present when an optional dependency is degraded.",
         }
+
+
+def test_component_enrichment_does_not_mutate_domain_contract_registries():
+    from apps.payroll.openapi_contracts import PAYROLL_SCHEMAS
+
+    original = deepcopy(PAYROLL_SCHEMAS)
+    _components()
+    assert original == PAYROLL_SCHEMAS
 
 
 def test_critical_contract_drift_fails_schema_validation_closed():

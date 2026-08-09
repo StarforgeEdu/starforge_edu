@@ -789,6 +789,26 @@ def _assert_existing_oldest_due_retry(
         )
 
 
+def _assert_existing_allocation_integrity(
+    *,
+    existing: list[PaymentAllocation],
+    payment_amount: Decimal,
+) -> None:
+    """Reject legacy/corrupt rows that account for only part of a payment.
+
+    A retry may return existing rows only when those rows still account for
+    the whole received payment. Callers compare the requested retry intent
+    first, preserving ``allocation_intent_mismatch`` for changed retries while
+    preventing a matching partial retry from being accepted as complete.
+    """
+    existing_total = sum((allocation.amount_uzs for allocation in existing), _ZERO).quantize(_CENT)
+    if existing_total != payment_amount.quantize(_CENT):
+        raise ConflictException(
+            _("The payment has an incomplete existing allocation and requires review."),
+            code="allocation_state_inconsistent",
+        )
+
+
 @transaction.atomic
 def allocate_payment(
     *, payment_id: int, amount_uzs: Decimal, invoice_ids: list[int] | None = None
@@ -808,6 +828,28 @@ def allocate_payment(
     payment = _locked_attributed_payment(payment_id)
     _assert_payment_completed(payment)
     payment_scope = (payment.branch_at_payment_id, payment.department_at_payment_id)
+    requested_invoice_ids = set(invoice_ids) if invoice_ids else None
+    intent = _allocation_intent(
+        mode="oldest_due",
+        amount=amount,
+        invoice_ids=requested_invoice_ids,
+    )
+    existing = list(PaymentAllocation.objects.filter(payment_id=payment_id))
+    if existing:
+        # A retry is an idempotency decision, not a fresh amount-validation
+        # request.  Compare it with the committed intent first so a changed
+        # amount/target consistently returns the conflict contract.
+        _assert_existing_oldest_due_retry(
+            existing=existing,
+            amount=amount,
+            invoice_ids=requested_invoice_ids,
+        )
+        _assert_existing_allocation_integrity(
+            existing=existing,
+            payment_amount=payment.amount_uzs,
+        )
+        _claim_allocation_intent(payment, intent)
+        return existing
     if amount > payment.amount_uzs:
         raise ValidationException(
             _("Allocation exceeds the amount received."),
@@ -818,21 +860,6 @@ def allocate_payment(
             _("The complete payment amount must be allocated in one immutable operation."),
             code="allocation_total_mismatch",
         )
-    requested_invoice_ids = set(invoice_ids) if invoice_ids else None
-    intent = _allocation_intent(
-        mode="oldest_due",
-        amount=amount,
-        invoice_ids=requested_invoice_ids,
-    )
-    existing = list(PaymentAllocation.objects.filter(payment_id=payment_id))
-    if existing:  # already allocated — idempotent no-op
-        _assert_existing_oldest_due_retry(
-            existing=existing,
-            amount=amount,
-            invoice_ids=requested_invoice_ids,
-        )
-        _claim_allocation_intent(payment, intent)
-        return existing
     _claim_allocation_intent(payment, intent)
 
     if invoice_ids:
@@ -919,16 +946,6 @@ def allocate_payment_lines(*, payment_id: int, lines: list[dict[str, Any]]) -> l
         per_invoice[inv_id] = per_invoice.get(inv_id, _ZERO) + amount
 
     total = sum(per_invoice.values(), _ZERO).quantize(_CENT)
-    if total > payment.amount_uzs:
-        raise ValidationException(
-            _("Allocations exceed the amount received."),
-            code="allocation_exceeds_payment",
-        )
-    if total < payment.amount_uzs:
-        raise ValidationException(
-            _("The complete payment amount must be allocated in one immutable operation."),
-            code="allocation_total_mismatch",
-        )
     intent = _allocation_intent(
         mode="explicit_lines",
         amount=total,
@@ -946,8 +963,22 @@ def allocate_payment_lines(*, payment_id: int, lines: list[dict[str, Any]]) -> l
                 _("This payment was already allocated with another intent."),
                 code="allocation_intent_mismatch",
             )
+        _assert_existing_allocation_integrity(
+            existing=existing,
+            payment_amount=payment.amount_uzs,
+        )
         _claim_allocation_intent(payment, intent)
         return existing
+    if total > payment.amount_uzs:
+        raise ValidationException(
+            _("Allocations exceed the amount received."),
+            code="allocation_exceeds_payment",
+        )
+    if total < payment.amount_uzs:
+        raise ValidationException(
+            _("The complete payment amount must be allocated in one immutable operation."),
+            code="allocation_total_mismatch",
+        )
     _claim_allocation_intent(payment, intent)
 
     invoices = {
@@ -1851,7 +1882,6 @@ def build_statement_export(export_id: UUID | str) -> str | None:
         with transaction.atomic():
             export = (
                 StatementExport.objects.select_for_update()
-                .select_related("student__user", "requested_by")
                 .prefetch_related("invoice_links")
                 .get(pk=export_uuid)
             )
@@ -1912,7 +1942,6 @@ def build_statement_export(export_id: UUID | str) -> str | None:
         with transaction.atomic():
             locked = (
                 StatementExport.objects.select_for_update()
-                .select_related("student__user", "requested_by")
                 .prefetch_related("invoice_links")
                 .get(pk=export_uuid)
             )
@@ -1960,7 +1989,6 @@ def mark_statement_export_failed(export_id: UUID | str, exc: Exception) -> None:
     with transaction.atomic():
         export = (
             StatementExport.objects.select_for_update()
-            .select_related("student__user", "requested_by")
             .prefetch_related("invoice_links")
             .filter(pk=export_uuid)
             .exclude(status__in=(StatementExport.Status.DONE, StatementExport.Status.EXPIRED))
@@ -2036,7 +2064,6 @@ def expire_statement_exports(*, now=None, batch_size: int = 100) -> int:
             with transaction.atomic():
                 export = (
                     StatementExport.objects.select_for_update()
-                    .select_related("student__user", "requested_by")
                     .prefetch_related("invoice_links")
                     .filter(
                         pk=export_id,

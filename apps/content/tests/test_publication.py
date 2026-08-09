@@ -293,10 +293,16 @@ def test_manager_reaches_pending_only_inside_exact_scope(tenant_a, user_in):
     from apps.content import selectors
     from apps.content.tests.factories import ContentLibraryFactory, FolderFactory
     from apps.org.tests.factories import DepartmentFactory
+    from tests.role_principal_helpers import ensure_role_principal
 
     hod = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT])
     with schema_context(tenant_a.schema_name):
         branch = hod.role_memberships.get().branch
+        ensure_role_principal(
+            hod,
+            roles=[Role.HEAD_OF_DEPT],
+            branch=branch,
+        )
         department = DepartmentFactory(branch=branch)
         in_scope = ContentLibraryFactory(visibility="department", department=department)
         in_scope_pending = LessonFileFactory(

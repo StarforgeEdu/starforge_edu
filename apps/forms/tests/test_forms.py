@@ -46,20 +46,20 @@ def test_create_and_update_form_audience(tenant_a, as_role):
     """F3-2: a form can target roles and/or specific users; the audience round-trips."""
     director, _ = as_role(Role.DIRECTOR)
     _teacher_client, teacher = as_role(Role.TEACHER)
-    _support_client, support = as_role(Role.SUPPORT)
+    _registrar_client, registrar = as_role(Role.REGISTRAR)
     created = director.post(
         FORMS,
         {
             "title": "Staff survey",
             "audience_roles": ["teacher", "teacher"],
-            "audience_user_ids": [teacher.pk, teacher.pk, support.pk],
+            "audience_user_ids": [teacher.pk, teacher.pk, registrar.pk],
         },
         format="json",
     )
     assert created.status_code == 201, created.content
     data = created.json()["data"]
     assert data["audience_roles"] == ["teacher"]  # deduped
-    assert data["audience_user_ids"] == [teacher.pk, support.pk]  # deduped
+    assert data["audience_user_ids"] == [teacher.pk, registrar.pk]  # deduped
 
     fid = data["id"]
     patched = director.patch(f"{FORMS}{fid}/", {"audience_roles": ["registrar"]}, format="json")
@@ -82,7 +82,10 @@ def test_shared_bridge_principals_do_not_share_form_target_or_dedupe_identity(te
         form = Form.objects.create(
             title="Teacher-only",
             status=Form.Status.PUBLISHED,
-            branch=branch,
+            # Centre-wide keeps the staff account on the responder path. If this
+            # were branch-bound, the registrar's forms:write grant would make it
+            # visible as a manageable form independently of its audience.
+            branch=None,
             audience_user_ids=[user.pk],
             audience_principals=[{"kind": "teacher", "id": teacher.pk, "user_id": user.pk}],
             published_at=timezone.now(),

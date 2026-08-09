@@ -357,15 +357,21 @@ def allocate_manual(*, payment_id: int, allocations: list[dict[str, Any]]) -> Pa
     if not allocations:
         raise ValidationException(_("At least one allocation line is required."), code="no_allocations")
     total = sum((Decimal(str(a["amount"])) for a in allocations), Decimal("0")).quantize(Decimal("0.01"))
-    if total > payment.amount_uzs:
-        raise UnprocessableEntity(_("Allocations exceed the payment amount."), code="over_allocation")
-    if total < payment.amount_uzs:
-        raise UnprocessableEntity(
-            _("The complete payment amount must be allocated."),
-            code="allocation_total_mismatch",
-        )
+    # Once an allocation exists, let the finance domain compare the exact
+    # committed line intent before applying fresh-request amount validation.
+    # This keeps changed retries on the stable idempotency-conflict contract.
+    from apps.finance.models import PaymentAllocation
     from apps.finance.services import allocate_payment_lines
 
+    has_existing = PaymentAllocation.objects.filter(payment_id=payment.pk).exists()
+    if not has_existing:
+        if total > payment.amount_uzs:
+            raise UnprocessableEntity(_("Allocations exceed the payment amount."), code="over_allocation")
+        if total < payment.amount_uzs:
+            raise UnprocessableEntity(
+                _("The complete payment amount must be allocated."),
+                code="allocation_total_mismatch",
+            )
     allocate_payment_lines(
         payment_id=payment.pk,
         lines=[{"invoice": int(a["invoice"]), "amount": Decimal(str(a["amount"]))} for a in allocations],

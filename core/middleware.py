@@ -641,7 +641,22 @@ class OrganizationTimezoneMiddleware:
         self.get_response = get_response
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
+        from core.exceptions import ServiceUnavailableException
         from core.timezones import organization_timezone_context
 
-        with organization_timezone_context():
-            return self.get_response(request)
+        try:
+            with organization_timezone_context():
+                return self.get_response(request)
+        except ServiceUnavailableException as exc:
+            # Exceptions raised while entering middleware context do not reach
+            # Django's process_exception hooks. Render the one expected domain
+            # failure here so missing/invalid organization time policy is a
+            # stable fail-closed 503 rather than a leaked test-client exception.
+            return JsonResponse(
+                {
+                    "success": False,
+                    "code": exc.code,
+                    "message": str(exc.detail),
+                },
+                status=exc.status_code,
+            )

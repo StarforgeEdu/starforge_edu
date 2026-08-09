@@ -45,16 +45,28 @@ def _draft_test(tenant, branch, builder):
         return create_test(title="EN placement", created_by=builder, branch=branch)
 
 
-def _setup(tenant, user_in, as_user):
+def _setup(tenant, user_in, client_for):
     from apps.org.tests.factories import BranchFactory
+    from core.role_principals import RolePrincipal
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
 
     with schema_context(tenant.schema_name):
         branch = BranchFactory.create()
-    teacher_u = user_in(tenant, roles=[Role.TEACHER], branch=branch)
+        teacher_u = user_in(tenant, roles=[Role.TEACHER], branch=branch)
+        teacher_profile = ensure_role_principal(
+            teacher_u,
+            roles=[Role.TEACHER],
+            branch=branch,
+        )
     return {
         "branch": branch,
         "teacher_u": teacher_u,
-        "teacher": as_user(tenant, teacher_u),
+        "teacher": exact_session_client(client_for, tenant, teacher_u),
+        "teacher_principal": RolePrincipal(
+            kind="teacher",
+            principal_id=teacher_profile.pk,
+            user_id=teacher_u.pk,
+        ),
     }
 
 
@@ -88,10 +100,10 @@ def _mock_complete(monkeypatch, text):
     )
 
 
-def test_generate_applies_only_valid_questions(tenant_a, user_in, as_user, monkeypatch):
+def test_generate_applies_only_valid_questions(tenant_a, user_in, client_for, monkeypatch):
     from celery_tasks import ai_tasks
 
-    s = _setup(tenant_a, user_in, as_user)
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     _mock_complete(monkeypatch, json.dumps(_GOOD_QUESTIONS))
     test = _draft_test(tenant_a, s["branch"], s["teacher_u"])
@@ -100,7 +112,12 @@ def test_generate_applies_only_valid_questions(tenant_a, user_in, as_user, monke
         from apps.placement.models import PlacementQuestion
         from apps.placement.services import request_placement_generation
 
-        ai_request = request_placement_generation(test=test, count=4, requested_by=s["teacher_u"])
+        ai_request = request_placement_generation(
+            test=test,
+            count=4,
+            requested_by=s["teacher_u"],
+            requested_principal=s["teacher_principal"],
+        )
         ai_tasks.run_placement_generation(
             ai_request.pk, params={"test_id": test.id, "count": 4, "difficulty": "medium", "topic": ""}
         )
@@ -110,10 +127,10 @@ def test_generate_applies_only_valid_questions(tenant_a, user_in, as_user, monke
         assert PlacementQuestion.objects.filter(test=test).count() == 3
 
 
-def test_generate_tolerates_unparseable_output(tenant_a, user_in, as_user, monkeypatch):
+def test_generate_tolerates_unparseable_output(tenant_a, user_in, client_for, monkeypatch):
     from celery_tasks import ai_tasks
 
-    s = _setup(tenant_a, user_in, as_user)
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     _mock_complete(monkeypatch, "Sorry, I can't do that.")  # not JSON
     test = _draft_test(tenant_a, s["branch"], s["teacher_u"])
@@ -122,7 +139,12 @@ def test_generate_tolerates_unparseable_output(tenant_a, user_in, as_user, monke
         from apps.placement.models import PlacementQuestion
         from apps.placement.services import request_placement_generation
 
-        ai_request = request_placement_generation(test=test, count=4, requested_by=s["teacher_u"])
+        ai_request = request_placement_generation(
+            test=test,
+            count=4,
+            requested_by=s["teacher_u"],
+            requested_principal=s["teacher_principal"],
+        )
         ai_tasks.run_placement_generation(
             ai_request.pk,
             params={"test_id": test.id, "count": 4, "difficulty": "medium", "topic": ""},
@@ -133,10 +155,10 @@ def test_generate_tolerates_unparseable_output(tenant_a, user_in, as_user, monke
         assert PlacementQuestion.objects.filter(test=test).count() == 0
 
 
-def test_generate_strips_markdown_fences(tenant_a, user_in, as_user, monkeypatch):
+def test_generate_strips_markdown_fences(tenant_a, user_in, client_for, monkeypatch):
     from celery_tasks import ai_tasks
 
-    s = _setup(tenant_a, user_in, as_user)
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     fenced = "```json\n" + json.dumps(_GOOD_QUESTIONS[:1]) + "\n```"
     _mock_complete(monkeypatch, fenced)
@@ -145,7 +167,12 @@ def test_generate_strips_markdown_fences(tenant_a, user_in, as_user, monkeypatch
         from apps.placement.models import PlacementQuestion
         from apps.placement.services import request_placement_generation
 
-        ai_request = request_placement_generation(test=test, count=1, requested_by=s["teacher_u"])
+        ai_request = request_placement_generation(
+            test=test,
+            count=1,
+            requested_by=s["teacher_u"],
+            requested_principal=s["teacher_principal"],
+        )
         ai_tasks.run_placement_generation(
             ai_request.pk,
             params={"test_id": test.id, "count": 1, "difficulty": "medium", "topic": ""},
@@ -153,11 +180,11 @@ def test_generate_strips_markdown_fences(tenant_a, user_in, as_user, monkeypatch
         assert PlacementQuestion.objects.filter(test=test).count() == 1
 
 
-def test_generate_does_not_mutate_a_non_draft_test(tenant_a, user_in, as_user, monkeypatch):
+def test_generate_does_not_mutate_a_non_draft_test(tenant_a, user_in, client_for, monkeypatch):
     """If the test leaves DRAFT between request and task completion, apply is a no-op."""
     from celery_tasks import ai_tasks
 
-    s = _setup(tenant_a, user_in, as_user)
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     _mock_complete(monkeypatch, json.dumps(_GOOD_QUESTIONS[:1]))
     test = _draft_test(tenant_a, s["branch"], s["teacher_u"])
@@ -165,7 +192,12 @@ def test_generate_does_not_mutate_a_non_draft_test(tenant_a, user_in, as_user, m
         from apps.placement.models import PlacementQuestion, PlacementTest
         from apps.placement.services import request_placement_generation
 
-        ai_request = request_placement_generation(test=test, count=1, requested_by=s["teacher_u"])
+        ai_request = request_placement_generation(
+            test=test,
+            count=1,
+            requested_by=s["teacher_u"],
+            requested_principal=s["teacher_principal"],
+        )
         # the test advances out of DRAFT before the task runs
         PlacementTest.objects.filter(pk=test.id).update(status=PlacementTest.Status.PENDING)
         ai_tasks.run_placement_generation(
@@ -175,8 +207,8 @@ def test_generate_does_not_mutate_a_non_draft_test(tenant_a, user_in, as_user, m
         assert PlacementQuestion.objects.filter(test=test).count() == 0
 
 
-def test_generate_endpoint_returns_202(tenant_a, user_in, as_user, monkeypatch):
-    s = _setup(tenant_a, user_in, as_user)
+def test_generate_endpoint_returns_202(tenant_a, user_in, client_for, monkeypatch):
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     _mock_complete(monkeypatch, json.dumps(_GOOD_QUESTIONS))
     tid = (
@@ -187,8 +219,8 @@ def test_generate_endpoint_returns_202(tenant_a, user_in, as_user, monkeypatch):
     assert r.json()["data"]["request_id"]
 
 
-def test_generate_endpoint_blocked_when_feature_disabled(tenant_a, user_in, as_user):
-    s = _setup(tenant_a, user_in, as_user)
+def test_generate_endpoint_blocked_when_feature_disabled(tenant_a, user_in, client_for):
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a, enabled=False)  # centre has AI generation off
     tid = (
         s["teacher"].post(TESTS, {"title": "T", "branch": s["branch"].id}, format="json").json()["data"]["id"]
@@ -198,8 +230,8 @@ def test_generate_endpoint_blocked_when_feature_disabled(tenant_a, user_in, as_u
     assert r.json()["code"] == "feature_disabled"
 
 
-def test_generate_endpoint_rejects_a_non_draft_test(tenant_a, user_in, as_user):
-    s = _setup(tenant_a, user_in, as_user)
+def test_generate_endpoint_rejects_a_non_draft_test(tenant_a, user_in, client_for):
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     tid = (
         s["teacher"].post(TESTS, {"title": "T", "branch": s["branch"].id}, format="json").json()["data"]["id"]
@@ -219,11 +251,11 @@ def test_generate_endpoint_rejects_a_non_draft_test(tenant_a, user_in, as_user):
     assert r.json()["code"] == "test_not_draft"
 
 
-def test_apply_skips_unknown_types_and_bounds_points_without_failing(tenant_a, user_in, as_user):
+def test_apply_skips_unknown_types_and_bounds_points_without_failing(tenant_a, user_in, client_for):
     """Never-raise invariant: a hallucinated question type (incl. one longer than the
     varchar(16) column) or an out-of-range points value is skipped/clamped, never a
     DB error that discards the whole batch."""
-    s = _setup(tenant_a, user_in, as_user)
+    s = _setup(tenant_a, user_in, client_for)
     test = _draft_test(tenant_a, s["branch"], s["teacher_u"])
     payload = json.dumps(
         [
@@ -243,9 +275,9 @@ def test_apply_skips_unknown_types_and_bounds_points_without_failing(tenant_a, u
         assert q.points == 100  # clamped from 40000, no smallint overflow
 
 
-def test_apply_is_idempotent_on_reapply(tenant_a, user_in, as_user):
+def test_apply_is_idempotent_on_reapply(tenant_a, user_in, client_for):
     """A task retry re-runs the persist hook; dedup-by-prompt stops a double-apply."""
-    s = _setup(tenant_a, user_in, as_user)
+    s = _setup(tenant_a, user_in, client_for)
     test = _draft_test(tenant_a, s["branch"], s["teacher_u"])
     payload = json.dumps(_GOOD_QUESTIONS)
     with schema_context(tenant_a.schema_name):
@@ -264,8 +296,8 @@ def test_apply_tolerates_a_vanished_test(tenant_a):
         assert apply_generated_questions(test_id=999999, output_text="[]") == 0  # no DoesNotExist
 
 
-def test_student_cannot_generate(tenant_a, user_in, as_user):
-    s = _setup(tenant_a, user_in, as_user)
+def test_student_cannot_generate(tenant_a, user_in, client_for, as_user):
+    s = _setup(tenant_a, user_in, client_for)
     _seed_placement_ai(tenant_a)
     tid = (
         s["teacher"].post(TESTS, {"title": "T", "branch": s["branch"].id}, format="json").json()["data"]["id"]

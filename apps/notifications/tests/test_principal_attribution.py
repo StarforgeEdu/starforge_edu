@@ -217,24 +217,38 @@ def test_backfill_defaults_to_dry_run(tenant_a):
         assert legacy.recipient_principal_id is None
 
 
-def test_backfill_cross_batch_duplicates_match_review_and_apply(tenant_a, tmp_path):
+def test_backfill_cross_batch_duplicates_match_review_and_apply(tenant_a, tmp_path, monkeypatch):
     """Global identity conflicts cannot depend on the operator's batch size."""
+    from apps.notifications.management.commands import backfill_notification_principals as command
     from apps.parents.tests.factories import ParentProfileFactory
     from apps.users.tests.factories import UserFactory
 
     with schema_context(tenant_a.schema_name):
         user = UserFactory()
-        ParentProfileFactory(user=user)
+        parent = ParentProfileFactory(user=user)
         rows = [
             Notification(
                 user=user,
                 event_type=EventType.REPORT_READY,
                 title=f"legacy duplicate {index}",
-                dedupe_key="cross-batch-duplicate",
+                # Current schemas correctly reject exact unresolved duplicates.
+                # Distinct raw legacy keys can still normalize to one reviewed
+                # identity, which is the cross-batch condition this test owns.
+                dedupe_key=f"cross-batch-duplicate-{index}",
             )
             for index in range(2)
         ]
         Notification.objects.bulk_create(rows)
+
+    row_ids = {item.pk for item in rows}
+    original_candidate_key = command._candidate_identity_key
+
+    def normalized_candidate_key(model, row, resolution):
+        if model is Notification and row.pk in row_ids:
+            return ("parent", parent.pk, "normalized-legacy-duplicate")
+        return original_candidate_key(model, row, resolution)
+
+    monkeypatch.setattr(command, "_candidate_identity_key", normalized_candidate_key)
 
     report_path = tmp_path / "notification-review.json"
     call_command(
@@ -245,7 +259,7 @@ def test_backfill_cross_batch_duplicates_match_review_and_apply(tenant_a, tmp_pa
         stdout=StringIO(),
     )
     review = json.loads(report_path.read_text())
-    reviewed_rows = [row for row in review["rows"] if row["id"] in {item.pk for item in rows}]
+    reviewed_rows = [row for row in review["rows"] if row["id"] in row_ids]
     assert len(reviewed_rows) == 2
     assert {row["status"] for row in reviewed_rows} == {RecipientAttributionStatus.CONFLICTING}
 

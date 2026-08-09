@@ -687,9 +687,9 @@ def test_all_four_signals_emitted(tenant_a, user_in, django_capture_on_commit_ca
     for signal, fn in receivers.values():
         signal.connect(fn)
     try:
-        teacher_user = user_in(tenant_a, roles=["teacher"])
         with schema_context(tenant_a.schema_name):
             branch = BranchFactory()
+            teacher_user = user_in(tenant_a, roles=["teacher"], branch=branch)
             teacher_profile = TeacherProfileFactory(user=teacher_user, branch=branch)
             cohort = CohortFactory(branch=branch, primary_teacher=teacher_profile)
             student = _member(cohort, branch)
@@ -704,7 +704,17 @@ def test_all_four_signals_emitted(tenant_a, user_in, django_capture_on_commit_ca
             sub = services.submit(assignment=draft, student=student)
             with django_capture_on_commit_callbacks(execute=True):
                 services.grade_submission(submission=sub, score=Decimal("90"))
-            services.request_ai_feedback(submission=sub, requested_by=teacher_user)
+            from core.role_principals import RolePrincipal
+
+            services.request_ai_feedback(
+                submission=sub,
+                requested_by=teacher_user,
+                requested_principal=RolePrincipal(
+                    kind="teacher",
+                    principal_id=teacher_profile.pk,
+                    user_id=teacher_user.pk,
+                ),
+            )
 
         assert seen == {"published", "due_soon", "graded", "ai"}
     finally:

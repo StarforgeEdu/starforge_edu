@@ -12,11 +12,16 @@ from apps.cohorts.tests.factories import CohortFactory
 from apps.org.tests.factories import BranchFactory
 from apps.teachers.models import TeacherType
 from apps.teachers.tests.factories import TeacherProfileFactory
+from tests.migration_isolation import IsolatedMigrationHarness
+
+TYPED_TARGET = ("cohorts", "0004_typed_teacher_assignments")
+FINAL_TARGET = ("cohorts", "0005_finalize_typed_teacher_assignments")
 
 
 @pytest.mark.django_db(transaction=True)
 def test_migration_preserves_primary_and_legacy_role_rows(tenant_a):
     """An old primary teacher who was also a co-teacher retains both responsibilities."""
+    migrations = IsolatedMigrationHarness(connection, (TYPED_TARGET, FINAL_TARGET))
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
         primary = TeacherProfileFactory(branch=branch)
@@ -33,9 +38,9 @@ def test_migration_preserves_primary_and_legacy_role_rows(tenant_a):
             teacher_type=TeacherType.objects.get(slug="assistant"),
         )
 
-        executor = MigrationExecutor(connection)
         try:
-            executor.migrate([("cohorts", "0003_initial")])
+            migrations.downgrade()
+            executor = MigrationExecutor(connection)
             old_state = executor.loader.project_state([("cohorts", "0003_initial")])
             old_assignment = old_state.apps.get_model("cohorts", "CohortTeacher")
             old_rows = set(
@@ -46,12 +51,10 @@ def test_migration_preserves_primary_and_legacy_role_rows(tenant_a):
                 (assistant.id, "assistant"),
             }
 
-            executor = MigrationExecutor(connection)
-            executor.migrate([("cohorts", "0005_finalize_typed_teacher_assignments")])
+            migrations.upgrade()
         finally:
             # Always restore the tenant schema for fixture teardown and later tests.
-            executor = MigrationExecutor(connection)
-            executor.migrate([("cohorts", "0005_finalize_typed_teacher_assignments")])
+            migrations.upgrade()
 
         migrated = set(
             CohortTeacher.objects.filter(cohort_id=cohort.id).values_list(

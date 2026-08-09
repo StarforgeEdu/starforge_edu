@@ -15,6 +15,7 @@ from core.security_config import validate_exact_https_origins
 from .base import *  # noqa: F403
 from .base import (
     AI_ENABLED,
+    APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS,
     CLICK_CHECKOUT_ALLOWED_HOSTS,
     CLICK_CHECKOUT_URL,
     CORS_ALLOWED_ORIGINS,
@@ -113,6 +114,8 @@ if not 1 <= WEBSOCKET_MAX_CONNECTIONS_PER_SESSION <= 20:
     raise ImproperlyConfigured("WEBSOCKET_MAX_CONNECTIONS_PER_SESSION must be between 1 and 20.")
 if not 60 <= WEBSOCKET_CONNECTION_LEASE_SECONDS <= 300:
     raise ImproperlyConfigured("WEBSOCKET_CONNECTION_LEASE_SECONDS must be between 60 and 300.")
+if not 1 <= APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS <= 300:
+    raise ImproperlyConfigured("APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS must be between 1 and 300.")
 
 # Production terminates TLS behind a reverse proxy (SECURE_PROXY_SSL_HEADER below),
 # so NUM_PROXIES MUST reflect the trusted hop count — otherwise client_ip / DRF's

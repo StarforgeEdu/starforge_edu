@@ -151,10 +151,19 @@ def _window(branch_id: int) -> dict[str, str | int]:
     }
 
 
+def _exact_staff_client(client_for, tenant, user):
+    """Authenticate the production-shaped staff principal used by this workflow."""
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
+
+    with schema_context(tenant.schema_name):
+        ensure_role_principal(user, roles=[Role.DIRECTOR])
+    return exact_session_client(client_for, tenant, user)
+
+
 def test_director_contract_uses_one_scope_window_and_permission_pruned_aggregates(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.org.models import CenterSettings
 
@@ -181,7 +190,7 @@ def test_director_contract_uses_one_scope_window_and_permission_pruned_aggregate
         settings_row.save(update_fields=("currency_primary",))
         director = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
 
-    response = as_user(tenant_a, director).get(SUMMARY, _window(branch.pk))
+    response = _exact_staff_client(client_for, tenant_a, director).get(SUMMARY, _window(branch.pk))
 
     assert response.status_code == 200, response.content
     assert response["Cache-Control"] == "private, no-cache, max-age=0, must-revalidate"
@@ -312,7 +321,7 @@ def test_director_contract_uses_one_scope_window_and_permission_pruned_aggregate
 def test_student_branch_transfer_does_not_move_historical_finance_totals(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     with schema_context(tenant_a.schema_name):
         source, _source_department, _source_cohort, source_students = _branch_fixture(
@@ -334,7 +343,7 @@ def test_student_branch_transfer_does_not_move_historical_finance_totals(
         director = user_in(tenant_a, roles=[Role.DIRECTOR], branch=source)
 
     cache.clear()
-    client = as_user(tenant_a, director)
+    client = _exact_staff_client(client_for, tenant_a, director)
     source_response = client.get(SUMMARY, _window(source.pk))
     destination_response = client.get(SUMMARY, _window(destination.pk))
     assert source_response.status_code == 200, source_response.content
@@ -357,7 +366,7 @@ def test_student_branch_transfer_does_not_move_historical_finance_totals(
 def test_student_department_transfer_does_not_move_historical_finance_totals(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.cohorts.tests.factories import CohortFactory
     from apps.org.tests.factories import DepartmentFactory
@@ -386,7 +395,7 @@ def test_student_department_transfer_does_not_move_historical_finance_totals(
         director = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
 
     cache.clear()
-    client = as_user(tenant_a, director)
+    client = _exact_staff_client(client_for, tenant_a, director)
     source_response = client.get(
         SUMMARY,
         {**_window(branch.pk), "department": source_department.pk},
@@ -417,7 +426,7 @@ def test_student_department_transfer_does_not_move_historical_finance_totals(
 def test_executive_finance_omits_unreviewed_historical_rows(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
     attribution_status,
 ):
     from apps.finance.models import Invoice, PaymentAllocation, Refund
@@ -468,7 +477,7 @@ def test_executive_finance_omits_unreviewed_historical_rows(
         director = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
 
     cache.clear()
-    response = as_user(tenant_a, director).get(SUMMARY, _window(branch.pk))
+    response = _exact_staff_client(client_for, tenant_a, director).get(SUMMARY, _window(branch.pk))
     assert response.status_code == 200, response.content
     data = response.json()["data"]
 
@@ -483,7 +492,7 @@ def test_executive_finance_omits_unreviewed_historical_rows(
 def test_department_head_is_exactly_scoped_and_finance_is_omitted_not_zero(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.cohorts.tests.factories import CohortFactory
     from apps.org.tests.factories import DepartmentFactory
@@ -514,7 +523,7 @@ def test_department_head_is_exactly_scoped_and_finance_is_omitted_not_zero(
         )
         user.refresh_from_db()
 
-    response = as_user(tenant_a, user).get(SUMMARY, _window(branch.pk))
+    response = _exact_staff_client(client_for, tenant_a, user).get(SUMMARY, _window(branch.pk))
     assert response.status_code == 200, response.content
     data = response.json()["data"]
 
@@ -534,7 +543,7 @@ def test_department_head_is_exactly_scoped_and_finance_is_omitted_not_zero(
 def test_permission_from_remote_membership_cannot_be_borrowed_for_local_scope(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.users.models import RoleMembership
 
@@ -570,7 +579,7 @@ def test_permission_from_remote_membership_cannot_be_borrowed_for_local_scope(
             account_type=remote_type,
         )
         user.refresh_from_db()
-    client = as_user(tenant_a, user)
+    client = _exact_staff_client(client_for, tenant_a, user)
 
     local_response = client.get(SUMMARY, _window(local.pk))
     remote_response = client.get(SUMMARY, _window(remote.pk))
@@ -584,7 +593,7 @@ def test_permission_from_remote_membership_cannot_be_borrowed_for_local_scope(
 def test_legacy_grant_and_revoke_overrides_apply_to_each_section_immediately(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.access.services import set_override
 
@@ -602,7 +611,7 @@ def test_legacy_grant_and_revoke_overrides_apply_to_each_section_immediately(
         set_override(role=Role.HEAD_OF_DEPT, permission="attendance:read", effect="revoke")
         user.refresh_from_db()
 
-    response = as_user(tenant_a, user).get(SUMMARY, _window(branch.pk))
+    response = _exact_staff_client(client_for, tenant_a, user).get(SUMMARY, _window(branch.pk))
 
     assert response.status_code == 200, response.content
     data = response.json()["data"]
@@ -667,7 +676,7 @@ def test_strict_filter_validation_and_method_contract(tenant_a, user_in, as_user
     assert client.post(SUMMARY, {}, format="json").status_code == 405
 
 
-def test_private_etag_and_short_cache_revalidation(tenant_a, user_in, as_user):
+def test_private_etag_and_short_cache_revalidation(tenant_a, user_in, client_for):
     from apps.students.tests.factories import StudentProfileFactory
 
     with schema_context(tenant_a.schema_name):
@@ -677,7 +686,7 @@ def test_private_etag_and_short_cache_revalidation(tenant_a, user_in, as_user):
             student_count=1,
         )
         user = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
-    client = as_user(tenant_a, user)
+    client = _exact_staff_client(client_for, tenant_a, user)
     query = _window(branch.pk)
 
     first = client.get(SUMMARY, query)
@@ -707,7 +716,7 @@ def test_private_etag_and_short_cache_revalidation(tenant_a, user_in, as_user):
 def test_cache_outage_does_not_take_down_authoritative_summary(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
     monkeypatch,
     failing_operation,
 ):
@@ -726,7 +735,7 @@ def test_cache_outage_does_not_take_down_authoritative_summary(
         f"apps.intelligence.views.v1.intelligence_views.cache.{failing_operation}",
         unavailable,
     )
-    response = as_user(tenant_a, user).get(SUMMARY, _window(branch.pk))
+    response = _exact_staff_client(client_for, tenant_a, user).get(SUMMARY, _window(branch.pk))
 
     assert response.status_code == 200, response.content
     assert response.json()["data"]["students"]["total"] == 1
@@ -737,7 +746,7 @@ def test_cache_isolated_by_tenant_scope_permissions_and_locale(
     tenant_a,
     tenant_b,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.users.models import RoleMembership
 
@@ -773,9 +782,9 @@ def test_cache_isolated_by_tenant_scope_permissions_and_locale(
         )
         director_b = user_in(tenant_b, roles=[Role.DIRECTOR], branch=branch_b)
 
-    director_a_client = as_user(tenant_a, director_a)
-    limited_client = as_user(tenant_a, limited)
-    director_b_client = as_user(tenant_b, director_b)
+    director_a_client = _exact_staff_client(client_for, tenant_a, director_a)
+    limited_client = _exact_staff_client(client_for, tenant_a, limited)
+    director_b_client = _exact_staff_client(client_for, tenant_b, director_b)
     a_en = director_a_client.get(
         SUMMARY,
         _window(branch_a.pk),
@@ -809,12 +818,13 @@ def test_cache_isolated_by_tenant_scope_permissions_and_locale(
 def test_personal_attention_is_exact_principal_scoped_and_cache_isolated(
     tenant_a,
     user_in,
-    as_user,
+    client_for,
 ):
     from apps.approvals.models import ApprovalRequest
     from apps.meetings.models import MeetingAttendee, StaffMeeting
     from apps.notifications.models import Notification, RecipientAttributionStatus
     from apps.tasks.models import Task
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
 
     with schema_context(tenant_a.schema_name):
         branch, _department, _cohort, _students = _branch_fixture(
@@ -824,9 +834,8 @@ def test_personal_attention_is_exact_principal_scoped_and_cache_isolated(
         )
         first = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
         second = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
-        first.refresh_from_db()
-        second.refresh_from_db()
-        first_principal = first.staff_profile
+        first_principal = ensure_role_principal(first, roles=[Role.DIRECTOR])
+        ensure_role_principal(second, roles=[Role.DIRECTOR])
         Notification.objects.create(
             user=first,
             event_type="approval.approved",
@@ -877,8 +886,8 @@ def test_personal_attention_is_exact_principal_scoped_and_cache_isolated(
         "date_from": today.isoformat(),
         "date_to": (today + timedelta(days=30)).isoformat(),
     }
-    first_response = as_user(tenant_a, first).get(SUMMARY, query)
-    second_response = as_user(tenant_a, second).get(SUMMARY, query)
+    first_response = exact_session_client(client_for, tenant_a, first).get(SUMMARY, query)
+    second_response = exact_session_client(client_for, tenant_a, second).get(SUMMARY, query)
 
     assert first_response.status_code == 200, first_response.content
     assert second_response.status_code == 200, second_response.content

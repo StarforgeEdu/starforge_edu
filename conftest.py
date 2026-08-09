@@ -36,9 +36,72 @@ def _ensure_tenants() -> None:
 
 @pytest.fixture(scope="session")
 def django_db_setup(django_db_setup, django_db_blocker):
-    """Provision tenant_a + tenant_b once per session (the slow part)."""
+    """Provision tenants and make transactional teardown schema-aware.
+
+    Django's ``TransactionTestCase`` flushes whichever PostgreSQL schema is on
+    the connection when teardown starts. A tenant HTTP request leaves that
+    schema selected, while a ``schema_context`` block restores ``public``. The
+    stock teardown is therefore nondeterministic in a multi-schema test suite:
+    it can either erase one tenant's migration-seeded catalogues or erase the
+    public control plane while leaving committed tenant rows behind.
+
+    Capture the small post-migration baseline for every test schema once, then
+    replace only ``TransactionTestCase`` teardown with an all-schema
+    flush/restore. Ordinary Django ``TestCase`` tests keep their fast rollback.
+    Each xdist worker owns its database and therefore its own snapshots.
+    """
     with django_db_blocker.unblock():
         _ensure_tenants()
+        snapshots = _serialize_test_schema_baselines()
+
+    from django.test import TransactionTestCase
+
+    original_fixture_teardown = TransactionTestCase._fixture_teardown
+
+    def _tenant_fixture_teardown(_test_case):
+        with django_db_blocker.unblock():
+            _restore_test_schema_baselines(snapshots)
+
+    TransactionTestCase._fixture_teardown = _tenant_fixture_teardown
+    try:
+        yield
+    finally:
+        TransactionTestCase._fixture_teardown = original_fixture_teardown
+
+
+def _serialize_test_schema_baselines() -> dict[str, str]:
+    """Serialize only rows that exist immediately after tenant provisioning."""
+    from django.db import connection
+
+    schemas = (get_public_schema_name(), *TENANTS)
+    snapshots: dict[str, str] = {}
+    for schema_name in schemas:
+        with schema_context(schema_name):
+            snapshots[schema_name] = connection.creation.serialize_db_to_string()
+    return snapshots
+
+
+def _restore_test_schema_baselines(snapshots: dict[str, str]) -> None:
+    """Remove committed test data and restore canonical migration seed rows."""
+    from django.core.management import call_command
+    from django.db import connection
+
+    try:
+        for schema_name, serialized_rows in snapshots.items():
+            with schema_context(schema_name):
+                call_command(
+                    "flush",
+                    verbosity=0,
+                    interactive=False,
+                    database=connection.alias,
+                    reset_sequences=False,
+                    inhibit_post_migrate=True,
+                )
+                connection.creation.deserialize_db_from_string(serialized_rows)
+    finally:
+        # A failed assertion or restore must never poison the next test's
+        # control-plane setup with a tenant search_path.
+        connection.set_schema_to_public()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -59,12 +122,12 @@ def _clear_cache():
 
 
 @pytest.fixture(autouse=True)
-def _reset_schema_to_public():
+def _reset_schema_to_public(_django_db_marker):
     """A client request through TenantMainMiddleware leaves connection.schema_name
-    on that tenant — django-tenants does not reset it at request end. Without this,
-    a test that ran a tenant-host request poisons the NEXT test's public-schema
-    work (provisioning guards on 'must be public', platform API, archive), causing
-    order-dependent failures. Reset to public before every test."""
+    on that tenant — django-tenants does not reset it at request end. Reset it
+    before the next test body. Transactional cleanup itself is handled by the
+    schema-aware session fixture above; resetting in this fixture's finalizer
+    would run *before* pytest-django teardown and select the wrong schema."""
     from django.db import connection
 
     connection.set_schema_to_public()

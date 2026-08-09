@@ -20,6 +20,17 @@ FEE_URL = "/api/v1/finance/fee-schedules/"
 OUTSTANDING_URL = "/api/v1/finance/outstanding/"
 
 
+def _attach_staff_principal(tenant, user, *, label: str):
+    """Give a legacy test session the one exact active role account it may resolve."""
+    from apps.org.models import StaffProfile
+
+    with schema_context(tenant.schema_name):
+        return StaffProfile.objects.create(
+            user=user,
+            username=f"finance-{label}-{user.pk}",
+        )
+
+
 # --------------------------------------------------------------------------- #
 # /invoices/ list — allowed / denied / anonymous
 # --------------------------------------------------------------------------- #
@@ -308,6 +319,7 @@ def test_accountant_invoice_and_statement_access_is_branch_scoped(tenant_a, user
         )
         own_branch = own_student.branch
     accountant = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=own_branch)
+    _attach_staff_principal(tenant_a, accountant, label="scoped-statement")
     client = as_user(tenant_a, accountant)
 
     listing = client.get(INVOICES_URL)
@@ -813,25 +825,25 @@ def test_cashier_scope_cannot_borrow_remote_accountant_identity(tenant_a, user_i
 
 
 def test_statement_request_returns_202(tenant_a, user_in, as_user, monkeypatch):
-    from apps.finance import services as fin_services
+    from celery_tasks.finance_tasks import generate_statement_pdf
 
+    queued = []
     monkeypatch.setattr(
-        fin_services,
-        "render_statement_pdf",
-        lambda *, student, locale="en", invoice_ids=None: b"%PDF",
-    )
-    monkeypatch.setattr(
-        "infrastructure.storage.s3_client.upload_bytes",
-        lambda key, data, *, content_type="application/octet-stream": key,
+        generate_statement_pdf,
+        "delay",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
     )
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory()
         InvoiceFactory(student=student)
     accountant = user_in(tenant_a, roles=[Role.ACCOUNTANT], branch=student.branch)
+    _attach_staff_principal(tenant_a, accountant, label="statement-request")
     client = as_user(tenant_a, accountant)
     resp = client.post(f"/api/v1/finance/students/{student.pk}/statement/", {"locale": "en"}, format="json")
     assert resp.status_code == 202
-    assert "task_id" in resp.json()["data"]
+    export_id = resp.json()["data"]["export_id"]
+    assert resp.json()["data"]["task_id"] == export_id
+    assert queued == [((export_id,), {"_schema_name": tenant_a.schema_name})]
 
 
 def test_statement_request_rejects_missing_student_before_enqueue(tenant_a, as_role, monkeypatch):
@@ -845,7 +857,8 @@ def test_statement_request_rejects_missing_student_before_enqueue(tenant_a, as_r
         raise AssertionError("missing students must not reach Celery")
 
     monkeypatch.setattr(generate_statement_pdf, "delay", should_not_enqueue)
-    client, _ = as_role(Role.DIRECTOR)
+    client, actor = as_role(Role.DIRECTOR)
+    _attach_staff_principal(tenant_a, actor, label="missing-student")
     response = client.post("/api/v1/finance/students/999999999/statement/")
     assert response.status_code == 404
     assert response.json()["code"] == "student_not_found"
@@ -853,31 +866,44 @@ def test_statement_request_rejects_missing_student_before_enqueue(tenant_a, as_r
 
 
 def test_statement_result_authorized_done_path(tenant_a, as_role, monkeypatch):
-    from django.core.cache import cache
+    from django.utils import timezone
+
+    from apps.finance import services as finance_services
+    from apps.finance.models import StatementExport, StatementExportInvoice
 
     client, actor = as_role(Role.DIRECTOR)
+    principal = _attach_staff_principal(tenant_a, actor, label="statement-result")
     with schema_context(tenant_a.schema_name):
         invoice = InvoiceFactory()
-    key = f"{tenant_a.schema_name}/documents/statement_{invoice.student_id}_20260802112233_{'a' * 32}.pdf"
-    cache.set(
-        f"finance:statement:{tenant_a.schema_name}:task-ready",
-        {
-            "key": key,
-            "requested_by_id": actor.pk,
-            "student_id": invoice.student_id,
-            "invoice_ids": [invoice.pk],
-        },
-    )
+        now = timezone.now()
+        export = StatementExport.objects.create(
+            student=invoice.student,
+            requested_by=actor,
+            requested_by_id_snapshot=actor.pk,
+            requested_principal_kind="staff",
+            requested_principal_id=principal.pk,
+            locale="en",
+            invoice_set_hash=finance_services._statement_invoice_set_hash([invoice.pk]),
+        )
+        StatementExportInvoice.objects.create(export=export, invoice=invoice)
+        StatementExport.objects.filter(pk=export.pk).update(
+            status=StatementExport.Status.DONE,
+            attempt_count=1,
+            file_bytes=128,
+            started_at=now,
+            finished_at=now,
+        )
+        export.refresh_from_db()
+        key = finance_services.expected_statement_export_key(export)
     monkeypatch.setattr(
         "infrastructure.storage.s3_client.presign_download",
-        lambda key, *, expires_in: f"signed:{key}:{expires_in}",
+        lambda key, **kwargs: f"signed:{key}:{kwargs['expires_in']}",
     )
-    response = client.get("/api/v1/finance/statements/task-ready/")
+    response = client.get(f"/api/v1/finance/statements/{export.pk}/")
     assert response.status_code == 200
-    assert response.json()["data"] == {
-        "status": "done",
-        "url": f"signed:{key}:600",
-    }
+    assert response.json()["data"]["export_id"] == str(export.pk)
+    assert response.json()["data"]["status"] == "done"
+    assert response.json()["data"]["url"] == f"signed:{key}:600"
 
 
 def test_statement_result_rechecks_every_artifact_invoice_scope(

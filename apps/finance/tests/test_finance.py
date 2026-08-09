@@ -278,11 +278,9 @@ def test_invoice_numbering_takes_advisory_lock_even_for_first_invoice(tenant_a, 
 
 def test_issue_invoice_fx_snapshot_manual(tenant_a):
     with schema_context(tenant_a.schema_name):
-        cs = _settings(fx_source="manual")
-        if hasattr(cs, "fx_rate_usd_manual"):
-            cs.fx_rate_usd_manual = Decimal("12500.0000")
-            cs.save()
-            cache.clear()
+        # The database deliberately rejects a transient manual-source row with
+        # no rate.  Persist the mutually dependent settings atomically.
+        cs = _settings(fx_source="manual", fx_rate_usd_manual=Decimal("12500.0000"))
         fs = FeeScheduleFactory(amount_uzs=Decimal("1250000.00"))
         student = StudentProfileFactory()
         inv = services.issue_invoice(student_id=student.pk, fee_schedule_id=fs.pk)
@@ -690,6 +688,39 @@ def test_allocate_payment_rejects_more_than_received_and_mismatched_retry(tenant
                 invoice_ids=[invoice.pk],
             )
         assert mismatch.value.code == "allocation_intent_mismatch"
+
+
+def test_allocate_payment_rejects_matching_retry_of_partial_existing_rows(tenant_a):
+    """Legacy partial rows must not turn a stranded payment into a valid retry."""
+    with schema_context(tenant_a.schema_name):
+        invoice = InvoiceFactory(total_uzs=Decimal("100000.00"))
+        payment = _captured_payment(invoice, amount="50000.00", key="allocate-partial-existing")
+        PaymentAllocation.objects.create(
+            payment_id=payment.pk,
+            invoice=invoice,
+            amount_uzs=Decimal("40000.00"),
+        )
+
+        # Keep changed retries on the documented idempotency-conflict contract
+        # before inspecting the health of the committed row set.
+        with pytest.raises(ConflictException) as changed:
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("50000.00"),
+                invoice_ids=[invoice.pk],
+            )
+        assert changed.value.code == "allocation_intent_mismatch"
+
+        with pytest.raises(ConflictException) as corrupt:
+            services.allocate_payment(
+                payment_id=payment.pk,
+                amount_uzs=Decimal("40000.00"),
+                invoice_ids=[invoice.pk],
+            )
+        assert corrupt.value.code == "allocation_state_inconsistent"
+        payment.refresh_from_db()
+        assert "_allocation_intent" not in payment.metadata
+        assert PaymentAllocation.objects.filter(payment_id=payment.pk).count() == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1202,13 +1233,13 @@ def test_second_refund_after_completion_rejected(tenant_a):
             provider_refund_id=f"payme-{payment.pk}",
         )
 
-        with pytest.raises(ValidationException) as exc:
+        with pytest.raises(UnprocessableEntity) as exc:
             services.request_refund(
                 invoice=inv,
                 amount_uzs=Decimal("100000.00"),
                 payment_id=payment.pk,
             )
-        assert exc.value.code == "refund_exceeds_paid"
+        assert exc.value.code == "payment_not_completed"
 
 
 def test_in_flight_refund_blocks_a_second_request(tenant_a):
@@ -1336,11 +1367,15 @@ def test_render_statement_pdf_real(tenant_a):
         assert pdf.startswith(b"%PDF")
 
 
-def test_generate_statement_uploads_to_s3(tenant_a, monkeypatch):
-    """Task body uploads to {schema}/documents/ — stub weasyprint + S3."""
+def test_generate_statement_uploads_to_s3(tenant_a, user_in, monkeypatch):
+    """A durable statement row owns the private object uploaded by its worker."""
+    from apps.org.models import StaffProfile
+    from core.permissions import Role
+    from core.role_principals import RolePrincipal
+
     captured = {}
 
-    def fake_render(*, student, locale="en"):
+    def fake_render(*, student, locale="en", invoice_ids=None):
         return b"%PDF-stub"
 
     def fake_upload(key, data, *, content_type="application/octet-stream"):
@@ -1352,7 +1387,20 @@ def test_generate_statement_uploads_to_s3(tenant_a, monkeypatch):
     monkeypatch.setattr("infrastructure.storage.s3_client.upload_bytes", fake_upload)
     with schema_context(tenant_a.schema_name):
         student = StudentProfileFactory()
-        key = services.generate_statement(student.pk, locale="en")
+        InvoiceFactory(student=student)
+    actor = user_in(tenant_a, roles=[Role.DIRECTOR], branch=student.branch)
+    with schema_context(tenant_a.schema_name):
+        principal = StaffProfile.objects.create(user=actor, username=f"statement-{actor.pk}")
+        export, should_enqueue = services.request_statement_export(
+            student_id=student.pk,
+            requested_by=actor,
+            principal=RolePrincipal(kind="staff", principal_id=principal.pk, user_id=actor.pk),
+            locale="en",
+        )
+        assert should_enqueue is True
+        key = services.build_statement_export(export.pk)
         assert key == captured["key"]
-        assert f"{tenant_a.schema_name}/documents/" in key
+        assert key == f"{tenant_a.schema_name}/documents/statements/{export.pk}.pdf"
         assert captured["data"] == b"%PDF-stub"
+        export.refresh_from_db()
+        assert export.status == export.Status.DONE

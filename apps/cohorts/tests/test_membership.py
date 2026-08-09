@@ -184,14 +184,25 @@ def test_student_patch_cannot_rewrite_cohort_or_branch(director, tenant_a):
         {"current_cohort": cohort_b.id, "branch": other_branch.id, "academic_level": "B2"},
         format="json",
     )
-    assert resp.status_code == 200
+    # Decision-critical writes reject non-writable fields instead of silently
+    # ignoring them and applying a misleading partial update.
+    assert resp.status_code == 400
+    assert set(resp.json()["errors"]) == {"branch", "current_cohort"}
 
     with schema_context(tenant_a.schema_name):
         student.refresh_from_db()
         assert student.current_cohort_id == cohort_a.id  # unchanged
         assert student.branch_id == branch.id  # unchanged
-        assert student.academic_level == "B2"  # writable field applied
+        assert student.academic_level != "B2"  # request rejected atomically
         assert CohortMembership.objects.filter(student=student).count() == 1
+
+    accepted = director.patch(
+        f"/api/v1/students/{student.id}/",
+        {"academic_level": "B2"},
+        format="json",
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["data"]["academic_level"] == "B2"
 
 
 def test_enroll_reads_current_cohort_from_db_under_lock_not_stale_memory(tenant_a):

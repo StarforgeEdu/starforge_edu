@@ -787,6 +787,46 @@ def test_allocate_manual_requires_exact_payment_amount(tenant_a):
         assert partial.value.code == "allocation_total_mismatch"
 
 
+def test_allocate_manual_rejects_matching_retry_of_partial_existing_rows(tenant_a):
+    """A matching legacy row set cannot be blessed as fully allocated."""
+    from apps.finance.models import PaymentAllocation
+    from apps.payments import services
+    from apps.payments.models import Payment
+    from core.exceptions import ConflictException
+
+    invoice = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-2026-000013",
+        amount_uzs="100000.00",
+    )
+    with schema_context(tenant_a.schema_name):
+        payment, _ = services.get_or_create_payment(
+            idempotency_key="alloc-partial-1",
+            provider="payme",
+            amount_uzs=Decimal("50000.00"),
+            account_ref=invoice.number,
+            metadata={},
+            invoice=invoice,
+        )
+        Payment.objects.filter(pk=payment.pk).update(status=Payment.Status.COMPLETED)
+        PaymentAllocation.objects.create(
+            payment_id=payment.pk,
+            invoice=invoice,
+            amount_uzs=Decimal("40000.00"),
+        )
+
+        with pytest.raises(ConflictException) as corrupt:
+            services.allocate_manual(
+                payment_id=payment.pk,
+                allocations=[{"invoice": invoice.pk, "amount": Decimal("40000.00")}],
+            )
+        assert corrupt.value.code == "allocation_state_inconsistent"
+        payment.refresh_from_db()
+        assert payment.allocation_status != Payment.Allocation.ALLOCATED
+        assert "_allocation_intent" not in payment.metadata
+        assert PaymentAllocation.objects.filter(payment_id=payment.pk).count() == 1
+
+
 def test_payment_detail_eager_data_and_receipt_head_has_no_enqueue(
     tenant_a,
     user_in,

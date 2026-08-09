@@ -11,6 +11,7 @@ from core.middleware import AppAvailabilityMiddleware
 
 
 def test_degraded_dependency_returns_a_safe_structured_warning(monkeypatch):
+    monkeypatch.setattr("core.middleware.current_schema", lambda: "tenant_a")
     monkeypatch.setattr(
         "core.availability.resolve_status",
         lambda app: (STATUS_DEGRADED, [f"private dependency details for {app}"]),
@@ -30,6 +31,7 @@ def test_degraded_dependency_returns_a_safe_structured_warning(monkeypatch):
 
 
 def test_unavailable_dependency_does_not_expose_internal_topology(monkeypatch):
+    monkeypatch.setattr("core.middleware.current_schema", lambda: "tenant_a")
     private_detail = "private-ledger dependency failed"
     monkeypatch.setattr(
         "core.availability.resolve_status",

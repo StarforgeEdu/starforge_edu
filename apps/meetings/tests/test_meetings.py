@@ -311,6 +311,18 @@ def test_invited_manager_cannot_cancel_another_branch_or_centre_wide_meeting(
         branch_a = BranchFactory()
         branch_b = BranchFactory()
     hod_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch_a)
+    with schema_context(tenant_a.schema_name):
+        from apps.users.models import RoleMembership
+
+        # A support assignment makes the staff account an eligible Branch-B
+        # invitee without granting meeting:write there. The Branch-A manager
+        # grant must not be borrowed to cancel the Branch-B meeting.
+        RoleMembership.objects.create(
+            user=hod_user,
+            branch=branch_b,
+            role=Role.SUPPORT,
+        )
+        hod_user.refresh_from_db()
     hod = as_user(tenant_a, hod_user)
     director, _ = as_role(Role.DIRECTOR)
     start = timezone.now() + timedelta(days=1)

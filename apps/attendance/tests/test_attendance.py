@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 import time_machine
-from django.db import close_old_connections
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 from django_tenants.utils import schema_context
 
@@ -358,6 +358,13 @@ def test_correction_window_expired_teacher_403_director_ok(tenant_a, user_in, as
     director_user = user_in(tenant_a, roles=["director"])
     with schema_context(tenant_a.schema_name):
         branch = BranchFactory()
+        from tests.role_principal_helpers import ensure_role_principal
+
+        ensure_role_principal(
+            director_user,
+            roles=["director"],
+            branch=branch,
+        )
         _grant_teacher_scope(teacher_user, branch)
         profile = TeacherProfileFactory(user=teacher_user, branch=branch)
         starts_at = _aware(2026, 6, 1, 10)
@@ -531,15 +538,23 @@ def test_concurrent_auto_absent_workers_claim_a_lesson_once(tenant_a, monkeypatc
         from apps.teachers.models import TeacherProfile
         from apps.users.models import User
 
-        AttendanceRecord.objects.filter(lesson_id=lesson_id).delete()
-        Lesson.objects.filter(pk=lesson_id).delete()
-        CohortMembership.objects.filter(cohort_id=cohort_id).delete()
-        StudentProfile.objects.filter(pk__in=student_ids).delete()
-        Cohort.objects.filter(pk=cohort_id).delete()
-        TeacherProfile.objects.filter(pk=teacher_id).delete()
-        Term.objects.filter(pk=term_id).delete()
-        User.objects.filter(pk__in=user_ids).delete()
-        Branch.objects.filter(pk=branch_id).delete()
+        # This committed concurrency fixture is the only reason these rows need
+        # deterministic teardown. Open the same narrowly-scoped maintenance gate
+        # used by reviewed identity-history backfills; production deletion stays
+        # protected at both the model and database layers.
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL starforge.identity_history_maintenance = 'on'")
+                cursor.execute("SET LOCAL starforge.org_history_maintenance = 'on'")
+            AttendanceRecord.objects.filter(lesson_id=lesson_id).delete()
+            Lesson.objects.filter(pk=lesson_id).delete()
+            CohortMembership.objects.filter(cohort_id=cohort_id).delete()
+            StudentProfile.objects.filter(pk__in=student_ids).delete()
+            Cohort.objects.filter(pk=cohort_id).delete()
+            TeacherProfile.objects.filter(pk=teacher_id).delete()
+            Term.objects.filter(pk=term_id).delete()
+            User.objects.filter(pk__in=user_ids).delete()
+            Branch.objects.filter(pk=branch_id).delete()
 
 
 def test_auto_absent_skips_marked_students(tenant_a, user_in):
@@ -828,6 +843,7 @@ def test_hod_attendance_is_department_scoped_for_reads_dashboard_and_mark(tenant
     from apps.org.tests.factories import DepartmentFactory
     from apps.users.models import RoleMembership
     from core.permissions import Role
+    from tests.role_principal_helpers import ensure_role_principal
 
     hod = user_in(tenant_a)
     with schema_context(tenant_a.schema_name):
@@ -841,6 +857,11 @@ def test_hod_attendance_is_department_scoped_for_reads_dashboard_and_mark(tenant
             branch=branch,
             department=own_department,
             role=Role.HEAD_OF_DEPT,
+        )
+        ensure_role_principal(
+            hod,
+            roles=[Role.HEAD_OF_DEPT],
+            branch=branch,
         )
         hod.refresh_from_db()
 
