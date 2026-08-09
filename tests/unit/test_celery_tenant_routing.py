@@ -56,7 +56,11 @@ def test_worker_accepts_only_the_exact_activated_schema():
 
 
 def test_explicit_schema_cannot_be_overridden_by_conflicting_celery_header(monkeypatch):
-    monkeypatch.setattr(_ProbeTask, "_assert_schema_resolvable", lambda _schema: None)
+    monkeypatch.setattr(
+        _ProbeTask,
+        "_assert_schema_resolvable",
+        staticmethod(lambda _schema: None),
+    )
     task = _ProbeTask()
 
     with pytest.raises(ValueError, match="Conflicting tenant routing") as caught:

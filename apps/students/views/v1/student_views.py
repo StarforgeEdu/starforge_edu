@@ -186,9 +186,10 @@ def students_collection_view(request: HttpRequest) -> HttpResponse:
 @csrf_exempt
 @require_auth
 def student_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
-    read = request.method in ("GET", "HEAD")
-    if not read:
+    if request.method in ("PUT", "PATCH", "DELETE"):
         return _student_detail_write(request, pk)
+    if request.method not in ("GET", "HEAD"):
+        return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
     student = _get_in_scope(
         request,

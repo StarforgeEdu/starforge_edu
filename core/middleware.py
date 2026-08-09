@@ -28,6 +28,7 @@ from django_tenants.utils import get_public_schema_name
 
 from core.logging_filters import request_id_var
 from core.rate_config import RateConfigurationError, parse_rate
+from core.utils import current_schema
 
 REQUEST_ID_HEADER = "X-Request-ID"
 logger = logging.getLogger("starforge.middleware")
@@ -531,6 +532,13 @@ class AppAvailabilityMiddleware:
         authenticated operator status surface. Normal API responses receive a stable public
         warning DTO so internal app labels and outage topology are not exposed to end users.
         """
+        # The public control plane has no tenant-local CenterSettings table. In
+        # particular, /api/v1/auth/login/ is mounted on both URLconfs; consulting
+        # tenant availability while serving it on the apex aborts the surrounding
+        # transaction before the login view can query the public User table.
+        if current_schema() == get_public_schema_name():
+            return None
+
         from core.availability import (
             STATUS_DISABLED,
             STATUS_UNAVAILABLE,

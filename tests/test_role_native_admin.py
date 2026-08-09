@@ -48,39 +48,16 @@ def test_role_admin_forms_never_expose_user_bridge(tenant_a):
         assert "teacher_head" in department_form.base_fields
 
 
-def test_student_admin_provisions_bridge_and_membership_automatically(tenant_a):
+def test_student_admin_requires_the_domain_provisioning_workflow(tenant_a):
     with schema_context(tenant_a.schema_name):
         operator = User.objects.create_superuser(username="admin-save", password="Admin-pass-42")
-        branch = BranchFactory()
         model_admin = admin.site._registry[StudentProfile]
         request = _request(operator)
+        # Student creation owns generated IDs, seat limits, enrollment history,
+        # and scoped grants. The generic admin form must not bypass that workflow.
+        assert model_admin.has_add_permission(request) is False
         form_class = model_admin.get_form(request)
-        form = form_class(
-            data={
-                "username": "admin.student",
-                "password1": "Starlight-Map-42",
-                "password2": "Starlight-Map-42",
-                "is_active": "on",
-                "student_id": "ADMIN-STUDENT-1",
-                "first_name": "Admin",
-                "last_name": "Student",
-                "status": StudentProfile.Status.LEAD,
-                "branch": branch.pk,
-            }
-        )
-        assert form.is_valid(), form.errors
-        student = form.save(commit=False)
-        model_admin.save_model(request, student, form, change=False)
-
-        student.refresh_from_db()
-        assert student.check_password("Starlight-Map-42")
-        assert not student.user.has_usable_password()
-        assert RoleMembership.objects.filter(
-            user=student.user,
-            role=Role.STUDENT,
-            branch=branch,
-            revoked_at__isnull=True,
-        ).exists()
+        assert {"student_id", "status", "branch", "current_cohort"}.isdisjoint(form_class.base_fields)
 
 
 def test_staff_admin_uses_staff_fields_and_creates_scoped_account_type(tenant_a):

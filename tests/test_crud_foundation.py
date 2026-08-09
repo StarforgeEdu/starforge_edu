@@ -19,6 +19,10 @@ _RF = RequestFactory()
 def _get(user, **params):
     request = _RF.get("/x/", params)
     request.user = user
+    # These unit-level requests deliberately bypass SessionAuthentication. Opt
+    # into the explicit test-only legacy adapter so this file can exercise the
+    # generic permission/scoping helpers without forging a production principal.
+    request._allow_legacy_principal_union_for_tests = True
     return request
 
 

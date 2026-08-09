@@ -7,20 +7,22 @@ from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django_tenants.utils import schema_context
 
+from tests.migration_isolation import IsolatedMigrationHarness
+
 pytestmark = pytest.mark.django_db(transaction=True)
 
-LEGACY_TARGET = ("parents", "0007_parentprofile_parent_phone_unique_nonblank_and_more")
 CREATION_SCOPE_TARGET = ("parents", "0008_parent_creation_scope")
-
-
-def _restore_current_graph() -> None:
-    executor = MigrationExecutor(connection)
-    executor.migrate(executor.loader.graph.leaf_nodes())
+PARENT_MIGRATIONS = (
+    CREATION_SCOPE_TARGET,
+    ("parents", "0009_encrypt_safeguarding_text"),
+    ("parents", "0010_preserve_family_lifecycle_history"),
+)
 
 
 def test_current_student_placement_is_not_treated_as_parent_creation_history(tenant_a):
     """A mutable guardian/student relation cannot resolve an immutable snapshot."""
 
+    migrations = IsolatedMigrationHarness(connection, PARENT_MIGRATIONS)
     try:
         with schema_context(tenant_a.schema_name):
             from apps.org.tests.factories import BranchFactory
@@ -33,10 +35,9 @@ def test_current_student_placement_is_not_treated_as_parent_creation_history(ten
             GuardianFactory(parent=parent, student=student)
             parent_id = parent.pk
 
+            migrations.downgrade()
+            migrations.migrate_to(1)
             executor = MigrationExecutor(connection)
-            executor.migrate([LEGACY_TARGET])
-            executor = MigrationExecutor(connection)
-            executor.migrate([CREATION_SCOPE_TARGET])
             migrated_state = executor.loader.project_state([CREATION_SCOPE_TARGET])
             MigratedParent = migrated_state.apps.get_model("parents", "ParentProfile")
             migrated = MigratedParent.objects.get(pk=parent_id)
@@ -46,6 +47,8 @@ def test_current_student_placement_is_not_treated_as_parent_creation_history(ten
             assert migrated.department_at_creation_id is None
             assert migrated.created_by_id is None
     finally:
-        with schema_context(tenant_a.schema_name):
-            _restore_current_graph()
-        connection.set_schema_to_public()
+        try:
+            with schema_context(tenant_a.schema_name):
+                migrations.upgrade()
+        finally:
+            connection.set_schema_to_public()

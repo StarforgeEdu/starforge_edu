@@ -895,8 +895,9 @@ def test_personal_attention_is_exact_principal_scoped_and_cache_isolated(
     assert first_response["ETag"] != second_response["ETag"]
 
 
-def test_query_count_is_population_invariant(tenant_a, user_in, as_user):
+def test_query_count_is_population_invariant(tenant_a, user_in, client_for):
     from apps.students.tests.factories import StudentProfileFactory
+    from tests.role_principal_helpers import ensure_role_principal, exact_session_client
 
     with schema_context(tenant_a.schema_name):
         branch, _department, cohort, _students = _branch_fixture(
@@ -905,7 +906,8 @@ def test_query_count_is_population_invariant(tenant_a, user_in, as_user):
             student_count=1,
         )
         user = user_in(tenant_a, roles=[Role.DIRECTOR], branch=branch)
-    client = as_user(tenant_a, user)
+        ensure_role_principal(user, roles=[Role.DIRECTOR], branch=branch)
+    client = exact_session_client(client_for, tenant_a, user)
     query = _window(branch.pk)
 
     cache.clear()

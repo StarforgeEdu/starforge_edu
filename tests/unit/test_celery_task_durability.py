@@ -1,59 +1,43 @@
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 
 
-def test_finance_statement_cache_reuse_accepts_only_exact_task_output():
-    from celery_tasks.finance_tasks import _trusted_cached_statement
+def test_finance_statement_task_delegates_to_one_durable_export_row(monkeypatch):
+    from apps.finance import services
+    from celery_tasks.finance_tasks import generate_statement_pdf
 
-    schema = "tenant_a"
-    key = f"{schema}/documents/statement_17_20260802112233_{'a' * 32}.pdf"
-    valid = {
-        "key": key,
-        "requested_by_id": 8,
-        "student_id": 17,
-        "invoice_ids": [2, 9],
-    }
+    export_id = str(uuid4())
+    expected_key = f"tenant_a/documents/statements/{export_id}.pdf"
+    received_ids: list[str] = []
+    monkeypatch.setattr(
+        services,
+        "build_statement_export",
+        lambda received_id: received_ids.append(received_id) or expected_key,
+    )
 
-    assert _trusted_cached_statement(valid, schema=schema, student_id=17, requested_by_id=8) == key
-    assert (
-        _trusted_cached_statement(
-            {**valid, "key": f"another/documents/{key.rsplit('/', 1)[-1]}"},
-            schema=schema,
-            student_id=17,
-            requested_by_id=8,
-        )
-        is None
-    )
-    assert (
-        _trusted_cached_statement(
-            {**valid, "invoice_ids": [9, 2]},
-            schema=schema,
-            student_id=17,
-            requested_by_id=8,
-        )
-        is None
-    )
-    assert (
-        _trusted_cached_statement(
-            {**valid, "requested_by_id": 99},
-            schema=schema,
-            student_id=17,
-            requested_by_id=8,
-        )
-        is None
-    )
+    assert generate_statement_pdf.run(export_id) == expected_key
+    assert received_ids == [export_id]
 
 
 def test_finance_statement_retry_does_not_expose_render_or_storage_error(monkeypatch):
     from apps.finance import services
     from celery_tasks.finance_tasks import generate_statement_pdf
 
+    export_id = str(uuid4())
     private_error = "signed://private-object?credential=secret"
+
+    def raise_private_error(_export_id: str):
+        raise RuntimeError(private_error)
+
+    reset_ids: list[str] = []
+    monkeypatch.setattr(services, "build_statement_export", raise_private_error)
     monkeypatch.setattr(
         services,
-        "generate_statement_artifact",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(private_error)),
+        "reset_statement_export_for_retry",
+        lambda received_id: reset_ids.append(received_id),
     )
     captured: list[Exception] = []
 
@@ -63,8 +47,9 @@ def test_finance_statement_retry_does_not_expose_render_or_storage_error(monkeyp
 
     monkeypatch.setattr(generate_statement_pdf, "retry", retry)
     with pytest.raises(RuntimeError, match="retry-sentinel"):
-        generate_statement_pdf.run(17, requested_by_id=8)
+        generate_statement_pdf.run(export_id)
 
+    assert reset_ids == [export_id]
     assert len(captured) == 1
     assert str(captured[0]) == "Finance statement generation failed."
     assert private_error not in str(captured[0])

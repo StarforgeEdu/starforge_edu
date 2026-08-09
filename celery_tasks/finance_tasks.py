@@ -1,10 +1,10 @@
 """Finance beat/async tasks (D3-A-7, D3-A-8).
 
-- `generate_statement_pdf` renders a statement-of-account to PDF (weasyprint,
-  lazy import in the service) and uploads it to `{schema}/documents/` (TD-14),
-  caching the task-id -> S3 key map so the result endpoint can sign it. Per-tenant
-  (enqueued with `_schema_name`), retries <=3 with backoff. No weasyprint/S3 call
-  ever happens in a request handler (DoD #9).
+- `generate_statement_pdf` drives one durable statement-export row through
+  rendering (weasyprint, lazy import in the service) and private upload to its
+  deterministic `{schema}/documents/` key (TD-14). Per-tenant (enqueued with
+  `_schema_name`), retries <=3 with backoff. No weasyprint/S3 call ever happens
+  in a request handler (DoD #9).
 - `late_payment_reminders` is the daily beat task: it fans out per active Center,
   scans overdue invoices, and emits `payment_reminder` once per invoice per
   `CenterSettings.payment_reminder_interval_days` (dedupe in the service body).

@@ -623,6 +623,13 @@ CELERY_BEAT_SCHEDULE = {
         "task": "celery_tasks.assignment_tasks.send_due_soon_reminders",
         "schedule": 60 * 60,  # hourly (D2-D-7)
     },
+    "maintain-statement-exports": {
+        "task": "celery_tasks.finance_tasks.maintain_statement_exports",
+        # Recover broker-publish gaps promptly and enforce the 24-hour private
+        # artifact retention boundary even when nobody polls the export again.
+        "schedule": 60 * 5,
+        "options": {"queue": "maintenance", "expires": 4 * 60},
+    },
     "late-payment-reminders": {
         "task": "celery_tasks.finance_tasks.late_payment_reminders",
         "schedule": 60 * 60 * 24,  # daily (D3-A-8)

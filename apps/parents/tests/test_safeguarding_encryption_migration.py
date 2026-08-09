@@ -7,11 +7,13 @@ from django.db import connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django_tenants.utils import schema_context
 
+from apps.org.models import Branch
 from apps.org.tests.factories import BranchFactory
 from apps.parents.models import Guardian, ParentProfile
 from apps.parents.tests.factories import GuardianFactory, ParentProfileFactory
 from apps.students.models import StudentProfile
 from apps.students.tests.factories import StudentProfileFactory
+from tests.migration_isolation import IsolatedMigrationHarness
 
 PARENT_TARGET = ("parents", "0010_preserve_family_lifecycle_history")
 PARENT_LEGACY_TARGET = ("parents", "0008_parent_creation_scope")
@@ -20,15 +22,12 @@ STUDENT_LEGACY_TARGET = (
     "students",
     "0009_studentprofile_student_phone_unique_nonblank_and_more",
 )
-
-
-def _migrate_current_graph() -> None:
-    """Restore every leaf that a parents/students downgrade may unapply."""
-
-    executor = MigrationExecutor(connection)
-    assert PARENT_TARGET in executor.loader.graph.nodes
-    assert STUDENT_TARGET in executor.loader.graph.nodes
-    executor.migrate(executor.loader.graph.leaf_nodes())
+SAFEGUARDING_MIGRATIONS = (
+    ("parents", "0009_encrypt_safeguarding_text"),
+    ("students", "0010_encrypt_emergency_contacts"),
+    STUDENT_TARGET,
+    PARENT_TARGET,
+)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -45,12 +44,13 @@ def test_shadow_migrations_transform_plaintext_before_cutover(tenant_a):
         student_user_id = student.user_id
         parent_user_id = parent.user_id
 
-        executor = MigrationExecutor(connection)
+        migrations = IsolatedMigrationHarness(connection, SAFEGUARDING_MIGRATIONS)
         try:
             # Recreate the deployed legacy column types, then write values through
             # the historical plaintext fields. Current fail-closed field classes
             # must never be used while the legacy schema is active.
-            executor.migrate([PARENT_LEGACY_TARGET, STUDENT_LEGACY_TARGET])
+            migrations.downgrade()
+            executor = MigrationExecutor(connection)
             legacy_state = executor.loader.project_state([PARENT_LEGACY_TARGET, STUDENT_LEGACY_TARGET])
             LegacyParent = legacy_state.apps.get_model("parents", "ParentProfile")
             LegacyGuardian = legacy_state.apps.get_model("parents", "Guardian")
@@ -73,7 +73,7 @@ def test_shadow_migrations_transform_plaintext_before_cutover(tenant_a):
 
             # Each forward migration writes an encrypted shadow, authenticates an
             # exact ORM round trip, and only then removes the plaintext column.
-            _migrate_current_graph()
+            migrations.upgrade()
 
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -103,9 +103,9 @@ def test_shadow_migrations_transform_plaintext_before_cutover(tenant_a):
             assert Guardian.objects.get(pk=guardian.pk).custody_notes == custody_secret
             assert StudentProfile.objects.get(pk=student.pk).emergency_contacts == contacts
         finally:
-            # Migration tests mutate a tenant schema. Always restore the current
-            # graph so fixture teardown and following tests see the normal model.
-            _migrate_current_graph()
+            # Always restore this exact migration slice so fixture teardown and
+            # following tests see the normal model.
+            migrations.upgrade()
             # pytest-django's transaction=True flush runs on whichever schema is
             # current at teardown; schema_context restores public first. Remove
             # this tenant fixture explicitly so reused databases and later
@@ -113,10 +113,14 @@ def test_shadow_migrations_transform_plaintext_before_cutover(tenant_a):
             with transaction.atomic():
                 with connection.cursor() as cursor:
                     cursor.execute("SET LOCAL starforge.identity_history_maintenance = 'on'")
+                    cursor.execute("SET LOCAL starforge.org_history_maintenance = 'on'")
                 Guardian.objects.filter(pk=guardian.pk).delete()
                 ParentProfile.objects.filter(pk=parent.pk).delete()
                 StudentProfile.objects.filter(pk=student.pk).delete()
                 from apps.users.models import User
 
                 User.objects.filter(pk__in=(student_user_id, parent_user_id)).delete()
-                branch.delete()
+                # Model-level lifecycle protection intentionally rejects instance
+                # deletion. Test cleanup uses the same explicit maintenance mode
+                # as the database history guards and bypasses only that model hook.
+                Branch.objects.filter(pk=branch.pk).delete()

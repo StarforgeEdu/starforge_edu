@@ -186,7 +186,9 @@ jobs:
       - run: uv run python manage.py showmigrations --plan
       # TD-20 coverage floor: 70 after Day 1 → 80 after Day 3 → 85 after Day 5.
       # Raising this number is the EOD duty of D1-A / D3-F / D5-B respectively.
-      - run: uv run pytest -q --cov=apps --cov=core --cov-fail-under=70
+      # Each worker provisions its own public and tenant schemas. Keep the
+      # parallelism bounded so larger/self-hosted runners cannot exhaust Postgres.
+      - run: uv run pytest -q -n 2 --dist=loadfile --cov=apps --cov=core --cov-fail-under=70
 
   schema:
     runs-on: ubuntu-latest

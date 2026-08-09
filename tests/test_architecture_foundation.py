@@ -125,29 +125,29 @@ def test_base_repository_crud_runs_through_the_orm(tenant_a):
 
     from django.utils import timezone
 
-    from apps.org.models import Branch
+    from apps.teachers.models import TeacherType
 
-    class _BranchRepo(BaseRepository[Branch]):
-        model = Branch
+    class _TeacherTypeRepo(BaseRepository[TeacherType]):
+        model = TeacherType
 
-    repo = _BranchRepo()
+    repo = _TeacherTypeRepo()
     with schema_context(tenant_a.schema_name):
-        branch = repo.create(name="North", slug="north-x")
-        assert repo.get_by_id(branch.pk).name == "North"
+        teacher_type = repo.create(name="North", slug="north-x")
+        assert repo.get_by_id(teacher_type.pk).name == "North"
         assert repo.exists(slug="north-x") is True
         assert repo.count(slug="north-x") == 1
         stale = timezone.now() - timedelta(days=1)
-        Branch.objects.filter(pk=branch.pk).update(updated_at=stale)
-        branch.refresh_from_db()
-        repo.update(branch, name="South")
-        updated = repo.get_by_id(branch.pk)
+        TeacherType.objects.filter(pk=teacher_type.pk).update(updated_at=stale)
+        teacher_type.refresh_from_db()
+        repo.update(teacher_type, name="South")
+        updated = repo.get_by_id(teacher_type.pk)
         assert updated.name == "South"
         assert updated.updated_at > stale
         again, made = repo.get_or_create(slug="north-x", defaults={"name": "South"})
         assert made is False
-        assert again.pk == branch.pk
-        repo.delete(branch)
-        assert repo.get_by_id(branch.pk) is None
+        assert again.pk == teacher_type.pk
+        repo.delete(teacher_type)
+        assert repo.get_by_id(teacher_type.pk) is None
 
 
 # --- domain error -> JSON (plain-view path) --------------------------------

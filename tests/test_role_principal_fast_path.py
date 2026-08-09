@@ -17,6 +17,7 @@ def test_session_validated_principal_is_reused_without_role_table_query(
     user_in,
     django_assert_num_queries,
 ):
+    from apps.audit.context import bind_request, reset_request
     from apps.org.models import StaffProfile
     from apps.org.tests.factories import BranchFactory
     from core.role_principals import request_role_principal
@@ -35,14 +36,18 @@ def test_session_validated_principal_is_reused_without_role_table_query(
             "/api/v1/messaging/threads/",
             HTTP_AUTHORIZATION=f"Bearer {session.key}",
         )
-        authenticated = SessionAuthentication().authenticate(request)
-        assert authenticated is not None
-        request.user, request.auth = authenticated
+        tokens = bind_request(request)
+        try:
+            authenticated = SessionAuthentication().authenticate(request)
+            assert authenticated is not None
+            request.user, request.auth = authenticated
 
-        # Authentication already checked active profile ownership. Domain helpers
-        # reuse the opaque server marker instead of repeating that same SELECT.
-        with django_assert_num_queries(0):
-            principal = request_role_principal(request)
+            # Authentication already checked active profile ownership. Domain helpers
+            # reuse the opaque server marker instead of repeating that same SELECT.
+            with django_assert_num_queries(0):
+                principal = request_role_principal(request)
+        finally:
+            reset_request(tokens)
         assert (principal.kind, principal.principal_id, principal.user_id) == (
             "staff",
             profile.pk,

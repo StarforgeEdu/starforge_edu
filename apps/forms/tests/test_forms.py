@@ -914,7 +914,15 @@ def test_form_summary_query_count_does_not_scale_with_fields_or_answers(
                 for i in range(20)
             ]
         )
-        responses = FormResponse.objects.bulk_create([FormResponse(form=form) for _ in range(30)])
+        responses = FormResponse.objects.bulk_create(
+            [
+                FormResponse(
+                    form=form,
+                    respondent_attribution_status=FormResponse.AttributionStatus.ANONYMOUS,
+                )
+                for _ in range(30)
+            ]
+        )
         FormAnswer.objects.bulk_create(
             [
                 FormAnswer(response=response, field=field, value=4)

@@ -274,15 +274,17 @@ def test_custom_domain_api_returns_challenge_then_verifies(staff_client, tenant_
     assert verified.json()["data"]["is_primary"] is True
 
 
-def test_non_staff_public_user_403(public_tenant, tenant_a):
-    """A public-schema NON-staff user is forbidden on the control center."""
+def test_non_staff_public_user_cannot_mint_a_platform_session(public_tenant, tenant_a):
+    """A public non-staff bridge is rejected by session validation itself."""
     from apps.users.models import User
     from core.session_auth import create_session
 
     user = User.objects.create_user(username="ctl-plain", password=PASSWORD)
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {create_session(user).key}")
-    assert client.post(f"/api/v1/platform/centers/{tenant_a.pk}/suspend/", {}).status_code == 403
+    response = client.post(f"/api/v1/platform/centers/{tenant_a.pk}/suspend/", {})
+    assert response.status_code == 401
+    assert response.json()["code"] == "authentication_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +382,19 @@ def _mint_impersonation(staff_client, tenant, user_id):
     )
 
 
+def _impersonation_target(user_in, tenant, *, role):
+    """Build the one active role-native principal production can impersonate."""
+    from tests.role_principal_helpers import ensure_role_principal
+
+    target = user_in(tenant, roles=[role])
+    with schema_context(tenant.schema_name):
+        membership = target.role_memberships.select_related("branch").get()
+        ensure_role_principal(target, roles=[role], branch=membership.branch)
+    return target
+
+
 def test_impersonation_mint_returns_access_only(staff_client, tenant_a, user_in):
-    target = user_in(tenant_a, roles=["teacher"])
+    target = _impersonation_target(user_in, tenant_a, role="teacher")
     resp = _mint_impersonation(staff_client, tenant_a, target.pk)
     assert resp.status_code == 200
     body = resp.json()["data"]
@@ -397,7 +410,7 @@ def test_impersonation_unknown_user_404(staff_client, tenant_a):
 
 
 def test_impersonation_rejects_inactive_bridge_account(staff_client, tenant_a, user_in):
-    target = user_in(tenant_a, roles=["teacher"])
+    target = _impersonation_target(user_in, tenant_a, role="teacher")
     with schema_context(tenant_a.schema_name):
         type(target).objects.filter(pk=target.pk).update(is_active=False)
 
@@ -410,7 +423,7 @@ def test_impersonation_rejects_inactive_bridge_account(staff_client, tenant_a, u
 def test_impersonation_both_sides_audited(staff_client, tenant_a, user_in):
     from apps.tenancy.models import PlatformEvent
 
-    target = user_in(tenant_a, roles=["teacher"])
+    target = _impersonation_target(user_in, tenant_a, role="teacher")
     before_pe = PlatformEvent.objects.filter(event="impersonation.minted").count()
 
     resp = _mint_impersonation(staff_client, tenant_a, target.pk)
@@ -438,7 +451,7 @@ def test_impersonation_token_get_works_write_denied(staff_client, tenant_a, user
     if not hasattr(core_perms, "DenyWriteForReadOnlyToken"):
         pytest.skip("DenyWriteForReadOnlyToken not wired yet (see integration_needed)")
 
-    director = user_in(tenant_a, roles=["director"])
+    director = _impersonation_target(user_in, tenant_a, role="director")
     minted = _mint_impersonation(staff_client, tenant_a, director.pk).json()["data"]
     token = minted["access"]
 
@@ -464,7 +477,7 @@ def test_impersonation_write_denied_on_apiview(staff_client, tenant_a, user_in, 
     initial(), not only via the ModelViewSet permission class) — many APIViews
     override permission_classes, so a permission-class-only guard would miss them.
     Uses the CenterSettings APIView: GET works, PATCH is denied read_only_token."""
-    director = user_in(tenant_a, roles=["director"])
+    director = _impersonation_target(user_in, tenant_a, role="director")
     token = _mint_impersonation(staff_client, tenant_a, director.pk).json()["data"]["access"]
 
     tclient = client_for(tenant_a)
@@ -480,7 +493,7 @@ def test_impersonation_token_get_works_unconditionally(staff_client, tenant_a, u
     """Even WITHOUT the write-deny wiring, the TD-1 auth class already accepts the
     impersonation token (it carries valid schema+tv), so a GET succeeds. This
     test proves the read path independent of the core write-deny wiring."""
-    director = user_in(tenant_a, roles=["director"])
+    director = _impersonation_target(user_in, tenant_a, role="director")
     token = _mint_impersonation(staff_client, tenant_a, director.pk).json()["data"]["access"]
     tclient = client_for(tenant_a)
     tclient.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
@@ -491,7 +504,7 @@ def test_impersonation_token_expires(staff_client, tenant_a, user_in, client_for
     """A token minted >10 min in the past is rejected 401 (no refresh to renew)."""
     import time_machine
 
-    director = user_in(tenant_a, roles=["director"])
+    director = _impersonation_target(user_in, tenant_a, role="director")
     with time_machine.travel(timezone.now() - timedelta(minutes=11), tick=False):
         token = _mint_impersonation(staff_client, tenant_a, director.pk).json()["data"]["access"]
 
@@ -509,7 +522,7 @@ def test_impersonation_mints_a_readonly_session(staff_client, tenant_a, user_in)
     from apps.users.models import Session
     from core.session_auth import hash_session_key
 
-    target = user_in(tenant_a, roles=["teacher"])
+    target = _impersonation_target(user_in, tenant_a, role="teacher")
 
     key = _mint_impersonation(staff_client, tenant_a, target.pk).json()["data"]["access"]
 

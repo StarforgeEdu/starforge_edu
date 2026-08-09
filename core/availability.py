@@ -198,12 +198,16 @@ def _database_disabled_apps() -> set[str]:
     """Load the durable tenant override without making a read-path write."""
     from django.db import DatabaseError
 
-    from apps.org.models import CenterSettings
+    from apps.org.selectors import get_center_settings
+    from core.exceptions import ServiceUnavailableException
 
     allowed = set(APP_MOUNTS.values()) - PROTECTED_APPS
     try:
-        raw = CenterSettings.objects.filter(pk=1).values_list("disabled_apps", flat=True).first()
-    except DatabaseError:
+        # OrganizationTimezoneMiddleware consumes the same singleton immediately
+        # after availability resolution. Use the shared cached selector so a cold
+        # request performs one authoritative read rather than fetching the row twice.
+        raw = get_center_settings().disabled_apps
+    except (DatabaseError, ServiceUnavailableException):
         # Runtime policy is security-sensitive: when its authoritative row
         # cannot be read, do not silently re-enable optional tenant features.
         # The protected control plane remains reachable for diagnosis/repair.

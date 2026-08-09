@@ -696,8 +696,9 @@ def test_dashboard_query_budget(tenant_a, user_in, as_user, django_assert_max_nu
         cohort_id = cohort.id
 
     client = as_user(tenant_a, director)
-    # +1 for billing paywall middleware subscription check
-    with django_assert_max_num_queries(7):  # +1: A-2 per-request permission-override load
+    # Includes tenant resolution, billing, the shared availability/timezone
+    # settings read, session auth, and live permission resolution.
+    with django_assert_max_num_queries(8):
         resp = client.get(f"/api/v1/attendance/cohorts/{cohort_id}/dashboard/")
     body = resp.json()["data"]
     assert resp.status_code == 200

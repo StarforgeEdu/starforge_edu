@@ -28,7 +28,9 @@ def test_object_scope_branch_mismatch_denied(tenant_a, user_in, as_user):
     # Teacher membership is in branch A; the slot lives in branch B.
     teacher = user_in(tenant_a, roles=["teacher"], branch=branch_a)
     resp = as_user(tenant_a, teacher).get(f"/api/v1/schedule/timeslots/{slot_id}/")
-    assert resp.status_code == 403  # passes schedule:read gate, fails branch object scope
+    # Scoped detail lookups conceal whether an out-of-scope identifier exists.
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "not_found"
 
 
 def test_object_scope_director_bypass(tenant_a, user_in, as_user):

@@ -7,10 +7,14 @@ from django.db import DatabaseError, IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django_tenants.utils import schema_context
 
+from tests.migration_isolation import IsolatedMigrationHarness
+
 pytestmark = pytest.mark.django_db(transaction=True)
 
 LEGACY_TARGET = ("org", "0019_centersettings_organization_timezone")
 CURRENT_TARGET = ("org", "0021_durable_center_settings")
+INTEGRITY_TARGET = ("org", "0020_org_scope_and_history_integrity")
+ORG_MIGRATIONS = (INTEGRITY_TARGET, CURRENT_TARGET)
 
 
 def _legacy_models():
@@ -22,14 +26,6 @@ def _legacy_models():
     )
 
 
-def _migrate_current_graph() -> None:
-    """Restore every leaf that an org downgrade may have unapplied."""
-
-    executor = MigrationExecutor(connection)
-    assert CURRENT_TARGET in executor.loader.graph.nodes
-    executor.migrate(executor.loader.graph.leaf_nodes())
-
-
 def test_org_integrity_migration_preflights_backfills_and_reverses(tenant_a):
     from apps.org.services import create_staff_account
     from apps.org.tests.factories import BranchFactory, DepartmentFactory
@@ -39,6 +35,7 @@ def test_org_integrity_migration_preflights_backfills_and_reverses(tenant_a):
 
     transfer_ids: list[int] = []
     profile_ids: dict[str, int] = {}
+    migrations = IsolatedMigrationHarness(connection, ORG_MIGRATIONS)
     try:
         with schema_context(tenant_a.schema_name):
             source = BranchFactory(name="Legacy source", slug="legacy-source")
@@ -69,7 +66,7 @@ def test_org_integrity_migration_preflights_backfills_and_reverses(tenant_a):
                 "target": target.pk,
             }
 
-            MigrationExecutor(connection).migrate([LEGACY_TARGET])
+            migrations.downgrade()
             LegacyTransfer, LegacyDepartment = _legacy_models()
             exact = LegacyTransfer.objects.create(
                 user_id=student.user_id,
@@ -91,10 +88,10 @@ def test_org_integrity_migration_preflights_backfills_and_reverses(tenant_a):
             # constraint is installed; the migration never guesses a repair.
             LegacyDepartment.objects.filter(pk=department.pk).update(budget="-1.00")
             with pytest.raises(RuntimeError, match="organization integrity preflight failed"):
-                _migrate_current_graph()
+                migrations.upgrade()
 
             LegacyDepartment.objects.filter(pk=department.pk).update(budget="0.00")
-            _migrate_current_graph()
+            migrations.upgrade()
 
             from apps.org.models import BranchTransfer, CenterSettings, Department
 
@@ -130,24 +127,24 @@ def test_org_integrity_migration_preflights_backfills_and_reverses(tenant_a):
             # Reverse removes the new checks and triggers without destroying
             # pre-existing columns or records. Clean the probes before restoring
             # the current graph so the forward preflight succeeds again.
-            MigrationExecutor(connection).migrate([LEGACY_TARGET])
+            migrations.downgrade()
             LegacyTransfer, LegacyDepartment = _legacy_models()
             assert LegacyTransfer.objects.filter(pk=exact.pk).update(reason="reverse probe") == 1
             assert LegacyDepartment.objects.filter(pk=department.pk).update(budget="-1.00") == 1
             LegacyDepartment.objects.filter(pk=department.pk).update(budget="0.00")
-            _migrate_current_graph()
+            migrations.upgrade()
     finally:
         try:
             with schema_context(tenant_a.schema_name):
                 # Always restore the leaf before cleanup, even when a forward
                 # assertion failed and left the tenant at the legacy graph.
-                MigrationExecutor(connection).migrate([LEGACY_TARGET])
+                migrations.downgrade()
                 LegacyTransfer, LegacyDepartment = _legacy_models()
                 if transfer_ids:
                     LegacyTransfer.objects.filter(pk__in=transfer_ids).delete()
                 if profile_ids:
                     LegacyDepartment.objects.filter(pk=profile_ids["department"]).delete()
-                _migrate_current_graph()
+                migrations.upgrade()
 
                 from apps.org.models import Branch, StaffProfile
                 from apps.students.models import StudentProfile

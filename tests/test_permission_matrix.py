@@ -7,6 +7,7 @@ fail-closed (TD-4) per-action (TD-5) permission system against real endpoints.
 from types import SimpleNamespace
 
 import pytest
+from django_tenants.utils import schema_context
 from rest_framework.request import Request
 from rest_framework.test import APIRequestFactory
 from rest_framework.views import APIView
@@ -102,15 +103,25 @@ MATRIX_CASES = [
     (Role.STUDENT, "get", "/api/v1/ai/requests/", False),
     (Role.PARENT, "get", "/api/v1/ai/requests/", False),
     (Role.CASHIER, "get", "/api/v1/ai/requests/", False),
-    (Role.TEACHER, "get", "/api/v1/ai/budget/", True),
+    (Role.TEACHER, "get", "/api/v1/ai/budget/", False),  # ai:manage is director-only
     (Role.STUDENT, "get", "/api/v1/ai/budget/", False),
     (Role.TEACHER, "patch", "/api/v1/ai/budget/", False),  # ai:manage director-only
 ]
 
 
 @pytest.mark.parametrize(("role", "method", "url", "allowed"), MATRIX_CASES)
-def test_permission_matrix(as_role, role, method, url, allowed):
-    client, _ = as_role(role)
+def test_permission_matrix(as_role, role, method, url, allowed, tenant_a, client_for):
+    client, user = as_role(role)
+    if url.startswith("/api/v1/ai/requests/") and allowed:
+        # AI request rows are principal-private. Exercise their permission gate
+        # with the exact production-shaped role session, not the legacy bridge
+        # union used by this older cross-domain matrix fixture.
+        from tests.role_principal_helpers import ensure_role_principal, exact_session_client
+
+        with schema_context(tenant_a.schema_name):
+            membership = user.role_memberships.select_related("branch").get()
+            ensure_role_principal(user, roles=[role], branch=membership.branch)
+        client = exact_session_client(client_for, tenant_a, user)
     resp = getattr(client, method)(url)
     if allowed:
         assert resp.status_code == 200, f"{role} {method} {url} -> {resp.status_code}"

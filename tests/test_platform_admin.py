@@ -55,16 +55,14 @@ def test_platform_centers_api_staff_200(platform_admin, tenant_a):
     assert tenant_a.slug in {row["slug"] for row in rows}
 
 
-def test_platform_centers_api_non_staff_403(public_tenant, tenant_a):
-    """A public-schema NON-staff user authenticates but is denied (is_staff gate).
-
-    (A tenant-schema user is rejected earlier with 401 — no public Session row —
-    covered by the D4-LE-7 apex lockdown tests; here we exercise the is_staff
-    branch, so the user must be a real public-schema user.)"""
+def test_platform_centers_api_rejects_non_staff_session(public_tenant, tenant_a):
+    """Blank public sessions are valid only for staff/superuser accounts."""
     from apps.users.models import User
 
     user = User.objects.create_user(username="plat-plain", password=PASSWORD)  # is_staff=False
-    assert _staff_client(user).get("/api/v1/platform/centers/").status_code == 403
+    response = _staff_client(user).get("/api/v1/platform/centers/")
+    assert response.status_code == 401
+    assert response.json()["code"] == "authentication_failed"
 
 
 def test_set_primary_non_numeric_domain_id_404(platform_admin, tenant_a):

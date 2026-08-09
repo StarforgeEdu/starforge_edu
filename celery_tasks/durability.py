@@ -83,8 +83,18 @@ TASK_DURABILITY_CONTRACTS = (
     ),
     DurabilityContract(
         "celery_tasks.finance_tasks.generate_statement_pdf",
-        "task-id cache record validated against actor, student, invoice set, and tenant key grammar",
-        "redelivery reuses a completed cache record; an upload-before-cache crash still requires a durable job row or deterministic key to eliminate orphan artifacts",
+        "locked durable StatementExport lifecycle row, immutable invoice snapshot, and deterministic tenant object key",
+        "redelivery observes terminal state or retries the same export; an upload-before-commit crash retains row ownership of the only key",
+    ),
+    DurabilityContract(
+        "celery_tasks.finance_tasks.maintain_statement_exports",
+        "public dispatcher fans out maintenance only to active tenant schemas",
+        "the next periodic sweep republishes tenant-local maintenance without processing tenant rows in public",
+    ),
+    DurabilityContract(
+        "celery_tasks.finance_tasks.maintain_statement_exports_for_schema",
+        "bounded durable StatementExport expiry and stale-delivery recovery under tenant-local execution",
+        "later sweeps retry cleanup and republish only still-queued or stale-running exports",
     ),
     DurabilityContract(
         "celery_tasks.finance_tasks.late_payment_reminders*",
