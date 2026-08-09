@@ -37,6 +37,7 @@ def test_static_writer_secret_is_isolated_to_collectstatic():
     assert 'STATIC_STORAGE_WRITE_ENABLED: "True"' in collectstatic
     assert 'AWS_S3_ACCESS_KEY_ID: ""' in collectstatic
     assert 'AWS_S3_SECRET_ACCESS_KEY: ""' in collectstatic
+    assert "networks:\n      - internal\n      - egress" in collectstatic
     assert "AWS_STATIC_ACCESS_KEY_ID" not in APP_ENV_EXAMPLE
     assert "AWS_STATIC_SECRET_ACCESS_KEY" not in APP_ENV_EXAMPLE
     assert "AWS_STATIC_ACCESS_KEY_ID" in STATIC_ENV_EXAMPLE

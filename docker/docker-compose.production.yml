@@ -245,6 +245,12 @@ services:
   collectstatic:
     <<: *app
     command: ["python", "manage.py", "collectstatic", "--noinput"]
+    # The release verifier fetches the public static URL after writing its probe.
+    # Keep database/cache access on the internal network while granting this
+    # short-lived tool the narrow outbound path required for that verification.
+    networks:
+      - internal
+      - egress
     # The CSP-trusted static bucket is writable only from this one-shot tool.
     # Long-running services inherit app.env alone and use a URL-only backend.
     env_file:
