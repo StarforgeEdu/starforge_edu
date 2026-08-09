@@ -27,3 +27,12 @@ def test_production_beat_healthcheck_uses_runtime_available_in_slim_image():
     assert "(Path('/proc') / pid / 'cmdline').read_bytes()" in compose
     assert "pid != str(os.getpid())" in compose
     assert '"CMD",' in compose
+
+
+def test_production_beat_has_scheduler_memory_headroom():
+    compose = (Path(__file__).resolve().parents[1] / "docker" / "docker-compose.production.yml").read_text(
+        encoding="utf-8"
+    )
+    beat = compose.split("\n  beat:\n", maxsplit=1)[1].split("\n  migrate:\n", maxsplit=1)[0]
+
+    assert "mem_limit: 256m" in beat

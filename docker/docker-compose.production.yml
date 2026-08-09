@@ -188,7 +188,10 @@ services:
   beat:
     <<: *app
     command: ["beat"]
-    mem_limit: 128m
+    # Django initialization plus the database-backed scheduler exceeds 128 MiB
+    # on the production image. Keep enough headroom for schedule reloads so the
+    # kernel does not repeatedly OOM-kill the authoritative scheduler.
+    mem_limit: 256m
     cpus: 0.15
     pids_limit: 80
     healthcheck:

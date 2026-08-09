@@ -518,9 +518,58 @@ quiesce_project_applications() {
   [[ "${#running_project_applications[@]}" == "0" ]]
 }
 
+container_environment_digest() {
+  docker inspect "$1" --format '{{json .Config.Env}}' | python3 -c '
+import hashlib
+import json
+import sys
+
+values = json.load(sys.stdin) or []
+payload = json.dumps(sorted(values), ensure_ascii=False, separators=(",", ":")).encode()
+print(hashlib.sha256(payload).hexdigest())
+'
+}
+
+stateful_reference_contract() (
+  set -Eeuo pipefail
+  local service="$1"
+  local reference_project="starforge-verify-${service}-$$-${RANDOM}"
+  local reference_container reference_config_hash reference_environment_digest
+
+  cleanup_reference() {
+    local status="$?" cleanup_status
+    trap - EXIT INT TERM
+    set +e
+    "${compose[@]}" --project-name "$reference_project" \
+      down --volumes --remove-orphans >/dev/null 2>&1
+    cleanup_status="$?"
+    if [[ "$status" == "0" && "$cleanup_status" != "0" ]]; then
+      exit 1
+    fi
+    exit "$status"
+  }
+  trap cleanup_reference EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  "${compose[@]}" --project-name "$reference_project" \
+    create --no-build "$service" >/dev/null
+  reference_container="$(
+    "${compose[@]}" --project-name "$reference_project" ps -aq "$service"
+  )"
+  [[ -n "$reference_container" ]] || return 1
+  reference_config_hash="$(docker inspect "$reference_container" \
+    --format '{{ index .Config.Labels "com.docker.compose.config-hash" }}')"
+  reference_environment_digest="$(container_environment_digest "$reference_container")"
+  [[ "$reference_config_hash" =~ ^[0-9a-f]{64}$ && \
+     "$reference_environment_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\t%s\n' "$reference_config_hash" "$reference_environment_digest"
+)
+
 verify_stateful_infrastructure() {
   local service expected_image expected_image_id container_ids container_id actual_image_id state health
   local expected_config_hash config_hash_line actual_config_hash published_ports mount_manifest
+  local actual_environment_digest reference_contract reference_config_hash reference_environment_digest
   local expected_volume_name expected_volume_destination
   local -a service_containers
   for service in "${stateful_services[@]}"; do
@@ -561,9 +610,23 @@ verify_stateful_infrastructure() {
     }
     actual_config_hash="$(docker inspect "$container_id" \
       --format '{{ index .Config.Labels "com.docker.compose.config-hash" }}')"
-    [[ "$actual_config_hash" == "$expected_config_hash" ]] || {
-      die "Stateful service $service configuration differs from the reviewed Compose definition"
-    }
+    if [[ "$actual_config_hash" != "$expected_config_hash" ]]; then
+      # Some Compose releases calculate `config --hash` from the fully
+      # resolved env_file model but label containers from the pre-resolution
+      # service model. Ask the same Compose binary to create a stopped,
+      # isolated reference container and compare the label it would actually
+      # apply. The distinct project gets empty disposable volumes and cannot
+      # attach to production state.
+      if ! reference_contract="$(stateful_reference_contract "$service")"; then
+        die "Cannot verify an isolated Compose reference for stateful service $service"
+      fi
+      IFS=$'\t' read -r reference_config_hash reference_environment_digest <<<"$reference_contract"
+      actual_environment_digest="$(container_environment_digest "$container_id")"
+      [[ "$actual_config_hash" == "$reference_config_hash" && \
+         "$actual_environment_digest" == "$reference_environment_digest" ]] || {
+        die "Stateful service $service configuration differs from the reviewed Compose definition"
+      }
+    fi
     published_ports="$(docker inspect "$container_id" --format '{{json .HostConfig.PortBindings}}')"
     [[ "$published_ports" == "{}" || "$published_ports" == "null" ]] || {
       die "Stateful service $service unexpectedly publishes a host port"
@@ -1109,7 +1172,7 @@ smoke_temporary="${evidence_dir}/leadership-smoke.json.tmp"
 rm -f -- "$smoke_temporary"
 if ! docker run --rm --pull=never --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=32m \
-  --user 0:0 --cap-drop ALL --security-opt no-new-privileges \
+  --user 0:0 --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
   --pids-limit 32 --memory 128m --cpus 0.25 \
   --network "container:${candidate_web_container}" \
   --mount "type=bind,src=${LEADERSHIP_SMOKE_CONFIG},dst=/run/secrets/leadership-smoke.json,ro" \

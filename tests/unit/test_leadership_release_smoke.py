@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
-from scripts.run_leadership_release_smoke import _pointer, validate_config
+from scripts.run_leadership_release_smoke import _allows, _pointer, validate_config
+
+
+def test_permission_check_honors_the_director_wildcard():
+    assert _allows(frozenset({"*:*"}), "finance:read")
+    assert _allows(frozenset({"finance:read"}), "finance:read")
+    assert _allows(frozenset({"finance:*"}), "finance:read")
+    assert not _allows(frozenset({"students:read"}), "finance:read")
+
+
+def test_direct_candidate_requests_and_logout_preserve_the_secure_proxy_contract():
+    source = (Path(__file__).resolve().parents[2] / "scripts" / "run_leadership_release_smoke.py").read_text(
+        encoding="utf-8"
+    )
+    logout = source.split("    finally:\n", maxsplit=1)[1].split("        session.close()", maxsplit=1)[0]
+
+    assert source.count('"X-Forwarded-Proto": "https"') == 2
+    assert "allow_redirects=False" in logout
+    assert "response.status_code != 200" in logout
 
 
 def _configuration() -> dict:

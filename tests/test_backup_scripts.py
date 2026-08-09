@@ -58,6 +58,17 @@ def test_backup_targets_only_the_reviewed_starforge_compose_project():
     assert "${COMPOSE_PROJECT_NAME:-starforge}" not in BACKUP_SCRIPT
 
 
+def test_stateful_hash_fallback_uses_an_isolated_disposable_compose_project():
+    verification = DEPLOY_SCRIPT[DEPLOY_SCRIPT.index("verify_stateful_infrastructure()") :]
+
+    assert "stateful_reference_contract" in DEPLOY_SCRIPT
+    assert 'create --no-build "$service"' in DEPLOY_SCRIPT
+    assert "down --volumes --remove-orphans" in DEPLOY_SCRIPT
+    assert "trap cleanup_reference EXIT" in DEPLOY_SCRIPT
+    assert 'container_environment_digest "$container_id"' in verification
+    assert '"$actual_environment_digest" == "$reference_environment_digest"' in verification
+
+
 def test_backup_creates_one_atomic_staged_snapshot_with_stable_retention():
     assert 'mkdir -p "$tmp_dir/minio"' in BACKUP_SCRIPT
     assert 'mkdir -p "$tmp_dir/minio-cluster"' in BACKUP_SCRIPT

@@ -10,7 +10,6 @@ while this process connects directly to the candidate web container.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import re
@@ -45,6 +44,11 @@ class RoleSession:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _allows(grants: frozenset[str], permission: str) -> bool:
+    resource, separator, _verb = permission.partition(":")
+    return "*:*" in grants or permission in grants or (bool(separator) and f"{resource}:*" in grants)
 
 
 def _pointer(document: Any, pointer: str) -> Any:
@@ -197,7 +201,15 @@ def _request(
     access: str | None = None,
     body: dict[str, Any] | None = None,
 ) -> tuple[requests.Response, dict[str, Any]]:
-    headers = {"Host": host, "Accept": "application/json", "User-Agent": "starforge-release-smoke/1"}
+    headers = {
+        "Host": host,
+        "Accept": "application/json",
+        "User-Agent": "starforge-release-smoke/1",
+        # The smoke connects directly to Gunicorn while exercising the same
+        # secure-origin contract used behind Caddy. Without this trusted proxy
+        # marker Django correctly redirects the HTTP hop to public HTTPS.
+        "X-Forwarded-Proto": "https",
+    }
     if access:
         headers["Authorization"] = f"Bearer {access}"
     try:
@@ -291,6 +303,8 @@ def run_smoke(config: dict[str, Any], *, base_url: str, revision: str) -> dict[s
     session = requests.Session()
     roles: dict[str, RoleSession] = {}
     results: list[dict[str, Any]] = []
+    logout_failed = False
+    primary_failure: Exception | None = None
     try:
         for role_name in ("director", "manager"):
             roles[role_name] = _login(
@@ -334,7 +348,7 @@ def run_smoke(config: dict[str, Any], *, base_url: str, revision: str) -> dict[s
                 field in data for field in ("generated_at", "scope", "coverage", "warnings")
             ):
                 raise SmokeFailure(f"{role_name}-executive-summary: snapshot metadata is incomplete")
-            should_have_finance = "finance:read" in roles[role_name].effective_permissions
+            should_have_finance = _allows(roles[role_name].effective_permissions, "finance:read")
             if ("finance" in data) is not should_have_finance:
                 raise SmokeFailure(f"{role_name}-executive-summary: finance permission pruning is incorrect")
             results.append({"name": f"{role_name}-executive-summary", "status": 200})
@@ -364,20 +378,34 @@ def run_smoke(config: dict[str, Any], *, base_url: str, revision: str) -> dict[s
                 else:
                     raise SmokeFailure(f"{operation['name']}: forbidden response field is present")
             results.append({"name": operation["name"], "status": response.status_code})
+    except Exception as exc:
+        primary_failure = exc
     finally:
         for role in roles.values():
-            with contextlib.suppress(requests.RequestException):
-                session.post(
+            try:
+                response = session.post(
                     f"{base_url}/api/v1/auth/logout/",
                     headers={
                         "Host": config["tenant_host"],
                         "Authorization": f"Bearer {role.access}",
                         "Accept": "application/json",
+                        "X-Forwarded-Proto": "https",
                     },
                     json={},
                     timeout=(3.05, 15),
+                    allow_redirects=False,
                 )
+                document = _json_response(response, operation=f"{role.name}-logout")
+                if response.status_code != 200 or document["success"] is not True:
+                    logout_failed = True
+            except (requests.RequestException, SmokeFailure):
+                logout_failed = True
         session.close()
+
+    if logout_failed:
+        raise SmokeFailure("leadership-logout: session cleanup failed") from primary_failure
+    if primary_failure is not None:
+        raise primary_failure
 
     return {
         "revision": revision,
