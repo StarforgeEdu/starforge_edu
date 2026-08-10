@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta
 from datetime import time as wall_time
 from decimal import Decimal
 from itertools import batched, pairwise
+from typing import TYPE_CHECKING, Any, cast
 
 from django.conf import settings
 from django.contrib.auth.hashers import make_password
@@ -32,6 +33,9 @@ from django.utils import timezone
 from django_tenants.utils import get_public_schema_name, schema_context
 
 from apps.tenancy.models import Center
+
+if TYPE_CHECKING:
+    from apps.teachers.models import TeacherProfile
 
 _SEED_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,31}$")
 _BATCH_SIZE = 2_000
@@ -222,7 +226,7 @@ class Command(BaseCommand):
         config = self._config(options)
         plan = _plan(config)
         digest = _plan_digest(config)
-        response = {"config": asdict(config), "plan": plan, "plan_digest": digest}
+        response: dict[str, Any] = {"config": asdict(config), "plan": plan, "plan_digest": digest}
         if options["plan"] and not options["execute"]:
             self._write(response, json_output=options["json_output"])
             return
@@ -712,7 +716,7 @@ def _ensure_students(
                     academic_level=cohort.level,
                     location=cohort.branch.name,
                     previous_school="Tashkent secondary school",
-                    emergency_contacts=[],
+                    emergency_contacts=cast(Any, []),
                 )
             )
         StudentProfile.objects.bulk_create(profiles, batch_size=_BATCH_SIZE)
@@ -730,7 +734,7 @@ def _ensure_students(
         )
         memberships = []
         cohort_memberships = []
-        enrollment_events = []
+        enrollment_events: list[EnrollmentEvent] = []
         for index, username in enumerate(expected, start=1):
             student = by_username[username]
             cohort = cohorts[(index - 1) % len(cohorts)]
@@ -1271,9 +1275,9 @@ def _ensure_finance_history(config: SeedConfig, cohorts: list, students: list, a
                 },
             )
         )
-    for batch in batched(payment_rows, _BATCH_SIZE, strict=False):
+    for payment_batch in batched(payment_rows, _BATCH_SIZE, strict=False):
         with transaction.atomic():
-            Payment.objects.bulk_create(list(batch), batch_size=_BATCH_SIZE)
+            Payment.objects.bulk_create(list(payment_batch), batch_size=_BATCH_SIZE)
     payments = list(Payment.objects.filter(idempotency_key__in=payment_keys))
     by_key = {payment.idempotency_key: payment for payment in payments}
     allocated_payment_ids = set(
@@ -1428,7 +1432,7 @@ def _ensure_academics(config: SeedConfig, cohorts: list, students: list, term, s
                     student=student,
                     score=score,
                     note=f"{config.marker} English assessment result",
-                    graded_by=exam.cohort.primary_teacher.user,
+                    graded_by=cast("TeacherProfile", exam.cohort.primary_teacher).user,
                 )
             )
     for batch in batched(result_rows, _BATCH_SIZE, strict=False):
@@ -1588,7 +1592,7 @@ def _ensure_academics(config: SeedConfig, cohorts: list, students: list, term, s
                 rubric_scores=[],
                 feedback="Good English progress. Review the corrections before the next lesson.",
                 ai_feedback="",
-                graded_by=submission.assignment.cohort.primary_teacher.user,
+                graded_by=cast("TeacherProfile", submission.assignment.cohort.primary_teacher).user,
             )
             for submission in submissions
             if submission.pk not in graded_submission_ids
@@ -1824,7 +1828,7 @@ def _ensure_crm_prospects(config: SeedConfig, structure: dict) -> list:
                     academic_level="",
                     location="Tashkent",
                     previous_school="",
-                    emergency_contacts=[],
+                    emergency_contacts=cast(Any, []),
                 )
                 for index, username in enumerate(usernames, start=1)
                 if username not in existing_profiles
@@ -2346,7 +2350,7 @@ def _verification(config: SeedConfig) -> dict[str, int | str | bool | None]:
         and result["exam_lifecycle_events"] == config.teachers * 4
         and result["grades"] == config.students
         and result["assignments"] == config.teachers * 4
-        and config.students * 3 <= result["submissions"] <= config.students * 4
+        and config.students * 3 <= cast(int, result["submissions"]) <= config.students * 4
         and result["threads"] == config.students
         and result["thread_participants"] == config.students * 3
         and result["messages"] == config.students * 16

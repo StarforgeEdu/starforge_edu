@@ -86,8 +86,7 @@ class Command(BaseCommand):
                     )
 
                 active_owner = RoleMembership.objects.filter(
-                    Q(account_type=owner_type)
-                    | Q(account_type__isnull=True, role=Role.DIRECTOR),
+                    Q(account_type=owner_type) | Q(account_type__isnull=True, role=Role.DIRECTOR),
                     revoked_at__isnull=True,
                     user__is_active=True,
                     user__staff_profile__is_active=True,
