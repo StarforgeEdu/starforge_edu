@@ -64,6 +64,7 @@ boundary: it includes safeguarding, privacy, exact-principal attribution,
 immutable finance/audit/organization history, assessment integrity, and the
 other migrations declared by the cutover command. Follow
 [`runbooks/production-release-cutover.md`](runbooks/production-release-cutover.md).
+
 The immutable deployment script requires an exact 40-character approved
 revision, stops all old application processes, restore-tests the database,
 broker, object, and configuration snapshot, and pauses for a human-reviewed
@@ -76,6 +77,30 @@ python manage.py migrate_schemas                    # all tenant schemas
 
 Adding a tenant runs all `TENANT_APPS` migrations on the new schema
 automatically (Center.auto_create_schema=True).
+
+## First tenant director
+
+The role-native staff API cannot create a tenant's first owner because that API
+correctly requires an existing owner-authorized session. After provisioning at
+least one branch, an operator can bootstrap exactly one first director from an
+application container:
+
+```bash
+python manage.py bootstrap_tenant_director \
+  --schema center_schema \
+  --branch central \
+  --username admin \
+  --first-name Amina \
+  --last-name Director \
+  --email amina@example.com
+```
+
+The command refuses the public schema, unknown/inactive tenants, inactive
+branches, missing recovery contacts, and any tenant that already has an active
+director. It generates a strong one-time password, prints it once, stores only
+its Django hash, and forces a password change at first login. Never run the
+development CEO seed in production and never install a shared default such as
+`root`.
 
 ## Backup
 
