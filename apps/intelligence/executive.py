@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable
 from datetime import date, timedelta
-from typing import Any
 
 from django.http import HttpRequest
 from django.utils import timezone
 
+from apps.intelligence.cache import intelligence_cache_key
 from apps.intelligence.dto import (
     ExecutiveScopeBoundary,
     ExecutiveScopeLabel,
@@ -22,14 +21,13 @@ from core.exceptions import PermissionException, ValidationException
 from core.permissions import (
     PermissionRoleSet,
     _request_overrides,
-    get_effective_permission_context,
     get_user_roles,
     has_permission_code,
 )
+from core.role_principals import RolePrincipal
 from core.scoping import is_permission_unscoped
-from core.utils import current_schema, stable_hash
 
-EXECUTIVE_CACHE_SECONDS = 45
+EXECUTIVE_CACHE_SECONDS = 300
 EXECUTIVE_MAX_WINDOW_DAYS = 366
 EXECUTIVE_SECTION_REQUIREMENTS: dict[str, tuple[tuple[str, ...], ...]] = {
     # Each inner tuple is an all-of permission set; outer tuples are
@@ -332,22 +330,29 @@ def executive_cache_key(
     principal_kind: str,
     principal_id: int,
 ) -> str:
-    effective_permissions, _permission_scopes = get_effective_permission_context(request)
-    identity: dict[str, Any] = {
-        "version": 2,
-        "tenant": current_schema(),
-        "principal": [user_id, principal_kind, principal_id],
-        "scope": [[boundary.branch_id, boundary.department_id] for boundary in scope.boundaries],
-        "permissions": list(effective_permissions),
-        "sections": sorted(included_sections),
-        "date_from": window.date_from.isoformat(),
-        "date_to": window.date_to.isoformat(),
-        "timezone": window.timezone,
-        "locale": locale,
-        "currency": currency,
-    }
-    digest = stable_hash(json.dumps(identity, sort_keys=True, separators=(",", ":")))
-    return f"intelligence:executive-summary:v2:{digest}"
+    return intelligence_cache_key(
+        request,
+        namespace="executive-summary",
+        principal=RolePrincipal(
+            user_id=user_id,
+            kind=principal_kind,
+            principal_id=principal_id,
+        ),
+        scope={
+            "boundaries": [[boundary.branch_id, boundary.department_id] for boundary in scope.boundaries],
+            "organization_wide": scope.organization_wide,
+            "requested_branch": scope.requested_branch_id,
+            "requested_department": scope.requested_department_id,
+        },
+        query={
+            "sections": sorted(included_sections),
+            "date_from": window.date_from.isoformat(),
+            "date_to": window.date_to.isoformat(),
+            "timezone": window.timezone,
+            "locale": locale,
+            "currency": currency,
+        },
+    )
 
 
 def _positive_id(request: HttpRequest, name: str) -> int | None:

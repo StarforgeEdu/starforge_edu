@@ -22,9 +22,15 @@ from django.utils.cache import patch_vary_headers
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 
+from apps.intelligence.cache import (
+    CachePolicy,
+    CacheResult,
+    apply_cache_headers,
+    get_or_compute,
+    intelligence_cache_key,
+)
 from apps.intelligence.dto import ExecutiveSummaryContext
 from apps.intelligence.executive import (
-    EXECUTIVE_CACHE_SECONDS,
     executive_cache_key,
     included_executive_sections,
     parse_executive_query,
@@ -55,7 +61,7 @@ from core.permissions import (
     has_permission_code,
 )
 from core.responses import error, success
-from core.role_principals import request_role_principal
+from core.role_principals import STAFF_PRINCIPAL_KINDS, request_role_principal
 from core.scoping import (
     is_permission_unscoped,
     permission_membership_branch_wide_ids,
@@ -121,10 +127,11 @@ def _page_values(request: HttpRequest) -> tuple[int, int]:
 
 def _executive_response(
     request: HttpRequest,
-    payload: dict[str, Any],
+    cached: CacheResult,
 ) -> HttpResponse:
     """Return a private conditional response for one already-scoped payload."""
 
+    payload = cached.payload
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     etag = f'"{stable_hash(encoded)}"'
     if _if_none_match(request.headers.get("If-None-Match", ""), etag):
@@ -137,7 +144,34 @@ def _executive_response(
     # leave a fresh protected response reusable from the browser cache.
     response["Cache-Control"] = "private, no-cache, max-age=0, must-revalidate"
     patch_vary_headers(response, ("Accept-Language", "Authorization"))
+    apply_cache_headers(response, cached)
     return response
+
+
+def _private_cached_response(cached: CacheResult) -> HttpResponse:
+    """Render a protected cached payload without enabling browser reuse."""
+
+    response = success(cached.payload)
+    response["Cache-Control"] = "private, no-cache, max-age=0, must-revalidate"
+    patch_vary_headers(response, ("Accept-Language", "Authorization"))
+    apply_cache_headers(response, cached)
+    return response
+
+
+def _executive_cache_policy() -> CachePolicy:
+    return CachePolicy(
+        fresh_seconds=int(settings.EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS),
+        stale_seconds=int(settings.EXECUTIVE_SUMMARY_CACHE_STALE_SECONDS),
+        lock_seconds=int(settings.INTELLIGENCE_CACHE_LOCK_SECONDS),
+    )
+
+
+def _risk_cache_policy() -> CachePolicy:
+    return CachePolicy(
+        fresh_seconds=int(settings.INTELLIGENCE_RISK_CACHE_FRESH_SECONDS),
+        stale_seconds=int(settings.INTELLIGENCE_RISK_CACHE_STALE_SECONDS),
+        lock_seconds=int(settings.INTELLIGENCE_CACHE_LOCK_SECONDS),
+    )
 
 
 def _if_none_match(header: str, etag: str) -> bool:
@@ -313,7 +347,15 @@ def _scoped_risk_students(request: HttpRequest):
         account_kinds={"teacher"},
     )
     if teacher_scope:
-        visible |= Q(current_cohort__in=taught_cohorts(user=request.user))
+        # Current named-risk access follows live cohort assignments only. A
+        # completed historical lesson is legitimate delivery evidence elsewhere,
+        # but must not grant a former teacher permanent access to today's roster.
+        visible |= Q(
+            current_cohort__in=taught_cohorts(
+                user=request.user,
+                include_lesson_teacher=False,
+            )
+        )
     return qs.filter(visible).distinct()
 
 
@@ -355,19 +397,6 @@ def executive_summary_view(request: HttpRequest) -> HttpResponse:
     # relabel those values with a configurable presentation currency until the
     # versioned multi-currency migration supplies converted amounts.
     currency = "UZS"
-    cache_seconds = max(
-        30,
-        min(
-            60,
-            int(
-                getattr(
-                    settings,
-                    "EXECUTIVE_SUMMARY_CACHE_SECONDS",
-                    EXECUTIVE_CACHE_SECONDS,
-                )
-            ),
-        ),
-    )
     key = executive_cache_key(
         request,
         scope=scope,
@@ -379,17 +408,9 @@ def executive_summary_view(request: HttpRequest) -> HttpResponse:
         principal_kind=principal.kind,
         principal_id=principal.principal_id,
     )
-    try:
-        payload = cache.get(key)
-    except Exception:
-        # The snapshot cache is an optimization, not an authorization source.
-        # A Redis incident must not turn an otherwise healthy, authoritative SQL
-        # dashboard into a 500. Avoid the key in logs because it fingerprints the
-        # caller's exact permission/scope combination.
-        logger.warning("Executive summary cache read failed.", exc_info=True)
-        payload = None
-    if not isinstance(payload, dict):
-        payload = _service().executive_summary(
+
+    def load_summary() -> dict[str, Any]:
+        return _service().executive_summary(
             context=ExecutiveSummaryContext(
                 generated_at=timezone.now(),
                 scope=scope,
@@ -402,11 +423,15 @@ def executive_summary_view(request: HttpRequest) -> HttpResponse:
                 principal_id=principal.principal_id,
             )
         )
-        try:
-            cache.set(key, payload, timeout=cache_seconds)
-        except Exception:
-            logger.warning("Executive summary cache write failed.", exc_info=True)
-    return _executive_response(request, payload)
+
+    cached = get_or_compute(
+        backend=cache,
+        key=key,
+        policy=_executive_cache_policy(),
+        loader=load_summary,
+        logger=logger,
+    )
+    return _executive_response(request, cached)
 
 
 @csrf_exempt
@@ -421,14 +446,69 @@ def risk_list_view(request: HttpRequest) -> HttpResponse:
     if cohort_id is not None:
         qs = qs.filter(current_cohort_id=cohort_id)
     page, page_size = _page_values(request)
-    return success(
-        _service().risk_list(
+    policy = _risk_cache_policy()
+    include_finance = _can_see_finance(request)
+    if not policy.enabled:
+        return success(
+            _service().risk_list(
+                students=qs,
+                include_finance=include_finance,
+                page=page,
+                page_size=page_size,
+            )
+        )
+    principal = request_role_principal(
+        request,
+        allowed_kinds=STAFF_PRINCIPAL_KINDS,
+        error_code="intelligence_principal_unavailable",
+    )
+    # Cache only organization-wide STAFF reads. Teacher cohort assignments and
+    # branch/department student placement are mutable row-scope inputs that are
+    # intentionally absent from the flat permission context; caching either can
+    # expose a former student until the stale horizon expires.
+    if principal.kind != "staff" or not is_permission_unscoped(
+        request,
+        permission="intelligence:read",
+        account_kinds={"staff"},
+    ):
+        return success(
+            _service().risk_list(
+                students=qs,
+                include_finance=include_finance,
+                page=page,
+                page_size=page_size,
+            )
+        )
+    key = intelligence_cache_key(
+        request,
+        namespace="risk-list",
+        principal=principal,
+        scope={
+            "resource": "student-risk",
+            "finance_signal": include_finance,
+        },
+        query={
+            "cohort": cohort_id,
+            "page": page,
+            "page_size": page_size,
+            "as_of_date": timezone.localdate().isoformat(),
+            "timezone": timezone.get_current_timezone_name(),
+            "locale": translation.get_language() or settings.LANGUAGE_CODE,
+        },
+    )
+    cached = get_or_compute(
+        backend=cache,
+        key=key,
+        policy=policy,
+        loader=lambda: _service().risk_list(
             students=qs,
-            include_finance=_can_see_finance(request),
+            include_finance=include_finance,
             page=page,
             page_size=page_size,
-        )
+        ),
+        logger=logger,
     )
+    return _private_cached_response(cached)
 
 
 @csrf_exempt
@@ -441,7 +521,46 @@ def risk_detail_view(request: HttpRequest, student_id: int) -> HttpResponse:
     student = _scoped_risk_students(request).filter(pk=student_id).first()
     if student is None:
         raise NotFoundException(_("Student not found."), code="not_found")
-    return success(_service().risk_detail(student=student, include_finance=_can_see_finance(request)))
+    policy = _risk_cache_policy()
+    include_finance = _can_see_finance(request)
+    if not policy.enabled:
+        return success(
+            _service().risk_detail(
+                student=student,
+                include_finance=include_finance,
+            )
+        )
+    principal = request_role_principal(
+        request,
+        allowed_kinds=STAFF_PRINCIPAL_KINDS,
+        error_code="intelligence_principal_unavailable",
+    )
+    key = intelligence_cache_key(
+        request,
+        namespace="risk-detail",
+        principal=principal,
+        scope={
+            "resource": "student-risk",
+            "finance_signal": include_finance,
+        },
+        query={
+            "student": student_id,
+            "as_of_date": timezone.localdate().isoformat(),
+            "timezone": timezone.get_current_timezone_name(),
+            "locale": translation.get_language() or settings.LANGUAGE_CODE,
+        },
+    )
+    cached = get_or_compute(
+        backend=cache,
+        key=key,
+        policy=policy,
+        loader=lambda: _service().risk_detail(
+            student=student,
+            include_finance=include_finance,
+        ),
+        logger=logger,
+    )
+    return _private_cached_response(cached)
 
 
 @csrf_exempt

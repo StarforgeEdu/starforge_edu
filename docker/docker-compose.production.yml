@@ -101,8 +101,12 @@ services:
       internal: {}
       edge:
         aliases: [starforge-web]
-    mem_limit: 384m
-    cpus: 0.65
+    # Two synchronous workers peaked above the former 384 MiB cgroup limit
+    # during production-sized intelligence reads.  Keep enough headroom to
+    # avoid worker OOM churn and let the web tier use one of the host's two
+    # CPUs without allowing it to starve PostgreSQL or background workers.
+    mem_limit: 512m
+    cpus: 1.00
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz/ready"]
       interval: 10s

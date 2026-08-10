@@ -678,6 +678,30 @@ CELERY_BEAT_SCHEDULE = {
 # ---------------------------------------------------------------------------
 # Cache (Redis)
 # ---------------------------------------------------------------------------
+# Expensive intelligence reads use a private, authorization-keyed
+# stale-while-revalidate envelope. The stale horizon is the Redis retention
+# period; callers still see the original generated-at/age metadata.
+EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS = env.int(
+    "EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS",
+    default=300,
+)
+EXECUTIVE_SUMMARY_CACHE_STALE_SECONDS = env.int(
+    "EXECUTIVE_SUMMARY_CACHE_STALE_SECONDS",
+    default=1800,
+)
+INTELLIGENCE_RISK_CACHE_FRESH_SECONDS = env.int(
+    "INTELLIGENCE_RISK_CACHE_FRESH_SECONDS",
+    default=120,
+)
+INTELLIGENCE_RISK_CACHE_STALE_SECONDS = env.int(
+    "INTELLIGENCE_RISK_CACHE_STALE_SECONDS",
+    default=600,
+)
+INTELLIGENCE_CACHE_LOCK_SECONDS = env.int(
+    "INTELLIGENCE_CACHE_LOCK_SECONDS",
+    default=60,
+)
+
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",

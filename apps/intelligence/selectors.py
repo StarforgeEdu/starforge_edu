@@ -16,10 +16,8 @@ from zoneinfo import ZoneInfo
 
 from django.db.models import (
     Avg,
-    BooleanField,
     Case,
     Count,
-    Exists,
     ExpressionWrapper,
     F,
     FloatField,
@@ -32,7 +30,7 @@ from django.db.models import (
     Value,
     When,
 )
-from django.db.models.functions import Cast, Coalesce, NullIf
+from django.db.models.functions import Cast, Coalesce
 from django.utils import timezone
 
 from apps.academics.models import ExamResult
@@ -164,11 +162,7 @@ def student_risk(students: QuerySet[StudentProfile], *, now=None, include_financ
 
 def _flags_for(att, avg_pct, is_overdue) -> list[dict]:
     flags: list[dict] = []
-    if (
-        att
-        and att["total"] >= MIN_LESSONS_FOR_ATTENDANCE_FLAG
-        and (att["absent"] / att["total"]) >= ABSENCE_RATE_THRESHOLD
-    ):
+    if _is_low_attendance(att):
         flags.append(
             {"code": "low_attendance", "reason": f"Absent {att['absent']} of last {att['total']} lessons."}
         )
@@ -179,40 +173,46 @@ def _flags_for(att, avg_pct, is_overdue) -> list[dict]:
     return flags
 
 
-def student_risk_page(
-    students: QuerySet[StudentProfile],
-    *,
-    include_finance: bool,
-    page: int,
-    page_size: int,
-    now=None,
-) -> tuple[list[dict[str, Any]], int]:
-    """Return one globally-ranked page without loading the scoped population.
+def _is_low_attendance(attendance: dict[str, int] | None) -> bool:
+    return bool(
+        attendance
+        and attendance["total"] >= MIN_LESSONS_FOR_ATTENDANCE_FLAG
+        and (attendance["absent"] / attendance["total"]) >= ABSENCE_RATE_THRESHOLD
+    )
 
-    Risk signals are correlated subqueries and the score is ordered in SQL, so
-    memory and row materialization stay bounded by ``page_size``. The public
-    rules and row shape remain identical to :func:`student_risk`.
+
+def _risk_signal_data(
+    *,
+    students: QuerySet[StudentProfile],
+    attendance_records: QuerySet[AttendanceRecord],
+    exam_results: QuerySet[ExamResult],
+    overdue_invoices: QuerySet[Invoice] | None,
+) -> tuple[dict[int, dict[str, int]], dict[int, float], set[int]]:
+    """Read each risk signal once for an already-authorized student scope.
+
+    Keeping the scope as a subquery lets PostgreSQL use one semi-join per signal.
+    In particular, it avoids Django expanding references to correlated annotation
+    aliases every time the score, filter, ordering, or aggregate mentions them.
     """
 
-    now = now or timezone.now()
-    window = now - timedelta(days=ATTENDANCE_WINDOW_DAYS)
-    attendance_stats = (
-        AttendanceRecord.objects.filter(
-            student_id=OuterRef("pk"),
-            lesson__starts_at__gte=window,
-            lesson__starts_at__lte=now,
-        )
+    student_ids = students.order_by().values("pk")
+    attendance = {
+        int(row["student_id"]): {
+            "total": int(row["total"]),
+            "absent": int(row["absent"]),
+        }
+        for row in attendance_records.filter(student_id__in=Subquery(student_ids))
+        .order_by()
         .values("student_id")
         .annotate(
-            denominator=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
+            total=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
             absent=Count("id", filter=Q(status=AttendanceRecord.Status.ABSENT)),
         )
-    )
-    grade_stats = (
-        ExamResult.objects.filter(
-            student_id=OuterRef("pk"),
-            exam__is_published=True,
-        )
+    }
+    grades = {
+        int(row["student_id"]): float(row["avg_pct"])
+        for row in exam_results.filter(student_id__in=Subquery(student_ids))
+        .order_by()
         .values("student_id")
         .annotate(
             avg_pct=Avg(
@@ -222,94 +222,94 @@ def student_risk_page(
                 )
             )
         )
-    )
-    overdue: Exists | Value
+        if row["avg_pct"] is not None
+    }
+    overdue: set[int] = set()
+    if overdue_invoices is not None:
+        overdue = set(
+            overdue_invoices.filter(student_id__in=Subquery(student_ids))
+            .order_by()
+            .values_list("student_id", flat=True)
+            .distinct()
+        )
+    return attendance, grades, overdue
+
+
+def _risk_flags_by_student(
+    attendance: dict[int, dict[str, int]],
+    grades: dict[int, float],
+    overdue: set[int],
+) -> dict[int, list[dict]]:
+    candidates = set(attendance) | set(grades) | overdue
+    return {
+        student_id: flags
+        for student_id in candidates
+        if (flags := _flags_for(attendance.get(student_id), grades.get(student_id), student_id in overdue))
+    }
+
+
+def student_risk_page(
+    students: QuerySet[StudentProfile],
+    *,
+    include_finance: bool,
+    page: int,
+    page_size: int,
+    now=None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return a globally-ranked page from three set-based signal aggregates."""
+
+    now = now or timezone.now()
+    window = now - timedelta(days=ATTENDANCE_WINDOW_DAYS)
+    overdue_invoices = None
     if include_finance:
-        overdue = Exists(
-            Invoice.objects.filter(
-                student_id=OuterRef("pk"),
-                status=Invoice.Status.OVERDUE,
-                attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
-                branch_at_issue_id=OuterRef("branch_id"),
-            )
+        overdue_invoices = Invoice.objects.filter(
+            status=Invoice.Status.OVERDUE,
+            attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+            branch_at_issue_id=F("student__branch_id"),
         )
-    else:
-        overdue = Value(False, output_field=BooleanField())
-    ranked = (
-        students.order_by()
-        .annotate(
-            risk_attendance_total=Coalesce(
-                Subquery(attendance_stats.values("denominator")[:1]),
-                Value(0),
-                output_field=IntegerField(),
-            ),
-            risk_attendance_absent=Coalesce(
-                Subquery(attendance_stats.values("absent")[:1]),
-                Value(0),
-                output_field=IntegerField(),
-            ),
-            risk_avg_grade_pct=Subquery(
-                grade_stats.values("avg_pct")[:1],
-                output_field=FloatField(),
-            ),
-            risk_overdue_payment=overdue,
-        )
-        .annotate(
-            risk_absence_rate=ExpressionWrapper(
-                Cast(F("risk_attendance_absent"), FloatField())
-                / NullIf(Cast(F("risk_attendance_total"), FloatField()), Value(0.0)),
-                output_field=FloatField(),
-            )
-        )
-        .annotate(
-            risk_low_attendance=Case(
-                When(
-                    risk_attendance_total__gte=MIN_LESSONS_FOR_ATTENDANCE_FLAG,
-                    risk_absence_rate__gte=ABSENCE_RATE_THRESHOLD,
-                    then=Value(True),
-                ),
-                default=Value(False),
-                output_field=BooleanField(),
-            ),
-            risk_low_grades=Case(
-                When(risk_avg_grade_pct__lt=LOW_GRADE_PCT_THRESHOLD, then=Value(True)),
-                default=Value(False),
-                output_field=BooleanField(),
-            ),
-        )
-        .annotate(
-            risk_score=(
-                Cast(F("risk_low_attendance"), IntegerField()) * RULES["low_attendance"]["weight"]
-                + Cast(F("risk_low_grades"), IntegerField()) * RULES["low_grades"]["weight"]
-                + Cast(F("risk_overdue_payment"), IntegerField()) * RULES["overdue_payment"]["weight"]
-            )
-        )
-        .filter(risk_score__gt=0)
-        .order_by("-risk_score", "pk")
+    attendance, grades, overdue = _risk_signal_data(
+        students=students,
+        attendance_records=AttendanceRecord.objects.filter(
+            lesson__starts_at__gte=window,
+            lesson__starts_at__lte=now,
+        ),
+        exam_results=ExamResult.objects.filter(
+            exam__is_published=True,
+        ),
+        overdue_invoices=overdue_invoices,
     )
-    total = ranked.count()
+    flags_by_student = _risk_flags_by_student(attendance, grades, overdue)
+    ranked = [
+        (
+            sum(RULES[flag["code"]]["weight"] for flag in flags),
+            student_id,
+            flags,
+        )
+        for student_id, flags in flags_by_student.items()
+    ]
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    total = len(ranked)
     offset = (page - 1) * page_size
     if offset > 1_000_000_000:
         return [], total
-    rows = list(ranked.select_related("user", "current_cohort")[offset : offset + page_size])
+    page_rows = ranked[offset : offset + page_size]
+    page_ids = [student_id for _score, student_id, _flags in page_rows]
+    students_by_id = {
+        student.pk: student
+        for student in students.filter(pk__in=page_ids).select_related("user", "current_cohort")
+    }
     results: list[dict[str, Any]] = []
-    for student in rows:
-        attendance = {
-            "total": student.risk_attendance_total,
-            "absent": student.risk_attendance_absent,
-        }
-        flags = _flags_for(
-            attendance,
-            student.risk_avg_grade_pct,
-            student.risk_overdue_payment,
-        )
+    for score, student_id, flags in page_rows:
+        student = students_by_id.get(student_id)
+        if student is None:
+            continue
         results.append(
             {
-                "student": student.pk,
+                "student": student_id,
                 "name": student.get_full_name(),
                 "cohort": student.current_cohort_id,
-                "score": student.risk_score,
-                "level": _level(student.risk_score),
+                "score": score,
+                "level": _level(score),
                 "flags": flags,
             }
         )
@@ -1242,93 +1242,57 @@ def _risk_summary(
         branch_field="lesson__cohort__branch_id",
         department_field="lesson__cohort__department_id",
     )
-    recent_attendance = (
-        AttendanceRecord.objects.filter(
-            attendance_scope,
-            student_id=OuterRef("pk"),
-            lesson__starts_at__gte=lower,
-            lesson__starts_at__lt=upper,
-        )
-        .values("student_id")
-        .annotate(
-            denominator=Count("id", filter=~Q(status=AttendanceRecord.Status.EXCUSED)),
-            absent=Count("id", filter=Q(status=AttendanceRecord.Status.ABSENT)),
-        )
-        .filter(denominator__gte=MIN_LESSONS_FOR_ATTENDANCE_FLAG)
-        .annotate(
-            absence_rate=ExpressionWrapper(
-                Cast(F("absent"), FloatField()) / Cast(F("denominator"), FloatField()),
-                output_field=FloatField(),
-            )
-        )
-        .filter(absence_rate__gte=ABSENCE_RATE_THRESHOLD)
+    attendance_records = AttendanceRecord.objects.filter(
+        attendance_scope,
+        lesson__starts_at__gte=lower,
+        lesson__starts_at__lt=upper,
     )
     assessment_scope = _scope_predicate(
         context.scope.boundaries,
         branch_field="exam__cohort__branch_id",
         department_field="exam__cohort__department_id",
     )
-    low_grades = (
-        ExamResult.objects.filter(
-            assessment_scope,
-            student_id=OuterRef("pk"),
-            exam__is_published=True,
-            exam__exam_date__gte=context.window.date_from,
-            exam__exam_date__lte=context.window.date_to,
-        )
-        .values("student_id")
-        .annotate(
-            avg_pct=Avg(
-                ExpressionWrapper(
-                    F("score") * 100.0 / F("exam__max_score"),
-                    output_field=FloatField(),
-                )
-            )
-        )
-        .filter(avg_pct__lt=LOW_GRADE_PCT_THRESHOLD)
+    exam_results = ExamResult.objects.filter(
+        assessment_scope,
+        exam__is_published=True,
+        exam__exam_date__gte=context.window.date_from,
+        exam__exam_date__lte=context.window.date_to,
     )
-    overdue_exists: Exists | Value
+    overdue_invoices = None
     if include_finance:
         invoice_scope = _scope_predicate(
             context.scope.boundaries,
             branch_field="branch_at_issue_id",
             department_field="department_at_issue_id",
         )
-        overdue_exists = Exists(
-            Invoice.objects.filter(
-                invoice_scope,
-                attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
-                student_id=OuterRef("pk"),
-                status=Invoice.Status.OVERDUE,
-            )
+        overdue_invoices = Invoice.objects.filter(
+            invoice_scope,
+            attribution_status__in=ATTRIBUTED_SCOPE_STATUSES,
+            status=Invoice.Status.OVERDUE,
         )
-    else:
-        overdue_exists = Value(False, output_field=BooleanField())
-
-    annotated = students.annotate(
-        low_attendance=Exists(recent_attendance),
-        low_grades=Exists(low_grades),
-        overdue_payment=overdue_exists,
+    sample = students.count()
+    attendance, grades, overdue = _risk_signal_data(
+        students=students,
+        attendance_records=attendance_records,
+        exam_results=exam_results,
+        overdue_invoices=overdue_invoices,
     )
-    any_risk = Q(low_attendance=True) | Q(low_grades=True) | Q(overdue_payment=True)
-    high_risk = Q(low_attendance=True) & (Q(low_grades=True) | Q(overdue_payment=True))
-    medium_risk = Q(low_attendance=True, low_grades=False, overdue_payment=False) | Q(
-        low_attendance=False, low_grades=True, overdue_payment=True
-    )
-    low_risk = Q(low_attendance=False) & (
-        Q(low_grades=True, overdue_payment=False) | Q(low_grades=False, overdue_payment=True)
-    )
-    totals = annotated.aggregate(
-        student_sample_size=Count("id"),
-        at_risk_students=Count("id", filter=any_risk),
-        high_risk_students=Count("id", filter=high_risk),
-        medium_risk_students=Count("id", filter=medium_risk),
-        low_risk_students=Count("id", filter=low_risk),
-        low_attendance_students=Count("id", filter=Q(low_attendance=True)),
-        low_grade_students=Count("id", filter=Q(low_grades=True)),
-        overdue_payment_students=Count("id", filter=Q(overdue_payment=True)),
-    )
-    sample = totals["student_sample_size"]
+    low_attendance = {student_id for student_id, row in attendance.items() if _is_low_attendance(row)}
+    low_grades = {student_id for student_id, average in grades.items() if average < LOW_GRADE_PCT_THRESHOLD}
+    at_risk = low_attendance | low_grades | overdue
+    high_risk = low_attendance & (low_grades | overdue)
+    medium_risk = (low_attendance - low_grades - overdue) | ((low_grades & overdue) - low_attendance)
+    low_risk = (low_grades ^ overdue) - low_attendance
+    totals: dict[str, Any] = {
+        "student_sample_size": sample,
+        "at_risk_students": len(at_risk),
+        "high_risk_students": len(high_risk),
+        "medium_risk_students": len(medium_risk),
+        "low_risk_students": len(low_risk),
+        "low_attendance_students": len(low_attendance),
+        "low_grade_students": len(low_grades),
+        "overdue_payment_students": len(overdue),
+    }
     totals["at_risk_rate_fraction"] = round(totals["at_risk_students"] / sample, 4) if sample else None
     totals["included_signals"] = [
         "low_attendance",

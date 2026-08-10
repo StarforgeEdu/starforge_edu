@@ -25,8 +25,13 @@ from .base import (
     EMAIL_ENABLED,
     ESKIZ_API_ALLOWED_HOSTS,
     ESKIZ_API_URL,
+    EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS,
+    EXECUTIVE_SUMMARY_CACHE_STALE_SECONDS,
     FIELD_ENCRYPTION_KEY,
     FISCALIZATION_ENABLED,
+    INTELLIGENCE_CACHE_LOCK_SECONDS,
+    INTELLIGENCE_RISK_CACHE_FRESH_SECONDS,
+    INTELLIGENCE_RISK_CACHE_STALE_SECONDS,
     PAYME_CHECKOUT_ALLOWED_HOSTS,
     PAYME_CHECKOUT_URL,
     PRINT_AGENT_LEASE_SECONDS,
@@ -116,6 +121,30 @@ if not 60 <= WEBSOCKET_CONNECTION_LEASE_SECONDS <= 300:
     raise ImproperlyConfigured("WEBSOCKET_CONNECTION_LEASE_SECONDS must be between 60 and 300.")
 if not 1 <= APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS <= 300:
     raise ImproperlyConfigured("APP_AVAILABILITY_CACHE_TIMEOUT_SECONDS must be between 1 and 300.")
+if not 30 <= EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS <= 15 * 60:
+    raise ImproperlyConfigured("EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS must be between 30 and 900.")
+if not (EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS <= EXECUTIVE_SUMMARY_CACHE_STALE_SECONDS <= 24 * 60 * 60):
+    raise ImproperlyConfigured(
+        "EXECUTIVE_SUMMARY_CACHE_STALE_SECONDS must be at least the fresh TTL and at most 86400."
+    )
+if not 30 <= INTELLIGENCE_RISK_CACHE_FRESH_SECONDS <= 10 * 60:
+    raise ImproperlyConfigured("INTELLIGENCE_RISK_CACHE_FRESH_SECONDS must be between 30 and 600.")
+if not (INTELLIGENCE_RISK_CACHE_FRESH_SECONDS <= INTELLIGENCE_RISK_CACHE_STALE_SECONDS <= 60 * 60):
+    raise ImproperlyConfigured(
+        "INTELLIGENCE_RISK_CACHE_STALE_SECONDS must be at least the fresh TTL and at most 3600."
+    )
+if not 5 <= INTELLIGENCE_CACHE_LOCK_SECONDS <= 120:
+    raise ImproperlyConfigured("INTELLIGENCE_CACHE_LOCK_SECONDS must be between 5 and 120.")
+if (
+    min(
+        EXECUTIVE_SUMMARY_CACHE_FRESH_SECONDS,
+        INTELLIGENCE_RISK_CACHE_FRESH_SECONDS,
+    )
+    < INTELLIGENCE_CACHE_LOCK_SECONDS
+):
+    raise ImproperlyConfigured(
+        "INTELLIGENCE_CACHE_LOCK_SECONDS must not exceed either intelligence fresh TTL."
+    )
 
 # Production terminates TLS behind a reverse proxy (SECURE_PROXY_SSL_HEADER below),
 # so NUM_PROXIES MUST reflect the trusted hop count — otherwise client_ip / DRF's

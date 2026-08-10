@@ -22,6 +22,11 @@ CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}
 
 # Locmem cache.
 CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+# Risk API tests intentionally create new domain rows between requests. Keep
+# those legacy functional tests uncached; the dedicated cache suite opts in to
+# production TTLs explicitly. Executive tests already clear/assert their cache.
+INTELLIGENCE_RISK_CACHE_FRESH_SECONDS = 0
+INTELLIGENCE_RISK_CACHE_STALE_SECONDS = 0
 
 # Local file storage in tests.
 STORAGES = {
