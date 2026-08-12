@@ -37,6 +37,24 @@ def _base_qs() -> QuerySet[StudentProfile]:
     )
 
 
+def _teacher_owned_students(
+    qs: QuerySet[StudentProfile], *, user, roles: set[str]
+) -> QuerySet[StudentProfile]:
+    """Keep an exact teacher principal inside cohorts they actually teach.
+
+    A branch membership supplies the permission, but it is not a classroom
+    ownership boundary. Typed cohort assignments (plus the transitional
+    primary-teacher/lesson relationships) are canonical, matching the cohort
+    directory and detail endpoints.
+    """
+    if not isinstance(roles, PermissionRoleSet) or roles.account_kinds != frozenset({"teacher"}):
+        return qs
+
+    from apps.cohorts.selectors import taught_cohorts
+
+    return qs.filter(current_cohort_id__in=taught_cohorts(user_id=user.pk).values("pk"))
+
+
 def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentProfile]:
     qs = _base_qs()
     if user.is_superuser:
@@ -49,7 +67,7 @@ def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentP
             permission="students:read",
             account_kinds={"staff", "teacher"},
         ):
-            return qs
+            return _teacher_owned_students(qs, user=user, roles=roles)
     elif roles & TENANT_WIDE_ROLES:
         return qs
 
@@ -95,7 +113,7 @@ def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentP
         )
     if student_reader:  # read_self
         visible |= Q(user=user)
-    return qs.filter(visible).distinct()
+    return _teacher_owned_students(qs.filter(visible).distinct(), user=user, roles=roles)
 
 
 def students_with_upcoming_birthdays(

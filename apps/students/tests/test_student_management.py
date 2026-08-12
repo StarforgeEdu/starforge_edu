@@ -251,3 +251,51 @@ def test_department_hod_student_surfaces_exclude_sibling_department(tenant_a, us
     assert {row["id"] for row in listing.json()["data"]} == {own_student.id}
     assert client.get(f"/api/v1/students/{sibling_student.id}/").status_code == 404
     assert client.get("/api/v1/students/stats/").json()["data"]["total"] == 1
+
+
+def test_exact_teacher_principal_reads_only_students_in_taught_cohorts(
+    tenant_a, user_in, client_for
+):
+    from django.utils import timezone
+
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.teachers.models import TeacherProfile
+    from apps.teachers.tests.factories import TeacherProfileFactory
+    from core.session_auth import create_session
+
+    user = user_in(tenant_a, roles=[Role.TEACHER])
+    with schema_context(tenant_a.schema_name):
+        branch = user.role_memberships.get().branch
+        teacher = TeacherProfile.objects.filter(user=user).first()
+        if teacher is None:
+            teacher = TeacherProfileFactory(user=user, branch=branch)
+        own_cohort = CohortFactory(branch=branch, primary_teacher=teacher)
+        other_cohort = CohortFactory(branch=branch)
+        own_student = StudentProfileFactory(
+            branch=branch,
+            current_cohort=own_cohort,
+            birthdate=timezone.localdate().replace(year=2010),
+        )
+        other_student = StudentProfileFactory(
+            branch=branch,
+            current_cohort=other_cohort,
+            birthdate=timezone.localdate().replace(year=2010),
+        )
+        StudentProfileFactory(branch=branch, current_cohort=None)
+        session = create_session(user, principal_kind="teacher", principal_id=teacher.pk)
+
+    client = client_for(tenant_a)
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {session.key}")
+
+    listing = client.get("/api/v1/students/")
+    own_detail = client.get(f"/api/v1/students/{own_student.pk}/")
+    other_detail = client.get(f"/api/v1/students/{other_student.pk}/")
+    birthdays = client.get("/api/v1/students/birthdays/?days=0")
+
+    assert listing.status_code == 200, listing.content
+    assert {row["id"] for row in listing.json()["data"]} == {own_student.pk}
+    assert own_detail.status_code == 200
+    assert other_detail.status_code == 404
+    assert client.get("/api/v1/students/stats/").json()["data"]["total"] == 1
+    assert {row["id"] for row in birthdays.json()["data"]} == {own_student.pk}
