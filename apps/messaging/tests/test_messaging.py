@@ -508,9 +508,11 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
         format="json",
     )
     assert created_for_group.status_code == 201, created_for_group.content
-    assert {
-        participant["user"] for participant in created_for_group.json()["data"]["participants"]
-    } == {teacher_user.id, own_student_user.id, second_own_student_user.id}
+    assert {participant["user"] for participant in created_for_group.json()["data"]["participants"]} == {
+        teacher_user.id,
+        own_student_user.id,
+        second_own_student_user.id,
+    }
 
     for manager_id in (manager_user.id, custom_manager_user.id):
         allowed_manager = client.post(
@@ -801,6 +803,41 @@ def test_role_native_staff_and_teacher_messaging_flows_remain_available(
     )
     assert staff_thread.status_code == 201, staff_thread.content
     assert teacher_thread.status_code == 201, teacher_thread.content
+
+
+def test_director_and_student_share_exact_threads_in_both_directions(tenant_a, as_role):
+    director_client, director_user = as_role(Role.DIRECTOR)
+    student_client, student_user = as_role(Role.STUDENT)
+
+    student_contacts = director_client.get(f"{CONTACTS}?category=student")
+    assert student_contacts.status_code == 200, student_contacts.content
+    assert student_user.pk in {row["user_id"] for row in student_contacts.json()["data"]}
+
+    created = director_client.post(
+        THREADS,
+        {"participant_ids": [student_user.pk], "first_body": "Director check-in"},
+        format="json",
+    )
+    assert created.status_code == 201, created.content
+    thread_id = created.json()["data"]["id"]
+    assert {row["user"] for row in created.json()["data"]["participants"]} == {
+        director_user.pk,
+        student_user.pk,
+    }
+    assert student_client.get(f"{THREADS}{thread_id}/").status_code == 200
+    assert thread_id in {row["id"] for row in student_client.get(THREADS).json()["data"]}
+
+    director_contacts = student_client.get(f"{CONTACTS}?category=staff")
+    assert director_contacts.status_code == 200, director_contacts.content
+    assert director_user.pk in {row["user_id"] for row in director_contacts.json()["data"]}
+    reverse = student_client.post(
+        THREADS,
+        {"participant_ids": [director_user.pk], "first_body": "Student reply channel"},
+        format="json",
+    )
+    assert reverse.status_code == 201, reverse.content
+    reverse_id = reverse.json()["data"]["id"]
+    assert director_client.get(f"{THREADS}{reverse_id}/").status_code == 200
 
 
 # --------------------------------------------------------------------------- #

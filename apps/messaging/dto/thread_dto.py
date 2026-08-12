@@ -10,8 +10,13 @@ from apps.messaging.models import Message, ThreadRealtimeEvent
 
 @dataclass(frozen=True)
 class CreateThreadDTO:
-    """A new thread. `participant_ids` are validated ints (deduped) in the view; the
-    service resolves them to active members of THIS center (unknown -> 400)."""
+    """A new thread.
+
+    ``participant_ids`` are bridge ``users.User`` ids returned as ``user_id`` by
+    the messaging contacts endpoint. They are not role-profile ids from
+    ``/users/me/``. The view validates/deduplicates them and the service resolves
+    them to active members of this center.
+    """
 
     participant_ids: list[int]
     subject: str = ""

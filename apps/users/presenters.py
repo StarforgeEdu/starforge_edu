@@ -227,7 +227,12 @@ def _device_family(user_agent: str) -> str:
 
 
 def role_account_to_dict(kind: str, account: Any, *, memberships: list[Any] | None = None) -> dict[str, Any]:
-    """Current-account payload for a role-native session; never exposes its bridge."""
+    """Current-account payload for a role-native session.
+
+    ``id`` remains the role-profile id. ``messaging_user_id`` explicitly exposes
+    the current account's bridge id so clients cannot accidentally pass a profile
+    id to messaging's legacy ``participant_ids`` contract.
+    """
     if memberships is None:
         legacy_roles = {
             "student": {"student"},
@@ -253,6 +258,7 @@ def role_account_to_dict(kind: str, account: Any, *, memberships: list[Any] | No
         ]
     payload: dict[str, Any] = {
         "id": account.id,
+        "messaging_user_id": account.user_id,
         "principal_kind": kind,
         "username": account.username,
         "phone": account.phone,

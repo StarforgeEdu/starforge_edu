@@ -139,6 +139,7 @@ def test_role_login_student_signs_in_as_their_role(tenant_a, client_for):
         student.set_password(PASSWORD)
         student.save(update_fields=["password"])
         student_id = student.id
+        messaging_user_id = student.user_id
 
     client = client_for(tenant_a)
     resp = client.post(ROLE_LOGIN_URL, {"username": "ada.student", "password": PASSWORD}, format="json")
@@ -153,6 +154,7 @@ def test_role_login_student_signs_in_as_their_role(tenant_a, client_for):
     me = authed.get(ME_URL)
     assert me.status_code == 200
     assert me.json()["data"]["id"] == student_id
+    assert me.json()["data"]["messaging_user_id"] == messaging_user_id
     assert me.json()["data"]["principal_kind"] == "student"
     assert me.json()["data"]["tenant_slug"] == tenant_a.schema_name
 

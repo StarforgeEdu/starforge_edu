@@ -15,6 +15,7 @@ from apps.messaging.models import (
     ThreadParticipant,
     ThreadRealtimeEvent,
 )
+from apps.org.models import StaffProfile
 from apps.parents.models import ParentProfile
 from apps.students.models import StudentProfile
 from apps.teachers.models import TeacherProfile
@@ -284,13 +285,37 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
             ).exists()
         )
 
+    def is_active_staff(self, *, authorization_context) -> bool:
+        """Whether the signed-in principal is an active role-native staff account."""
+        from core.role_principals import request_role_principal
+
+        user = authorization_context.user
+        principal = request_role_principal(
+            authorization_context,
+            error_code="messaging_principal_unavailable",
+        )
+        write_scopes, _membership_scope = self._recipient_membership_scope(
+            authorization_context=authorization_context
+        )
+        return (
+            principal.kind == AccountType.AccountKind.STAFF
+            and any(scope.account_kind == AccountType.AccountKind.STAFF for scope in write_scopes)
+            and StaffProfile.objects.filter(
+                user=user,
+                pk=principal.principal_id,
+                is_active=True,
+            ).exists()
+        )
+
     def contacts_for(self, *, authorization_context, category: str = "") -> QuerySet[User]:
         """Purpose-limited messaging directory.
 
         Every returned primary key is a real ``users.User`` bridge id accepted by
         thread creation. Staff/teacher contacts are active role-native accounts.
-        An active teacher additionally sees only students in cohorts they actually
-        teach, never the broader branch/department student directory.
+        An active teacher sees only students in cohorts they actually teach. Active
+        staff see students inside the exact branch/department scope that grants
+        ``messaging:write``; organization-wide Directors therefore see every active
+        student in the tenant.
         """
         user = authorization_context.user
         write_scopes, recipient_membership_scope = self._recipient_membership_scope(
@@ -380,12 +405,12 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
         # Management accounts remain constrained by the sender's exact
         # messaging-write branch/department grant. Teachers need a direct,
         # auditable channel to coordinators and leaders in that same scope.
-        staff_visible = Q(contact_is_staff=True) & (
-            only_staff_profile | only_teacher_profile
-        )
+        staff_visible = Q(contact_is_staff=True) & (only_staff_profile | only_teacher_profile)
         student_visible = Q(pk__in=[])
         parent_visible = Q(pk__in=[])
-        if self.is_active_teacher(authorization_context=authorization_context):
+        active_teacher = self.is_active_teacher(authorization_context=authorization_context)
+        active_staff = self.is_active_staff(authorization_context=authorization_context)
+        if active_teacher or active_staff:
             student_profile_scope = Q(pk__in=[])
             if any(scope.is_organization_wide for scope in write_scopes):
                 student_profile_scope = Q(pk__isnull=False)
@@ -400,8 +425,9 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
                 user__is_active=True,
                 is_active=True,
                 status__in=(StudentProfile.Status.ENROLLED, StudentProfile.Status.ACTIVE),
-                current_cohort__in=taught_cohorts(user=user),
             )
+            if active_teacher:
+                owned_students = owned_students.filter(current_cohort__in=taught_cohorts(user=user))
             student_visible = (
                 Q(contact_is_student=True, pk__in=owned_students.values("user_id")) & only_student_profile
             )

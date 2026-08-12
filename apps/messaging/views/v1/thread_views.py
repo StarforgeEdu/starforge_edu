@@ -537,9 +537,12 @@ def _send_message(request: HttpRequest, thread) -> HttpResponse:
 
 
 def _participant_ids(body: dict[str, Any]) -> list[int]:
-    """A non-empty list of integer user ids (deduped, order-preserving). Each MUST be an
-    int (a non-int would break `id__in` / the dict.fromkeys dedup, and an unhashable one
-    would 500) — the old ListField(child=IntegerField()) enforced this."""
+    """Bridge User ids from ``/messaging/contacts/`` (deduped, order-preserving).
+
+    These are deliberately not role-profile ids returned as ``id`` by
+    ``/users/me/``. Each value must be an integer; the legacy DRF ListField enforced
+    the same input rule.
+    """
     raw = body.get("participant_ids")
     if not isinstance(raw, list) or not raw:
         raise ValidationException(
