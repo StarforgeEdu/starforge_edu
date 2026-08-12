@@ -43,16 +43,21 @@ def _teacher_owned_students(
     """Keep an exact teacher principal inside cohorts they actually teach.
 
     A branch membership supplies the permission, but it is not a classroom
-    ownership boundary. Typed cohort assignments (plus the transitional
-    primary-teacher/lesson relationships) are canonical, matching the cohort
-    directory and detail endpoints.
+    ownership boundary. Only an explicit main/co-teacher assignment owns a
+    classroom. A scheduled lesson may be cover or historical evidence and must
+    never widen the teacher's student directory.
     """
     if not isinstance(roles, PermissionRoleSet) or roles.account_kinds != frozenset({"teacher"}):
         return qs
 
     from apps.cohorts.selectors import taught_cohorts
 
-    return qs.filter(current_cohort_id__in=taught_cohorts(user_id=user.pk).values("pk"))
+    return qs.filter(
+        current_cohort_id__in=taught_cohorts(
+            user_id=user.pk,
+            include_lesson_teacher=False,
+        ).values("pk")
+    )
 
 
 def scoped_students(*, user, roles: set[str] | None = None) -> QuerySet[StudentProfile]:

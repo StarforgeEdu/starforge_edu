@@ -215,6 +215,8 @@ def test_exact_teacher_principal_reads_only_taught_cohorts(tenant_a, user_in, cl
     from apps.cohorts.tests.factories import CohortFactory
     from apps.teachers.models import TeacherProfile
     from apps.teachers.tests.factories import TeacherProfileFactory
+    from apps.schedule.models import Lesson
+    from apps.schedule.tests.factories import TermFactory
     from core.session_auth import create_session
 
     user = user_in(tenant_a, roles=[Role.TEACHER])
@@ -225,6 +227,14 @@ def test_exact_teacher_principal_reads_only_taught_cohorts(tenant_a, user_in, cl
             teacher = TeacherProfileFactory(user=user, branch=membership_branch)
         own = CohortFactory(branch=membership_branch, primary_teacher=teacher)
         other = CohortFactory(branch=membership_branch)
+        Lesson.objects.create(
+            term=TermFactory(),
+            cohort=other,
+            teacher=teacher,
+            title="One-off cover lesson",
+            starts_at=timezone.now(),
+            ends_at=timezone.now() + timedelta(hours=1),
+        )
         session = create_session(user, principal_kind="teacher", principal_id=teacher.pk)
     client = client_for(tenant_a)
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {session.key}")

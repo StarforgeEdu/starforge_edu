@@ -101,6 +101,9 @@ class ReportRunCreateSerializer(serializers.Serializer):
     report_key = serializers.ChoiceField(choices=ReportKey.choices)
     format = serializers.ChoiceField(choices=ReportFormat.choices, required=False)
     params = serializers.DictField(required=False, default=dict)
+    recipient_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False, default=list, max_length=50
+    )
 
 
 class ReportScheduleReadSerializer(serializers.ModelSerializer):

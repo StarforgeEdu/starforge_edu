@@ -110,6 +110,28 @@ def test_reward_kind_not_accepted_by_generic_endpoint(tenant_a, as_role):
     assert "kind" in r.json()["errors"]
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "salary_advance",
+        "group_graduation",
+        "student_removal",
+        "leave_request",
+        "schedule_change",
+    ],
+)
+def test_teacher_workflow_request_kinds_are_supported(tenant_a, as_role, kind):
+    teacher, _ = as_role(Role.TEACHER)
+    response = teacher.post(
+        REQ,
+        {"kind": kind, "title": f"Request: {kind}", "payload": {"note": "teacher workflow"}},
+        format="json",
+    )
+    assert response.status_code == 201, response.content
+    assert response.json()["data"]["kind"] == kind
+    assert response.json()["data"]["status"] == "pending"
+
+
 def test_beneficiary_self_dealing_guard_int_coerces_id():
     """MONEY-1 hardening: the beneficiary SoD guard int-coerces the pinned id, so a STRING
     recipient_id equal to the actor still blocks (type-confusion can't bypass), and a

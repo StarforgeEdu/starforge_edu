@@ -124,13 +124,13 @@ class TeacherService(ITeacherService):
             )
         self._teachers.delete(teacher)
 
-    def dashboard(self, user, roles) -> dict[str, Any]:
+    def dashboard(self, user, roles, *, range_key: str = "7d") -> dict[str, Any]:
         from apps.teachers.selectors import teacher_dashboard, teacher_profile_for
 
         teacher = teacher_profile_for(user)
         if teacher is None:
             raise NotFoundException(_("You do not have a teacher profile."), code="not_a_teacher")
-        return teacher_dashboard(teacher=teacher, user=user, roles=roles)
+        return teacher_dashboard(teacher=teacher, user=user, roles=roles, range_key=range_key)
 
     @staticmethod
     def _resolve_branch(branch_id: int):

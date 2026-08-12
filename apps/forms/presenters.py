@@ -70,6 +70,7 @@ def form_to_dict(form: Form, *, include_management: bool = True) -> dict[str, An
         "published_at": form.published_at.isoformat() if form.published_at else None,
         "closed_at": form.closed_at.isoformat() if form.closed_at else None,
         "created_at": form.created_at.isoformat(),
+        "response_submitted": bool(getattr(form, "response_submitted", False)),
         "form_fields": [field_to_dict(fld) for fld in form.fields.all()],
     }
     if include_management:

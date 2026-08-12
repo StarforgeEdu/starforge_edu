@@ -256,12 +256,16 @@ def test_department_hod_student_surfaces_exclude_sibling_department(tenant_a, us
 def test_exact_teacher_principal_reads_only_students_in_taught_cohorts(
     tenant_a, user_in, client_for
 ):
+    from datetime import timedelta
+
     from django.utils import timezone
 
     from apps.cohorts.tests.factories import CohortFactory
     from apps.students.tests.factories import StudentProfileFactory
     from apps.teachers.models import TeacherProfile
     from apps.teachers.tests.factories import TeacherProfileFactory
+    from apps.schedule.models import Lesson
+    from apps.schedule.tests.factories import TermFactory
     from core.session_auth import create_session
 
     user = user_in(tenant_a, roles=[Role.TEACHER])
@@ -281,6 +285,17 @@ def test_exact_teacher_principal_reads_only_students_in_taught_cohorts(
             branch=branch,
             current_cohort=other_cohort,
             birthdate=timezone.localdate().replace(year=2010),
+        )
+        # Covering or being scheduled for one lesson does not transfer cohort
+        # ownership. The student remains outside the teacher directory until an
+        # explicit cohort assignment exists.
+        Lesson.objects.create(
+            term=TermFactory(),
+            cohort=other_cohort,
+            teacher=teacher,
+            title="One-off cover lesson",
+            starts_at=timezone.now(),
+            ends_at=timezone.now() + timedelta(hours=1),
         )
         StudentProfileFactory(branch=branch, current_cohort=None)
         session = create_session(user, principal_kind="teacher", principal_id=teacher.pk)

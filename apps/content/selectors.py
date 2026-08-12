@@ -171,7 +171,11 @@ def scoped_files(
     memberships=None,
     permission: str = "content:read",
 ) -> QuerySet[LessonFile]:
-    qs = LessonFile.objects.select_related("lesson", "folder", "uploaded_by")
+    qs = LessonFile.objects.select_related(
+        "lesson__module__course__library__cohort",
+        "folder__library__cohort",
+        "uploaded_by",
+    )
     if user.is_superuser:
         return qs
     if roles is None:

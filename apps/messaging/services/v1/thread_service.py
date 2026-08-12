@@ -13,8 +13,10 @@ from apps.messaging.models import Message, Thread
 from apps.messaging.services import (
     assert_thread_safeguarding,
     create_thread,
+    hide_thread,
     mark_read,
     post_message,
+    set_archived,
     set_notifications_muted,
 )
 from apps.users.models import User
@@ -262,6 +264,33 @@ class ThreadService(IThreadService):
             principal_kind=principal_kind,
             principal_id=principal_id,
             muted=muted,
+        )
+
+    def set_archived(
+        self,
+        *,
+        thread: Thread,
+        user,
+        principal_kind: str,
+        principal_id: int,
+        archived: bool,
+    ) -> None:
+        set_archived(
+            thread=thread,
+            user=user,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
+            archived=archived,
+        )
+
+    def hide_thread(
+        self, *, thread: Thread, user, principal_kind: str, principal_id: int
+    ) -> None:
+        hide_thread(
+            thread=thread,
+            user=user,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
         )
 
     def presign_attachment(self, *, filename: str, content_type: str, size_bytes: int, requested_by) -> dict:

@@ -739,7 +739,9 @@ def test_branch_builder_can_answer_but_not_manage_centre_wide_form(tenant_a, use
     teacher = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
     fid, (choice, rating, _text) = _build_published_form(director)
 
-    assert fid in {row["id"] for row in _rows(teacher.get(FORMS).json())}
+    before = {row["id"]: row for row in _rows(teacher.get(FORMS).json())}
+    assert fid in before
+    assert before[fid]["response_submitted"] is False
     submitted = teacher.post(
         f"{FORMS}{fid}/submit/",
         {
@@ -751,6 +753,8 @@ def test_branch_builder_can_answer_but_not_manage_centre_wide_form(tenant_a, use
         format="json",
     )
     assert submitted.status_code == 201, submitted.content
+    after = {row["id"]: row for row in _rows(teacher.get(FORMS).json())}
+    assert after[fid]["response_submitted"] is True
 
     # forms:write does not turn centre-wide read access into response/lifecycle
     # management for a branch-scoped builder.

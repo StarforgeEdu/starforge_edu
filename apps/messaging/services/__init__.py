@@ -486,11 +486,14 @@ def assert_thread_safeguarding(
             AccountType.AccountKind.TEACHER,
         }
 
-    # Safeguarding (dignity DNA) enforced on the resulting PARTICIPANT SET, not just
-    # the opener's role: at most one student in any thread (no unsupervised peer
-    # channel, even one opened by a teacher), and a non-staff opener may only reach
-    # staff (a student/parent can't initiate contact with another non-staff person).
-    if sum(1 for principal in principals if principal.kind == AccountType.AccountKind.STUDENT) > 1:
+    # A non-staff opener can never create a student-to-student channel. A staff
+    # or teacher opener remains a durable participant and may open a supervised
+    # class conversation with students inside the exact recipient scope checked
+    # below. This makes teacher-created cohort rooms safe and useful.
+    if (
+        not is_staff(creator_principal)
+        and sum(1 for principal in principals if principal.kind == AccountType.AccountKind.STUDENT) > 1
+    ):
         raise PermissionException(
             _("A conversation can include at most one student."), code="non_staff_recipient"
         )
@@ -750,7 +753,22 @@ def post_message(
         caller_thread.last_message_at = now
         caller_thread.updated_at = now
         # The sender has, by definition, read up to their own message.
-        sender_participant.update(last_read_at=timezone.now(), last_read_message=message)
+        sender_participant.update(
+            last_read_at=timezone.now(),
+            last_read_message=message,
+            hidden_at=None,
+        )
+        # Deleting a chat hides it only for that participant. A new incoming
+        # message makes the conversation visible again, matching familiar
+        # messaging-app behavior without destroying shared history.
+        ThreadParticipant.objects.filter(
+            thread=thread,
+            attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
+        ).exclude(
+            user=sender,
+            principal_kind=sender_principal_kind,
+            principal_id=sender_principal_id,
+        ).update(hidden_at=None)
         realtime_event = _append_realtime_event(
             locked_thread=thread,
             kind=ThreadEventKind.MESSAGE_CREATED,
@@ -928,3 +946,33 @@ def set_notifications_muted(
         principal_id=principal_id,
         attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
     ).update(notifications_muted=muted)
+
+
+def set_archived(
+    *, thread: Thread, user, principal_kind: str, principal_id: int, archived: bool
+) -> None:
+    """Archive or restore one conversation for the exact signed-in role account."""
+    updated = ThreadParticipant.objects.filter(
+        thread=thread,
+        user=user,
+        principal_kind=principal_kind,
+        principal_id=principal_id,
+        attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
+        hidden_at__isnull=True,
+    ).update(archived_at=timezone.now() if archived else None)
+    if not updated:
+        raise NotFoundException(_("Thread not found."), code="not_found")
+
+
+def hide_thread(*, thread: Thread, user, principal_kind: str, principal_id: int) -> None:
+    """Hide a conversation for one participant without deleting shared history."""
+    updated = ThreadParticipant.objects.filter(
+        thread=thread,
+        user=user,
+        principal_kind=principal_kind,
+        principal_id=principal_id,
+        attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
+        hidden_at__isnull=True,
+    ).update(hidden_at=timezone.now(), archived_at=None)
+    if not updated:
+        raise NotFoundException(_("Thread not found."), code="not_found")

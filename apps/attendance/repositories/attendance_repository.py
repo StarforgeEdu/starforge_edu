@@ -48,4 +48,7 @@ class AttendanceRepository(BaseRepository[AttendanceRecord], IAttendanceReposito
         return {s.pk: s for s in StudentProfile.objects.filter(pk__in=ids)}
 
     def cohort_taught_by(self, *, cohort_id: int, user) -> bool:
-        return taught_cohorts(user=user).filter(pk=cohort_id).exists()
+        return taught_cohorts(
+            user=user,
+            include_lesson_teacher=False,
+        ).filter(pk=cohort_id).exists()

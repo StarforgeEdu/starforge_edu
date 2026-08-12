@@ -95,6 +95,7 @@ class ReportRunViewSet(
             report_key=ser.validated_data["report_key"],
             fmt=ser.validated_data.get("format"),
             params=ser.validated_data.get("params") or {},
+            recipient_ids=ser.validated_data.get("recipient_ids") or [],
             requested_by=request.user,
             roles=get_user_roles(request),
         )

@@ -658,7 +658,13 @@ def _admit_report_run(
 
 @transaction.atomic
 def create_report_run(
-    *, report_key: str, fmt: str | None, params: dict[str, Any], requested_by, roles: set[str]
+    *,
+    report_key: str,
+    fmt: str | None,
+    params: dict[str, Any],
+    requested_by,
+    roles: set[str],
+    recipient_ids: list[int] | None = None,
 ) -> ReportRun:
     """Validate the key/format/visibility, create a queued ReportRun, enqueue
     ``build_report`` after commit. Raises 403 when the caller's roles are not in
@@ -685,11 +691,17 @@ def create_report_run(
         user=requested_by,
         roles=roles,
     )
+    recipients = _validate_recipient_ids(
+        recipient_ids=recipient_ids or [],
+        report=report,
+        params=normalized_params,
+    )
     run, created = _admit_report_run(
         report=report,
         requested_by=requested_by,
         params=normalized_params,
         fmt=chosen,
+        recipient_ids=recipients,
     )
     schema = current_schema()
     run_id = run.pk

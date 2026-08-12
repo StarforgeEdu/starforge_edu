@@ -124,7 +124,7 @@ def scoped_dashboard_cohorts(*, user, roles: set[str] | None = None) -> QuerySet
     if _kind_can_read_attendance(roles, "teacher", Role.TEACHER):
         from apps.cohorts.selectors import taught_cohorts
 
-        taught = taught_cohorts(user=user)
+        taught = taught_cohorts(user=user, include_lesson_teacher=False)
         if isinstance(roles, PermissionRoleSet):
             # Keep the natural teaching relationship inside the scope of the
             # permission-bearing teacher membership. Assignment alone must not

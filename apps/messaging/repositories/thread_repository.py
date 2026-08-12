@@ -53,6 +53,7 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
                 participants__principal_kind=principal_kind,
                 participants__principal_id=principal_id,
                 participants__attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
+                participants__hidden_at__isnull=True,
             )
             .distinct()
             .select_related("branch", "created_by")
@@ -351,7 +352,7 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
             .select_related(
                 "staff_profile",
                 "teacher_profile",
-                "student_profile",
+                "student_profile__current_cohort",
                 "parent_profile",
             )
         )
@@ -376,7 +377,10 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
         only_parent_profile = (
             Q(parent_profile__is_active=True) & no_active_staff & no_active_teacher & no_active_student
         )
-        staff_visible = Q(contact_is_staff=True, contact_is_management=False) & (
+        # Management accounts remain constrained by the sender's exact
+        # messaging-write branch/department grant. Teachers need a direct,
+        # auditable channel to coordinators and leaders in that same scope.
+        staff_visible = Q(contact_is_staff=True) & (
             only_staff_profile | only_teacher_profile
         )
         student_visible = Q(pk__in=[])

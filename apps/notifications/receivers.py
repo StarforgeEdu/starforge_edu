@@ -27,6 +27,7 @@ Signal -> EventType -> recipient mapping table (D3-C-4):
 | finance.payment_reminder              | finance.payment_reminder        | payer + primary guardian              |
 | payments.payment_completed            | payments.payment_completed      | payer + primary guardian              |
 | payments.payment_failed               | payments.payment_failed         | payer + primary guardian              |
+| tasks.task_assigned                   | task.assigned                   | exact staff/teacher assignee          |
 
 NOTE on event types whose dedicated source signal does not exist yet:
 ``students.enrollment_changed`` is bridged from the *existing*
@@ -575,6 +576,48 @@ def _connect_cohorts() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tasks — exact role-account assignee
+# ---------------------------------------------------------------------------
+def _connect_tasks() -> None:
+    from apps.tasks.signals import task_assigned
+
+    @receiver(task_assigned, dispatch_uid="notifications.task_assigned", weak=False)
+    def on_task_assigned(sender, *, task_id, schema_name="", **kwargs):
+        from apps.notifications.models import EventType
+        from apps.tasks.models import Task
+
+        task = Task.objects.select_related("assignee", "created_by").filter(pk=task_id).first()
+        if (
+            task is None
+            or task.assignee_id is None
+            or task.assignee_principal_kind not in {"staff", "teacher"}
+            or task.assignee_principal_id is None
+        ):
+            return
+        if (
+            task.created_by_principal_kind == task.assignee_principal_kind
+            and task.created_by_principal_id == task.assignee_principal_id
+        ):
+            return
+        services.dispatch(
+            event_type=EventType.TASK_ASSIGNED,
+            recipient_id=task.assignee_id,
+            recipient_principal_kind=task.assignee_principal_kind,
+            recipient_principal_id=task.assignee_principal_id,
+            context={
+                "task_id": task.pk,
+                "task_title": task.title,
+                "creator_name": task.created_by.get_full_name() if task.created_by else "",
+                "due_at": task.due_at.isoformat() if task.due_at else "",
+            },
+            dedupe_key=(
+                f"task.assigned:{task.pk}:{task.assignee_principal_kind}:"
+                f"{task.assignee_principal_id}"
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Finance (D3-A) — invoice issued / payment reminder
 # ---------------------------------------------------------------------------
 def _invoice_recipients(invoice_id, student_id):
@@ -679,5 +722,6 @@ _connect_assignments()
 _connect_schedule()
 _connect_auth()
 _connect_cohorts()
+_connect_tasks()
 _connect_finance()
 _connect_payments()

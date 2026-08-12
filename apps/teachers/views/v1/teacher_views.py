@@ -231,7 +231,16 @@ def teacher_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
 def teacher_dashboard_view(request: HttpRequest) -> HttpResponse:
     if request.method != "GET":
         return error("Method not allowed.", code="method_not_allowed", status=405)
-    return success(_service().dashboard(request.user, get_user_roles(request)))
+    range_key = request.GET.get("range", "7d")
+    if range_key not in {"7d", "30d", "term"}:
+        range_key = "7d"
+    return success(
+        _service().dashboard(
+            request.user,
+            get_user_roles(request),
+            range_key=range_key,
+        )
+    )
 
 
 def _teacher_in_scope(

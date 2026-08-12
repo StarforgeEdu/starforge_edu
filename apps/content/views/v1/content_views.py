@@ -533,10 +533,15 @@ def _get_file_in_scope(request: HttpRequest, pk: int, *, permission: str):
 @csrf_exempt
 @require_auth
 def file_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
-    if request.method not in ("GET", "HEAD"):
-        return _method_not_allowed()
-    check_perm(request, "content:read")
-    return success(lesson_file_to_dict(_get_file_in_scope(request, pk, permission="content:read")))
+    if request.method in ("GET", "HEAD"):
+        check_perm(request, "content:read")
+        return success(lesson_file_to_dict(_get_file_in_scope(request, pk, permission="content:read")))
+    if request.method == "DELETE":
+        check_perm(request, "content:write")
+        file = _get_file_in_scope(request, pk, permission="content:write")
+        file.delete()
+        return no_content()
+    return _method_not_allowed()
 
 
 @csrf_exempt

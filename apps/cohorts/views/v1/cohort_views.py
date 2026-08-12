@@ -74,12 +74,15 @@ def _get_in_scope(request: HttpRequest, pk: int, *, permission: str = "cohorts:r
     )
     if getattr(request, "principal_kind", "") == "teacher":
         # A teacher's branch membership grants the permission, while the typed
-        # assignment/lesson relationship supplies the natural row boundary.
+        # explicit main/co-teacher assignment supplies the natural row boundary.
         # Never let the compatibility User bridge widen one teacher account to
         # every cohort in that branch.
         from apps.cohorts.selectors import taught_cohorts
 
-        if not taught_cohorts(user_id=request.user.pk).filter(pk=cohort.pk).exists():
+        if not taught_cohorts(
+            user_id=request.user.pk,
+            include_lesson_teacher=False,
+        ).filter(pk=cohort.pk).exists():
             from core.exceptions import PermissionException
 
             raise PermissionException(code="out_of_scope")
@@ -457,7 +460,12 @@ def _list(request: HttpRequest) -> HttpResponse:
     if getattr(request, "principal_kind", "") == "teacher":
         from apps.cohorts.selectors import taught_cohorts
 
-        qs = qs.filter(pk__in=taught_cohorts(user_id=request.user.pk).values("pk"))
+        qs = qs.filter(
+            pk__in=taught_cohorts(
+                user_id=request.user.pk,
+                include_lesson_teacher=False,
+            ).values("pk")
+        )
     qs = apply_filters(
         request,
         qs,

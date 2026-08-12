@@ -96,6 +96,13 @@ def folder_to_dict(folder: Folder) -> dict:
 
 
 def lesson_file_to_dict(f: LessonFile) -> dict:
+    library = (
+        f.folder.library
+        if f.folder_id
+        else f.lesson.module.course.library
+        if f.lesson_id
+        else None
+    )
     thumbnail_url = None
     storage_key = trusted_thumbnail_key(f, schema=current_schema())
     if storage_key:
@@ -110,6 +117,10 @@ def lesson_file_to_dict(f: LessonFile) -> dict:
         "lesson_title": f.lesson.title if f.lesson else None,
         "folder": f.folder_id,
         "folder_name": f.folder.name if f.folder else None,
+        "library": library.id if library else None,
+        "library_name": library.name if library else None,
+        "cohort": library.cohort_id if library else None,
+        "cohort_name": library.cohort.name if library and library.cohort else None,
         "title": f.title,
         "content_type": f.content_type,
         "size_bytes": f.size_bytes,

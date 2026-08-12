@@ -50,6 +50,11 @@ _REQUEST_KINDS = frozenset(
         "fine",
         "absence_deduction",
         "payment_delay",
+        "salary_advance",
+        "group_graduation",
+        "student_removal",
+        "leave_request",
+        "schedule_change",
         # NOTE: "salary_prep" is deliberately NOT here. A salary is real money OUT whose
         # amount must be COMPUTED from the teacher's PayoutPolicy and branch-scoped — only
         # apps.teachers.prepare_salary may create it (via the domain create_request). Letting

@@ -91,6 +91,22 @@ class IThreadService(ABC):
     ) -> None: ...
 
     @abstractmethod
+    def set_archived(
+        self,
+        *,
+        thread: Thread,
+        user,
+        principal_kind: str,
+        principal_id: int,
+        archived: bool,
+    ) -> None: ...
+
+    @abstractmethod
+    def hide_thread(
+        self, *, thread: Thread, user, principal_kind: str, principal_id: int
+    ) -> None: ...
+
+    @abstractmethod
     def presign_attachment(
         self, *, filename: str, content_type: str, size_bytes: int, requested_by
     ) -> dict: ...

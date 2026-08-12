@@ -20,6 +20,7 @@ _EXTENSION_MIME: dict[str, frozenset[str]] = {
     # reviewed container signature as audio/x-m4a on common production images,
     # so declared and sniffed MIME contracts are deliberately separated below.
     "m4a": frozenset({"audio/mp4"}),
+    "webm": frozenset({"audio/webm"}),
     "jpg": frozenset({"image/jpeg"}),
     "jpeg": frozenset({"image/jpeg"}),
     "png": frozenset({"image/png"}),
@@ -28,6 +29,9 @@ _EXTENSION_MIME: dict[str, frozenset[str]] = {
 
 _EXTENSION_SNIFFED_MIME: dict[str, frozenset[str]] = {
     "m4a": frozenset({"audio/x-m4a", "audio/mp4"}),
+    # Chromium records Opus voice notes in a WebM container. libmagic may
+    # describe an audio-only stream as either audio/webm or video/webm.
+    "webm": frozenset({"audio/webm", "video/webm"}),
 }
 
 

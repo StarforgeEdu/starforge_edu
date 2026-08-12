@@ -38,7 +38,7 @@ from core.exceptions import NotFoundException, ValidationException
 from core.http import int_field, read_json, str_field
 from core.listing import apply_filters, paginate
 from core.openapi_contracts import openapi_contract
-from core.responses import created, error, paginated, success
+from core.responses import created, error, no_content, paginated, success
 from core.role_principals import RolePrincipal, request_role_principal
 
 _RESOURCE = "messaging"
@@ -263,11 +263,19 @@ def threads_collection_view(request: HttpRequest) -> HttpResponse:
 @csrf_exempt
 @require_auth
 def thread_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
-    if request.method not in ("GET", "HEAD"):
+    if request.method not in ("GET", "HEAD", "DELETE"):
         return error("Method not allowed.", code="method_not_allowed", status=405)
     check_perm(request, f"{_RESOURCE}:read")
     thread = _get_thread(request, pk)
     principal = _viewer_principal(request)
+    if request.method == "DELETE":
+        _service().hide_thread(
+            thread=thread,
+            user=request.user,
+            principal_kind=principal.kind,
+            principal_id=principal.principal_id,
+        )
+        return no_content()
     unread = _unread_map(request, [thread])
     return success(
         thread_to_dict(
@@ -393,22 +401,49 @@ def thread_preferences_view(request: HttpRequest, pk: int) -> HttpResponse:
     check_perm(request, f"{_RESOURCE}:read")
     thread = _get_thread(request, pk)
     body = read_json(request)
-    if not isinstance(body.get("notifications_muted"), bool):
+    unknown = sorted(set(body) - {"notifications_muted", "archived"})
+    if unknown:
+        raise ValidationException(
+            "Unknown conversation preference.",
+            code="validation_error",
+            fields={name: ["This field is not supported."] for name in unknown},
+        )
+    if not body:
+        raise ValidationException(
+            "Choose at least one conversation preference.",
+            code="validation_error",
+            fields={"preferences": ["Provide a preference to update."]},
+        )
+    if "notifications_muted" in body and not isinstance(body["notifications_muted"], bool):
         raise ValidationException(
             "notifications_muted must be a boolean.",
             code="validation_error",
             fields={"notifications_muted": ["Provide true or false."]},
         )
-    muted = body["notifications_muted"]
+    if "archived" in body and not isinstance(body["archived"], bool):
+        raise ValidationException(
+            "archived must be a boolean.",
+            code="validation_error",
+            fields={"archived": ["Provide true or false."]},
+        )
     principal = _viewer_principal(request)
-    _service().set_notifications_muted(
-        thread=thread,
-        user=request.user,
-        principal_kind=principal.kind,
-        principal_id=principal.principal_id,
-        muted=muted,
-    )
-    return success({"notifications_muted": muted})
+    if "notifications_muted" in body:
+        _service().set_notifications_muted(
+            thread=thread,
+            user=request.user,
+            principal_kind=principal.kind,
+            principal_id=principal.principal_id,
+            muted=body["notifications_muted"],
+        )
+    if "archived" in body:
+        _service().set_archived(
+            thread=thread,
+            user=request.user,
+            principal_kind=principal.kind,
+            principal_id=principal.principal_id,
+            archived=body["archived"],
+        )
+    return success({key: body[key] for key in ("notifications_muted", "archived") if key in body})
 
 
 @csrf_exempt

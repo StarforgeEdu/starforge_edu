@@ -17,6 +17,7 @@ from django.utils.translation import gettext_lazy as _
 from apps.tasks.models import RoleGrade, Task
 from apps.users.models import User
 from core.exceptions import PermissionException, UnprocessableEntity, ValidationException
+from core.utils import current_schema
 
 _UNSET: object = object()
 
@@ -35,6 +36,27 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     Task.Status.DONE: {Task.Status.OPEN, Task.Status.CANCELLED},
     Task.Status.CANCELLED: {Task.Status.OPEN},
 }
+
+
+def _emit_task_assigned(task: Task) -> None:
+    if (
+        task.assignee_id is None
+        or task.assignee_principal_kind not in {"staff", "teacher"}
+        or task.assignee_principal_id is None
+    ):
+        return
+    from apps.tasks.signals import task_assigned
+
+    task_id = task.pk
+    schema_name = current_schema()
+    transaction.on_commit(
+        lambda: task_assigned.send(
+            sender=Task,
+            task_id=task_id,
+            schema_name=schema_name,
+        ),
+        robust=True,
+    )
 
 
 def _roles_of(user) -> set[str]:
@@ -198,7 +220,7 @@ def create_task(
             "created_by_principal_id": created_by_principal.principal_id,
             "created_by_attribution_status": Task.CreatorAttributionStatus.CAPTURED,
         }
-    return Task.objects.create(
+    task = Task.objects.create(
         title=title,
         description=description,
         assignee=assignee,
@@ -211,6 +233,8 @@ def create_task(
         created_by=created_by,
         **creator_fields,
     )
+    _emit_task_assigned(task)
+    return task
 
 
 @transaction.atomic
@@ -230,6 +254,10 @@ def assign_task(
     """Reassign a task to a person and/or a department. The person assignment is
     hierarchy-gated; clearing an assignee (None) is always allowed."""
     fields: list[str] = []
+    previous_assignee = (
+        task.assignee_principal_kind,
+        task.assignee_principal_id,
+    )
     if assignee is not _UNSET:
         if assignee is None:
             if assignee_principal_kind not in (_UNSET, "") or assignee_principal_id not in (
@@ -274,6 +302,8 @@ def assign_task(
     if fields:
         fields.append("updated_at")
         task.save(update_fields=fields)
+    if previous_assignee != (task.assignee_principal_kind, task.assignee_principal_id):
+        _emit_task_assigned(task)
     return task
 
 

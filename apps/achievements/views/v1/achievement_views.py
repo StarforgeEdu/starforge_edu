@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db.models import Q
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
@@ -29,6 +30,7 @@ from core.listing import apply_filters, paginate
 from core.openapi_contracts import openapi_contract
 from core.permissions import _request_overrides, get_user_roles, has_permission_code
 from core.responses import created, error, paginated, success
+from core.role_principals import request_role_principal
 from core.scoping import (
     is_permission_unscoped,
     permission_membership_branch_ids,
@@ -39,6 +41,27 @@ _RESOURCE = "achievements"
 
 def _service() -> IAchievementService:
     return container.resolve(IAchievementService)  # type: ignore[type-abstract]
+
+
+def _teacher_cohort_ids(request: HttpRequest) -> set[int] | None:
+    """Return the exact taught-group boundary for a teacher principal."""
+    # Legacy test sessions do not carry a role-native principal. Production
+    # sessions always do; only enforce the classroom boundary when the active
+    # session explicitly identifies a teacher account.
+    if getattr(request, "principal_kind", "") != "teacher":
+        return None
+    principal = request_role_principal(request, error_code="achievements_principal_unavailable")
+    from apps.cohorts.selectors import taught_cohorts
+    from apps.teachers.models import TeacherProfile
+
+    teacher = TeacherProfile.objects.filter(pk=principal.principal_id).first()
+    if teacher is None:
+        return set()
+    return set(
+        taught_cohorts(teacher=teacher, include_lesson_teacher=False)
+        .order_by()
+        .values_list("id", flat=True)
+    )
 
 
 def _scope(request: HttpRequest, *, permission: str) -> tuple[bool, bool, bool, set[int]]:
@@ -73,6 +96,14 @@ def _get_visible(
     )
     if achievement is None:
         raise NotFoundException(code="not_found")  # not in the caller's scope -> 404, no leak
+    teacher_cohort_ids = _teacher_cohort_ids(request)
+    if (
+        teacher_cohort_ids is not None
+        and achievement.scope == Achievement.Scope.GROUP
+        and achievement.cohort_id not in teacher_cohort_ids
+        and achievement.created_by_id != request.user.id
+    ):
+        raise NotFoundException(code="not_found")
     return achievement
 
 
@@ -92,6 +123,13 @@ def achievements_collection_view(request: HttpRequest) -> HttpResponse:
             can_approve=can_approve,
             branch_ids=branch_ids,
         )
+        teacher_cohort_ids = _teacher_cohort_ids(request)
+        if teacher_cohort_ids is not None:
+            qs = qs.filter(
+                Q(scope=Achievement.Scope.GLOBAL, status=Achievement.Status.ACTIVE)
+                | Q(created_by=request.user)
+                | Q(scope=Achievement.Scope.GROUP, cohort_id__in=teacher_cohort_ids)
+            )
         qs = apply_filters(
             request,
             qs,
@@ -155,6 +193,10 @@ def achievement_grant_view(request: HttpRequest, pk: int) -> HttpResponse:
         is_unscoped=is_unscoped,
         branch_ids=branch_ids,
     )
+    teacher_cohort_ids = _teacher_cohort_ids(request)
+    if teacher_cohort_ids is not None and student is not None:
+        if student.current_cohort_id not in teacher_cohort_ids:
+            student = None
     if student is None:
         # Missing and outside-scope identifiers are resolved through the same
         # queryset and deliberately return the same response.
@@ -220,6 +262,16 @@ def _create(request: HttpRequest) -> HttpResponse:
             code="validation_error",
             fields={"scope": [f"Must be one of {', '.join(Achievement.Scope.values)}."]},
         )
+    cohort_id = int_field(body, "cohort")
+    teacher_cohort_ids = _teacher_cohort_ids(request)
+    if (
+        teacher_cohort_ids is not None
+        and scope == Achievement.Scope.GROUP
+        and cohort_id not in teacher_cohort_ids
+    ):
+        raise ValidationException(
+            "Invalid cohort.", code="validation_error", fields={"cohort": ["Not found."]}
+        )
     dto = CreateAchievementDTO(
         name=name,
         scope=scope,
@@ -227,7 +279,7 @@ def _create(request: HttpRequest) -> HttpResponse:
         # The model intentionally allows multi-codepoint ZWJ emoji. Keep the API
         # limit aligned so valid family/profession emoji are not rejected early.
         emoji=str_field(body, "emoji", max_length=32),
-        cohort_id=int_field(body, "cohort"),
+        cohort_id=cohort_id,
     )
     is_unscoped, _can_write, can_approve, branch_ids = _scope(
         request,

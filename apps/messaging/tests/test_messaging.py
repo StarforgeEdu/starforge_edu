@@ -362,6 +362,7 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
     manager_user = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
     custom_manager_user = user_in(tenant_a, roles=[Role.SUPPORT], branch=branch)
     own_student_user = user_in(tenant_a, roles=[Role.STUDENT], branch=branch)
+    second_own_student_user = user_in(tenant_a, roles=[Role.STUDENT], branch=branch)
     untaught_student_user = user_in(tenant_a, roles=[Role.STUDENT], branch=branch)
     withdrawn_student_user = user_in(tenant_a, roles=[Role.STUDENT], branch=branch)
     parent_user = user_in(tenant_a, roles=[Role.PARENT], branch=branch)
@@ -391,6 +392,14 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
             branch=branch,
             current_cohort=taught,
             first_name="Own",
+            last_name="Student",
+            status=StudentProfile.Status.ACTIVE,
+        )
+        StudentProfileFactory(
+            user=second_own_student_user,
+            branch=branch,
+            current_cohort=taught,
+            first_name="Second",
             last_name="Student",
             status=StudentProfile.Status.ACTIVE,
         )
@@ -435,10 +444,10 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
     assert body["pagination"]["self_user_id"] == teacher_user.id
     rows = body["data"]
     ids = {row["user_id"] for row in rows}
-    assert {staff_user.id, colleague_user.id, own_student_user.id} <= ids
+    assert {staff_user.id, colleague_user.id, own_student_user.id, second_own_student_user.id} <= ids
     assert teacher_user.id not in ids
-    assert manager_user.id not in ids
-    assert custom_manager_user.id not in ids
+    assert manager_user.id in ids
+    assert custom_manager_user.id in ids
     assert untaught_student_user.id not in ids
     assert withdrawn_student_user.id not in ids
     assert parent_user.id not in ids
@@ -454,6 +463,8 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
         "username": own_student.username,
         "role_label": "Student",
         "role_slug": Role.STUDENT,
+        "cohort_id": taught.id,
+        "cohort_name": taught.name,
         "is_online": False,
         "is_online_is_heuristic": True,
         "recently_active": False,
@@ -487,12 +498,32 @@ def test_teacher_contact_directory_and_thread_scope(tenant_a, user_in, as_user):
     )
     assert created_for_staff.status_code == 201, created_for_staff.content
 
+    created_for_group = client.post(
+        THREADS,
+        {
+            "participant_ids": [own_student_user.id, second_own_student_user.id],
+            "subject": taught.name,
+            "first_body": "Welcome, group",
+        },
+        format="json",
+    )
+    assert created_for_group.status_code == 201, created_for_group.content
+    assert {
+        participant["user"] for participant in created_for_group.json()["data"]["participants"]
+    } == {teacher_user.id, own_student_user.id, second_own_student_user.id}
+
+    for manager_id in (manager_user.id, custom_manager_user.id):
+        allowed_manager = client.post(
+            THREADS,
+            {"participant_ids": [manager_id], "first_body": "Teacher update"},
+            format="json",
+        )
+        assert allowed_manager.status_code == 201, allowed_manager.content
+
     for forbidden_id in (
         untaught_student_user.id,
         withdrawn_student_user.id,
         parent_user.id,
-        manager_user.id,
-        custom_manager_user.id,
     ):
         denied = client.post(
             THREADS,

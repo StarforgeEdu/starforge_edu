@@ -786,6 +786,36 @@ def test_schedule_recipients_must_be_active_and_in_branch_scope(tenant_a, user_i
     assert exc.value.code == "invalid_recipients"
 
 
+def test_one_off_report_can_send_to_authorized_recipients_only(tenant_a, user_in):
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory(name="One-off report", slug="one-off-report")
+        foreign = BranchFactory(name="Foreign report", slug="foreign-report")
+        creator = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
+        manager = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=branch)
+        outsider = user_in(tenant_a, roles=[Role.HEAD_OF_DEPT], branch=foreign)
+
+        run = services.create_report_run(
+            report_key="enrollment",
+            fmt="pdf",
+            params={},
+            recipient_ids=[manager.pk, manager.pk],
+            requested_by=creator,
+            roles=services._live_roles(creator),
+        )
+        assert run.recipient_ids == [manager.pk]
+
+        with pytest.raises(ValidationException) as exc:
+            services.create_report_run(
+                report_key="enrollment",
+                fmt="xlsx",
+                params={},
+                recipient_ids=[outsider.pk],
+                requested_by=creator,
+                roles=services._live_roles(creator),
+            )
+    assert exc.value.code == "invalid_recipients"
+
+
 def test_schedule_recipient_must_cover_complete_exact_department_scope(tenant_a, user_in):
     from apps.org.tests.factories import DepartmentFactory
 

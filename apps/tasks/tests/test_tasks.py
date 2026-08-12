@@ -91,6 +91,35 @@ def test_assignee_sees_and_transitions_own_task(tenant_a, as_role):
     assert worker_client.post(TASKS, {"title": "x"}, format="json").status_code == 403
 
 
+def test_task_assignment_creates_exact_assignee_notification(
+    tenant_a, as_role, monkeypatch, django_capture_on_commit_callbacks
+):
+    from apps.notifications.models import EventType
+
+    director, _ = as_role(Role.DIRECTOR)
+    _worker_client, worker = as_role(Role.SUPPORT)
+    dispatched = []
+    monkeypatch.setattr(
+        "apps.notifications.services.dispatch",
+        lambda **kwargs: dispatched.append(kwargs),
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        response = director.post(
+            TASKS,
+            {"title": "Prepare classroom", "assignee": worker.pk},
+            format="json",
+        )
+
+    assert response.status_code == 201, response.content
+    assert len(dispatched) == 1
+    assert dispatched[0]["event_type"] == EventType.TASK_ASSIGNED
+    assert dispatched[0]["recipient_id"] == worker.pk
+    assert dispatched[0]["recipient_principal_kind"] == worker.test_principal_kind
+    assert dispatched[0]["recipient_principal_id"] == worker.test_principal_id
+    assert dispatched[0]["context"]["task_title"] == "Prepare classroom"
+
+
 def test_unassigned_user_does_not_see_others_tasks(tenant_a, as_role):
     director, _ = as_role(Role.DIRECTOR)
     _wc, worker = as_role(Role.SUPPORT)

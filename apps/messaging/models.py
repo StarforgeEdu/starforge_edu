@@ -289,6 +289,8 @@ class ThreadParticipant(models.Model):
         related_name="+",
     )
     notifications_muted = models.BooleanField(default=False)
+    archived_at = models.DateTimeField(null=True, blank=True)
+    hidden_at = models.DateTimeField(null=True, blank=True)
     added_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

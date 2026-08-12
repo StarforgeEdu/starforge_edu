@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+from django.db.models import Exists, OuterRef
 from django.http import HttpRequest, HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -17,7 +18,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from apps.forms.dto.form_dto import AddFieldDTO, CreateFormDTO
 from apps.forms.interfaces.services import IFormService
-from apps.forms.models import Form, FormField
+from apps.forms.models import Form, FormField, FormResponse
 from apps.forms.openapi_contracts import (
     FORM_ADD_FIELD_CONTRACT,
     FORM_ANALYZE_CONTRACT,
@@ -168,6 +169,19 @@ def forms_collection_view(request: HttpRequest) -> HttpResponse:
             principal_id=scope.principal.principal_id,
             read_branch_ids=scope.read_branch_ids,
             write_branch_ids=scope.write_branch_ids,
+        )
+        qs = qs.annotate(
+            response_submitted=Exists(
+                FormResponse.objects.filter(
+                    form_id=OuterRef("pk"),
+                    respondent_principal_kind=scope.principal.kind,
+                    respondent_principal_id=scope.principal.principal_id,
+                    respondent_attribution_status__in=(
+                        FormResponse.AttributionStatus.CAPTURED,
+                        FormResponse.AttributionStatus.RESOLVED,
+                    ),
+                )
+            )
         )
         _validate_filters(request)
         qs = apply_filters(

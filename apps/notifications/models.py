@@ -33,6 +33,7 @@ class EventType(models.TextChoices):
     ASSIGNMENTS_CREATED = "assignments.created", _("Assignment created")
     ASSIGNMENTS_DUE_SOON = "assignments.due_soon", _("Assignment due soon")
     ASSIGNMENTS_GRADED = "assignments.graded", _("Assignment graded")
+    TASK_ASSIGNED = "task.assigned", _("Task assigned")
     SCHEDULE_LESSON_REMINDER = "schedule.lesson_reminder", _("Lesson reminder")
     SCHEDULE_CYCLE_EXAM_REMINDER = (
         "schedule.cycle_exam_reminder",

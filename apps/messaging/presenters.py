@@ -54,6 +54,7 @@ def thread_to_dict(
         "participants": [participant_to_dict(p) for p in thread.participants.all()],
         "unread_count": unread_count,
         "notifications_muted": bool(viewer_participant and viewer_participant.notifications_muted),
+        "archived": bool(viewer_participant and viewer_participant.archived_at),
     }
 
 
@@ -151,6 +152,7 @@ def contact_to_dict(user) -> dict:
     username = (profile.username if profile is not None else "") or user.username
     last_seen = user.last_seen_at
     recently_active = bool(last_seen and last_seen >= timezone.now() - timedelta(minutes=5))
+    cohort = getattr(student, "current_cohort", None) if student is not None else None
     return {
         # Keep `id` as a compatibility alias while making the bridge semantics explicit.
         "id": user.pk,
@@ -162,6 +164,8 @@ def contact_to_dict(user) -> dict:
         "username": username,
         "role_label": role_label,
         "role_slug": role_slug,
+        "cohort_id": cohort.pk if cohort is not None else None,
+        "cohort_name": cohort.name if cohort is not None else "",
         # Deprecated compatibility hint.  It is explicitly false as a presence
         # contract; the current realtime protocol does not publish presence.
         "is_online": recently_active,

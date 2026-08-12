@@ -331,3 +331,71 @@ def test_detail_scope_head_and_multi_codepoint_emoji(tenant_a, user_in, as_user,
     assert teacher_a.head(detail_url).status_code == 200
     assert director.head(f"{ACH}{achievement_id}/grants/").status_code == 200
     assert teacher_a.head(f"{ACH}mine/").status_code == 200
+
+
+def test_exact_teacher_can_only_create_list_and_grant_inside_taught_groups(
+    tenant_a, user_in, client_for, as_role
+):
+    """A branch-wide teacher permission must never become branch-wide classroom access."""
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.org.tests.factories import BranchFactory
+    from apps.students.tests.factories import StudentProfileFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+    from tests.role_principal_helpers import exact_session_client
+
+    director, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory.create()
+        teacher_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+        teacher_profile = TeacherProfileFactory.create(user=teacher_user, branch=branch)
+        other_user = user_in(tenant_a, roles=[Role.TEACHER], branch=branch)
+        other_profile = TeacherProfileFactory.create(user=other_user, branch=branch)
+        mine = CohortFactory.create(branch=branch, primary_teacher=teacher_profile)
+        theirs = CohortFactory.create(branch=branch, primary_teacher=other_profile)
+        my_student = StudentProfileFactory.create(branch=branch, current_cohort=mine)
+        other_student = StudentProfileFactory.create(branch=branch, current_cohort=theirs)
+
+    teacher = exact_session_client(
+        client_for,
+        tenant_a,
+        teacher_user,
+        principal_kind="teacher",
+        principal_id=teacher_profile.pk,
+    )
+    other = exact_session_client(
+        client_for,
+        tenant_a,
+        other_user,
+        principal_kind="teacher",
+        principal_id=other_profile.pk,
+    )
+
+    own = teacher.post(
+        ACH, {"name": "My group star", "scope": "group", "cohort": mine.pk}, format="json"
+    )
+    assert own.status_code == 201, own.content
+    blocked = teacher.post(
+        ACH, {"name": "Wrong group", "scope": "group", "cohort": theirs.pk}, format="json"
+    )
+    assert blocked.status_code == 400
+    assert blocked.json()["errors"] == {"cohort": ["Not found."]}
+
+    other_achievement = other.post(
+        ACH, {"name": "Other group star", "scope": "group", "cohort": theirs.pk}, format="json"
+    )
+    assert other_achievement.status_code == 201, other_achievement.content
+    visible_ids = {row["id"] for row in _rows(teacher.get(ACH).json())}
+    assert own.json()["data"]["id"] in visible_ids
+    assert other_achievement.json()["data"]["id"] not in visible_ids
+
+    global_id = director.post(
+        ACH, {"name": "Centre star", "scope": "global"}, format="json"
+    ).json()["data"]["id"]
+    assert teacher.post(
+        f"{ACH}{global_id}/grant/", {"student": my_student.pk}, format="json"
+    ).status_code == 201
+    denied = teacher.post(
+        f"{ACH}{global_id}/grant/", {"student": other_student.pk}, format="json"
+    )
+    assert denied.status_code == 404
+    assert denied.json()["code"] == "not_found"
