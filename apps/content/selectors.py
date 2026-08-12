@@ -182,6 +182,27 @@ def scoped_files(
         memberships = list(user.role_memberships.filter(revoked_at__isnull=True))
     if has_global_content_scope(roles, permission=permission):
         return qs  # protected owner: every file tenant-wide
+
+    # A teacher may explicitly submit a draft to a tenant-wide library for a
+    # distinct organization-wide publisher to countersign. Tenant libraries are
+    # intentionally not ordinary branch-scoped mutation targets, so retain one
+    # narrow exception for files uploaded by this exact teacher account. The
+    # PermissionRoleSet is principal-scoped by the authenticated session: a staff
+    # session sharing the same bridge User cannot inherit this path.
+    teacher_owned_global = Q(pk__in=[])
+    if (
+        isinstance(roles, PermissionRoleSet)
+        and "teacher" in roles.account_kinds
+        and has_permission_code(roles, permission)
+    ):
+        teacher_owned_global = Q(
+            uploaded_by=user,
+            submitted_by_teacher__user=user,
+            submission_audience=LessonFile.SubmissionAudience.GLOBAL,
+        ) & (
+            Q(folder__library__visibility=ContentLibrary.Visibility.TENANT)
+            | Q(lesson__module__course__library__visibility=ContentLibrary.Visibility.TENANT)
+        )
     libs = scoped_libraries(
         user=user,
         roles=roles,
@@ -190,7 +211,7 @@ def scoped_files(
     )
     visible = Q(lesson__module__course__library__in=libs) | Q(folder__library__in=libs)
     if permission != "content:read":
-        return qs.filter(visible).distinct()
+        return qs.filter(visible | teacher_owned_global).distinct()
     if isinstance(roles, PermissionRoleSet):
         managed = Q(pk__in=[])
         for management_permission in _CONTENT_MANAGEMENT_PERMISSIONS:
@@ -204,7 +225,7 @@ def scoped_files(
                 folder__library__in=managed_libraries
             )
         published = Q(is_approved_teacher=True, is_approved_manager=True)
-        return qs.filter(visible & (published | managed)).distinct()
+        return qs.filter(visible & (published | managed | teacher_owned_global)).distinct()
     if can_review_content(roles):
         # Canonical reviewer/publisher grants and legacy teacher/librarian roles
         # see drafts only within their exact library scope.

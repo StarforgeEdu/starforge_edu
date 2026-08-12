@@ -82,6 +82,13 @@ def folder_to_dict(folder: Folder) -> dict:
         "id": folder.id,
         "library": folder.library_id,
         "library_name": folder.library.name,
+        # Upload clients need to present the audience choice before issuing a
+        # signed URL. The upload boundary independently revalidates this metadata
+        # against the exact active teacher principal; these labels are never an
+        # authorization decision by themselves.
+        "library_visibility": folder.library.visibility,
+        "library_cohort": folder.library.cohort_id,
+        "library_cohort_name": folder.library.cohort.name if folder.library.cohort else None,
         "parent": folder.parent_id,
         "parent_name": folder.parent.name if folder.parent else None,
         "name": folder.name,
@@ -115,6 +122,7 @@ def lesson_file_to_dict(f: LessonFile) -> dict:
         "download_count": f.download_count,
         "uploaded_by": f.uploaded_by_id,
         "uploaded_by_name": f.uploaded_by.get_full_name() if f.uploaded_by else None,
+        "submission_audience": f.submission_audience or None,
         "created_at": _iso(f.created_at),
         "is_approved_teacher": f.is_approved_teacher,
         "approved_teacher_by": f.approved_teacher_by_id,

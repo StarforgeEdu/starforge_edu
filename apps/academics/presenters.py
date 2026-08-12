@@ -86,6 +86,7 @@ def exam_result_to_dict(result: ExamResult) -> dict:
         "student_name": result.student.get_full_name(),
         "score": _dec(result.score, 2),
         "note": result.note,
+        "components": result.components,
         "graded_by": result.graded_by_id,
         "graded_at": _iso(result.graded_at),
     }

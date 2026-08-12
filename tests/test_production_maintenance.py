@@ -18,6 +18,12 @@ def test_caddy_has_reloadable_api_and_storage_maintenance_hooks():
     )
 
 
+def test_staff_api_edge_uses_an_android_7_compatible_rsa_certificate_key():
+    api_site = CADDY.split("starforge.example.com {", 1)[1].split("\n}\n\n# S3 API only.", 1)[0]
+
+    assert "tls {\n\t\tkey_type rsa2048\n\t}" in api_site
+
+
 def test_controller_blocks_all_business_ingress_but_keeps_health_and_reads():
     assert "not method GET HEAD OPTIONS" in SCRIPT
     assert 'X-StarForge-Maintenance "active"' in SCRIPT

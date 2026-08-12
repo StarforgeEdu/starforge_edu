@@ -26,7 +26,7 @@ import inspect
 import re
 from copy import deepcopy
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 
 from django.conf import settings
 from django.http import HttpRequest, JsonResponse
@@ -406,7 +406,7 @@ def _validate_view_contract(
             )
 
     body_contract_exists = any(operation.request_body is not None for operation in contract.operations)
-    runtime_reads_json = "read_json(request)" in source
+    runtime_reads_json = "read_json(request)" in source or "read_json_array(request" in source
     if body_contract_exists and not runtime_reads_json:
         raise OpenAPIContractError(f"{path} declares a JSON body but runtime does not parse one")
     if runtime_reads_json and not body_contract_exists:
@@ -440,7 +440,9 @@ def _components() -> dict:
     # Product-critical workflow schemas live beside their executable contracts.
     # Merge them explicitly here so a generated client receives the same closed
     # DTOs and response envelopes validated against the registered callbacks.
+    from apps.academics.openapi_contracts import OPENAPI_SCHEMAS as ACADEMICS_SCHEMAS
     from apps.ai.openapi_contracts import OPENAPI_SCHEMAS as AI_SCHEMAS
+    from apps.attendance.openapi_contracts import OPENAPI_SCHEMAS as ATTENDANCE_SCHEMAS
     from apps.audit.openapi_contracts import OPENAPI_SCHEMAS as AUDIT_SCHEMAS
     from apps.finance.openapi_contracts import OPENAPI_SCHEMAS as FINANCE_SCHEMAS
     from apps.forms.openapi_contracts import OPENAPI_SCHEMAS as FORM_SCHEMAS
@@ -454,7 +456,9 @@ def _components() -> dict:
 
     workflow_schemas: dict[str, dict[str, Any]] = {}
     for domain_schemas in (
+        ACADEMICS_SCHEMAS,
         AI_SCHEMAS,
+        ATTENDANCE_SCHEMAS,
         AUDIT_SCHEMAS,
         FORM_SCHEMAS,
         FINANCE_SCHEMAS,
@@ -473,7 +477,9 @@ def _components() -> dict:
         # the module-owned contract registries immutable so repeated schema
         # generation and later domain contract tests cannot observe fields
         # injected by an earlier build.
-        workflow_schemas.update({name: deepcopy(schema) for name, schema in domain_schemas.items()})
+        workflow_schemas.update(
+            {name: deepcopy(cast(dict[str, Any], schema)) for name, schema in domain_schemas.items()}
+        )
 
     components: dict[str, Any] = {
         "securitySchemes": {
@@ -1642,20 +1648,20 @@ def _components() -> dict:
                 "type": "object",
                 "additionalProperties": False,
                 "description": (
-                    "Identifies a printable domain record. payload_s3_key, branch, cohort, "
-                    "status, printer, and agent are server-owned and rejected if supplied."
+                    "Identifies a printable domain record or owned upload grant. payload_s3_key, "
+                    "branch, cohort, status, and agent are server-owned and rejected if supplied."
                 ),
                 "properties": {
                     "source": {
                         "type": "string",
-                        "enum": ["assignment", "transcript", "report", "receipt"],
+                        "enum": ["assignment", "transcript", "report", "receipt", "content", "upload"],
                     },
                     "source_id": {
                         "type": "integer",
                         "format": "int64",
                         "minimum": 1,
                         "description": (
-                            "Assignment, Transcript, ReportRun, or Payment ID according to source."
+                            "Assignment, Transcript, ReportRun, Payment, LessonFile, or print upload grant ID."
                         ),
                     },
                     "attachment_index": {
@@ -1665,12 +1671,73 @@ def _components() -> dict:
                             "Required only when an assignment has multiple attachments; zero-based."
                         ),
                     },
-                    "pages": {"type": "integer", "minimum": 1},
-                    "copies": {"type": "integer", "minimum": 1, "default": 1},
+                    "pages": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Optional consistency hint for content/upload; the server derives the "
+                            "authoritative PDF/image count and rejects a mismatch. Required for legacy sources."
+                        ),
+                    },
+                    "copies": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1},
                     "color": {"type": "boolean", "default": False},
                     "duplex": {"type": "boolean", "default": False},
+                    "printer": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 1,
+                        "description": "Active in-scope printer; required for content and upload sources.",
+                    },
+                    "scheduled_for": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": True,
+                        "description": "Timezone-aware start time within 365 days; null/omitted means now.",
+                    },
                 },
-                "required": ["source", "source_id", "pages"],
+                "required": ["source", "source_id"],
+            },
+            "PrintUploadRequest": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "branch": {"type": "integer", "format": "int64", "minimum": 1},
+                    "filename": {"type": "string", "minLength": 1, "maxLength": 255},
+                    "content_type": {
+                        "type": "string",
+                        "enum": ["application/pdf", "image/jpeg", "image/png", "image/webp"],
+                    },
+                    "size_bytes": {
+                        "type": "integer",
+                        "format": "int64",
+                        "minimum": 1,
+                        "maximum": 52428800,
+                    },
+                },
+                "required": ["branch", "filename", "content_type", "size_bytes"],
+            },
+            "PrintUploadData": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "grant_id": {"type": "integer", "format": "int64", "minimum": 1},
+                    "url": {"type": "string", "format": "uri"},
+                    "fields": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "method": {"type": "string", "enum": ["POST"]},
+                    "expires_at": {"type": "string", "format": "date-time"},
+                },
+                "required": ["grant_id", "url", "fields", "method", "expires_at"],
+            },
+            "PrintUploadResponse": {
+                "type": "object",
+                "properties": {
+                    "success": {"type": "boolean", "enum": [True]},
+                    "data": {"$ref": "#/components/schemas/PrintUploadData"},
+                },
+                "required": ["success", "data"],
             },
             "PrintJob": {
                 "type": "object",
@@ -1683,6 +1750,7 @@ def _components() -> dict:
                     "id": {"type": "integer"},
                     "branch": {"type": "integer"},
                     "printer": {"type": "integer", "nullable": True},
+                    "preferred_printer": {"type": "integer", "nullable": True},
                     "agent": {"type": "integer", "nullable": True},
                     "status": {
                         "type": "string",
@@ -1697,7 +1765,7 @@ def _components() -> dict:
                     },
                     "source": {
                         "type": "string",
-                        "enum": ["assignment", "transcript", "report", "receipt"],
+                        "enum": ["assignment", "transcript", "report", "receipt", "content", "upload"],
                     },
                     "source_id": {"type": "integer", "format": "int64"},
                     "pages": {"type": "integer"},
@@ -1708,6 +1776,7 @@ def _components() -> dict:
                     "requested_by": {"type": "integer", "nullable": True},
                     "attempts": {"type": "integer"},
                     "next_attempt_at": {"type": "string", "format": "date-time", "nullable": True},
+                    "scheduled_for": {"type": "string", "format": "date-time", "nullable": True},
                     "pages_printed": {"type": "integer"},
                     "created_at": {"type": "string", "format": "date-time"},
                     "claimed_at": {"type": "string", "format": "date-time", "nullable": True},
@@ -1746,6 +1815,7 @@ def _components() -> dict:
                     "id",
                     "branch",
                     "printer",
+                    "preferred_printer",
                     "agent",
                     "status",
                     "source",
@@ -1758,6 +1828,7 @@ def _components() -> dict:
                     "requested_by",
                     "attempts",
                     "next_attempt_at",
+                    "scheduled_for",
                     "pages_printed",
                     "created_at",
                     "claimed_at",

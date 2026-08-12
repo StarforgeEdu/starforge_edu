@@ -9,7 +9,6 @@ even on read, so a student/parent holding ``academics:read`` can't harvest score
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from django.http import HttpRequest, HttpResponse
@@ -25,6 +24,7 @@ from apps.academics.interfaces.services import (
     ITranscriptService,
 )
 from apps.academics.models import Exam
+from apps.academics.openapi_contracts import EXAM_RESULTS_CONTRACTS
 from apps.academics.presenters import (
     exam_lifecycle_event_to_dict,
     exam_result_to_dict,
@@ -41,8 +41,9 @@ from apps.students.models import StudentProfile
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
-from core.http import bool_field, decimal_field, parse_bool, read_json
+from core.http import bool_field, decimal_field, parse_bool, read_json, read_json_array
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.ratelimit import check_rate
 from core.responses import created, error, no_content, paginated, success
@@ -530,14 +531,14 @@ def _parse_result_items(
 
     if len(raw) > MAX_IMPORT_ROWS:
         raise _reject(root, f"Too many rows (max {MAX_IMPORT_ROWS}).")
-    parsed: list[tuple[int, int | None, str | None, Any, Any]] = []
+    parsed: list[tuple[int, int | None, str | None, Any]] = []
     student_ids: set[int] = set()
     student_codes: set[str] = set()
     for index, item in enumerate(raw):
         field = f"{root}[{index}]"
         if not isinstance(item, dict):
             raise _reject(field, "Each row must be an object.")
-        unknown = set(item) - {"student", "student_code", "score", "note"}
+        unknown = set(item) - {"student", "student_code", "score", "note", "components"}
         if unknown:
             raise _reject(
                 field,
@@ -562,20 +563,24 @@ def _parse_result_items(
         if "score" not in item:
             raise _reject(f"{field}.score", "This field is required.")
         try:
+            validation_kwargs = {}
+            if "components" in item:
+                validation_kwargs["components"] = item["components"]
             values = validate_result_values(
                 score=item["score"],
                 note=item.get("note", ""),
                 max_score=max_score if max_score is not None else exam.max_score,
+                **validation_kwargs,
             )
         except ResultFieldError as exc:
             raise _reject(f"{field}.{exc.field}", exc.message) from None
-        parsed.append((index, student_id, student_code, values.score, values.note))
+        parsed.append((index, student_id, student_code, values))
 
     students_by_id = StudentProfile.objects.in_bulk(student_ids)
     students_by_code = StudentProfile.objects.in_bulk(student_codes, field_name="student_id")
     rows: list[dict] = []
     seen_profiles: set[int] = set()
-    for index, student_id, student_code, score, note in parsed:
+    for index, student_id, student_code, values in parsed:
         student = (
             students_by_id.get(student_id)
             if student_id is not None
@@ -587,23 +592,17 @@ def _parse_result_items(
         if student.pk in seen_profiles:
             raise _reject(f"{root}[{index}]", "A student may appear only once per batch.")
         seen_profiles.add(student.pk)
-        rows.append({"student": student, "score": score, "note": note})
+        row = {"student": student, "score": values.score, "note": values.note}
+        if values.components is not None:
+            row["components"] = list(values.components)
+        rows.append(row)
     return rows
 
 
-def _parse_result_rows(request: HttpRequest, *, exam: Exam) -> list[dict]:
-    """The results payload is a top-level JSON ARRAY of {student, score, note?} —
-    parse it directly (read_json rejects non-objects), validate each element, and
-    resolve student ids to StudentProfile objects (record_results expects objects).
-    An empty/malformed body is a 400 (parity with the old DRF ParseError); an explicit
-    empty array [] is a valid no-op."""
-    try:
-        raw = json.loads(request.body)
-    except (json.JSONDecodeError, ValueError):
-        raise _reject("rows", "Request body must be a JSON array.") from None
-    return _parse_result_items(raw, exam=exam)
-
-
+@openapi_contract(
+    path="/api/v1/academics/exams/{pk}/results/",
+    operations=EXAM_RESULTS_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def exam_results_view(request: HttpRequest, pk: int) -> HttpResponse:
@@ -620,7 +619,8 @@ def exam_results_view(request: HttpRequest, pk: int) -> HttpResponse:
             page=page,
             page_size=size,
         )
-    rows = _parse_result_rows(request, exam=exam)
+    # Result writes are a top-level array rather than the API's usual object DTO.
+    rows = _parse_result_items(read_json_array(request), exam=exam)
     result = _exam_service().record_results(exam=exam, rows=rows, actor=request.user)
     return success(
         {

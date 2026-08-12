@@ -1,4 +1,4 @@
-"""Bounded lifecycle cleanup for assignment and messaging attachments."""
+"""Bounded lifecycle cleanup for assignment, messaging, and print uploads."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from config.celery import app
 
 logger = logging.getLogger(__name__)
 
-_DOMAINS = {"assignments", "messaging"}
+_DOMAINS = {"assignments", "messaging", "printing"}
 _BATCH_SIZE = 500
 
 
@@ -28,7 +28,13 @@ def _active_schemas() -> list[str]:
     )
 
 
-def _trusted_durable_key(domain: str, key: object, *, schema: str) -> bool:
+def _trusted_durable_key(
+    domain: str,
+    key: object,
+    *,
+    schema: str,
+    grant_id: int | None = None,
+) -> bool:
     if domain == "assignments":
         from apps.assignments.storage_keys import (
             parse_final_attachment_key as parse_assignment_final_key,
@@ -53,6 +59,11 @@ def _trusted_durable_key(domain: str, key: object, *, schema: str) -> bool:
             parse_message_final_key(key, schema=schema) is not None
             or parse_message_legacy_key(key, schema=schema) is not None
         )
+    if domain == "printing":
+        from apps.printing.storage_keys import parse_final_print_document_key
+
+        parsed = parse_final_print_document_key(key, schema=schema)
+        return parsed is not None and grant_id is not None and parsed.grant_id == grant_id
     return False
 
 
@@ -93,6 +104,11 @@ def _trusted_upload_source(
             return owner_id is None or message_pending.owner_id == owner_id
         legacy = parse_message_legacy_key(key, schema=schema)
         return allow_legacy and legacy is not None and (owner_id is None or legacy.owner_id == owner_id)
+    if domain == "printing":
+        from apps.printing.storage_keys import parse_pending_print_upload_key
+
+        pending = parse_pending_print_upload_key(key, schema=schema)
+        return pending is not None and (owner_id is None or pending.owner_id == owner_id)
     return False
 
 
@@ -107,6 +123,8 @@ def _legacy_durable_key(domain: str, key: object, *, schema: str) -> bool:
         from apps.messaging.storage_keys import parse_legacy_attachment_key as parse_message_legacy_key
 
         return parse_message_legacy_key(key, schema=schema) is not None
+    if domain == "printing":
+        return False
     return False
 
 
@@ -125,6 +143,10 @@ def _grant_model(domain: str):
         from apps.messaging.models import MessageAttachmentUploadGrant
 
         return MessageAttachmentUploadGrant
+    if domain == "printing":
+        from apps.printing.models import PrintUploadGrant
+
+        return PrintUploadGrant
     raise ValueError("Invalid attachment domain")
 
 
@@ -162,7 +184,7 @@ def delete_attachment_objects(domain: str, grant_ids: list[int]) -> int:
                 skipped += 1
                 continue
             key = grant.durable_key or grant.key
-            if not _trusted_durable_key(domain, key, schema=schema):
+            if not _trusted_durable_key(domain, key, schema=schema, grant_id=grant.pk):
                 logger.warning(
                     "Skipped poisoned durable attachment during cleanup domain=%s schema=%s grant_id=%s",
                     domain,
@@ -255,6 +277,7 @@ def cleanup_expired_attachment_uploads_for_schema() -> int:
 
     from apps.assignments.models import AssignmentUploadGrant
     from apps.messaging.models import MessageAttachmentUploadGrant
+    from apps.printing.models import PrintUploadGrant
     from core.utils import current_schema
 
     schema = current_schema()
@@ -263,6 +286,7 @@ def cleanup_expired_attachment_uploads_for_schema() -> int:
     for domain, Grant in (
         ("assignments", AssignmentUploadGrant),
         ("messaging", MessageAttachmentUploadGrant),
+        ("printing", PrintUploadGrant),
     ):
         grant_ids = list(
             Grant.objects.filter(
@@ -313,6 +337,7 @@ def cleanup_expired_attachment_uploads_for_schema() -> int:
     for domain, Grant in (
         ("assignments", AssignmentUploadGrant),
         ("messaging", MessageAttachmentUploadGrant),
+        ("printing", PrintUploadGrant),
     ):
         durable_grant_ids = list(
             Grant.objects.filter(
@@ -336,7 +361,7 @@ def cleanup_expired_attachment_uploads_for_schema() -> int:
                 if grant is None:
                     continue
                 key = grant.durable_key or grant.key
-                if _trusted_durable_key(domain, key, schema=schema):
+                if _trusted_durable_key(domain, key, schema=schema, grant_id=grant.pk):
                     _delete_one(key)
                 else:
                     logger.warning(

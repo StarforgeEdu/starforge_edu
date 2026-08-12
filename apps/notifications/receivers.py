@@ -17,6 +17,7 @@ Signal -> EventType -> recipient mapping table (D3-C-4):
 | assignments.assignment_due_soon       | assignments.due_soon            | cohort members (students)             |
 | assignments.submission_graded         | assignments.graded             | the student + guardians               |
 | schedule.lesson_reminder_due          | schedule.lesson_reminder        | cohort members (students)             |
+| schedule.lesson_reminder_due (exam)   | schedule.cycle_exam_reminder    | scheduled teacher                     |
 | schedule.lesson_cancelled             | schedule.lesson_reminder        | cohort members (students)             |
 | schedule.lesson_rescheduled           | schedule.lesson_reminder        | cohort members (students)             |
 | schedule.lessons_bulk_rescheduled     | schedule.lesson_reminder        | cohort members (async, bounded)       |
@@ -98,6 +99,19 @@ def _student_recipient(student_id: int) -> dict | None:
     if user_id is None:
         return None
     return {"user_id": user_id, "principal_kind": "student", "principal_id": student_id}
+
+
+def _teacher_recipient(teacher_id: int) -> dict | None:
+    from apps.teachers.models import TeacherProfile
+
+    user_id = (
+        TeacherProfile.objects.filter(pk=teacher_id, is_active=True, user__is_active=True)
+        .values_list("user_id", flat=True)
+        .first()
+    )
+    if user_id is None:
+        return None
+    return {"user_id": user_id, "principal_kind": "teacher", "principal_id": teacher_id}
 
 
 def _cohort_member_recipients(cohort_id: int) -> list[dict]:
@@ -404,8 +418,18 @@ def _connect_schedule() -> None:
         return _cohort_member_recipients(cohort_id)
 
     @receiver(lesson_reminder_due, dispatch_uid="notifications.lesson_reminder_due", weak=False)
-    def on_lesson_reminder_due(sender, *, lesson_id, schema_name="", **kwargs):
+    def on_lesson_reminder_due(
+        sender,
+        *,
+        lesson_id,
+        schema_name="",
+        is_cycle_exam_day=False,
+        cycle_lesson_number=None,
+        cycle_length=None,
+        **kwargs,
+    ):
         from apps.notifications.models import EventType
+        from apps.schedule.models import Lesson
 
         _dispatch_many(
             recipients=_lesson_recipients(lesson_id),
@@ -413,6 +437,28 @@ def _connect_schedule() -> None:
             context={"lesson_id": lesson_id, "kind": "reminder"},
             dedupe_prefix=f"schedule.lesson_reminder:{lesson_id}",
         )
+        if is_cycle_exam_day:
+            lesson = (
+                Lesson.objects.filter(pk=lesson_id)
+                .values("teacher_id", "cohort_id", "title", "starts_at")
+                .first()
+            )
+            if lesson is not None:
+                _dispatch_many(
+                    recipients=[_teacher_recipient(lesson["teacher_id"])],
+                    event_type=EventType.SCHEDULE_CYCLE_EXAM_REMINDER,
+                    context={
+                        "lesson_id": lesson_id,
+                        "cohort_id": lesson["cohort_id"],
+                        "lesson_title": lesson["title"],
+                        "starts_at": lesson["starts_at"].isoformat(),
+                        "cycle_lesson_number": cycle_lesson_number,
+                        "cycle_length": cycle_length,
+                        "is_cycle_exam_day": True,
+                        "kind": "cycle_exam",
+                    },
+                    dedupe_prefix=f"schedule.cycle_exam_reminder:{lesson_id}",
+                )
 
     @receiver(lesson_cancelled, dispatch_uid="notifications.lesson_cancelled", weak=False)
     def on_lesson_cancelled(sender, *, lesson_id, schema_name="", **kwargs):

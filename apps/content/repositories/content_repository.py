@@ -114,7 +114,7 @@ class FolderRepository(_CrudRepo, BaseRepository[Folder], IFolderRepository):
 
     def scoped(self, *, user: Any, roles: set[str] | None, permission: str) -> QuerySet[Folder]:
         return Folder.objects.filter(library__in=_libs(user, roles, permission)).select_related(
-            "library", "parent"
+            "library", "library__cohort", "parent"
         )
 
     def get_scoped(self, *, pk: int, user: Any, roles: set[str] | None, permission: str):

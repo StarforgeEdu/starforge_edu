@@ -214,6 +214,7 @@ def _result_snapshot(result: ExamResult) -> dict[str, Any]:
         "student_code": result.student.student_id,
         "score": str(result.score),
         "note": result.note,
+        "components": result.components,
     }
 
 
@@ -651,16 +652,23 @@ def correct_exam(
                 student=student,
                 score=row["score"],
                 note=row["note"],
+                components=row.get("components", []),
                 graded_by=actor,
                 graded_at=now,
             )
             to_create.append(result)
-        elif result.score != row["score"] or result.note != row["note"]:
+        elif (
+            result.score != row["score"]
+            or result.note != row["note"]
+            or ("components" in row and result.components != row["components"])
+        ):
             if before_result is None:  # defensive invariant; keeps -O behavior identical
                 raise RuntimeError("Existing assessment result has no correction snapshot")
             before_by_student[result.student_id] = before_result
             result.score = row["score"]
             result.note = row["note"]
+            if "components" in row:
+                result.components = row["components"]
             result.graded_by = actor
             result.graded_at = now
             to_update.append(result)
@@ -676,6 +684,7 @@ def correct_exam(
                     "student_code": student.student_id,
                     "score": str(result.score),
                     "note": result.note,
+                    "components": result.components,
                 },
             }
         )
@@ -713,7 +722,7 @@ def correct_exam(
         if to_update:
             ExamResult.objects.bulk_update(
                 to_update,
-                fields=("score", "note", "graded_by", "graded_at"),
+                fields=("score", "note", "components", "graded_by", "graded_at"),
             )
 
     invalidate_term_grades(
@@ -803,15 +812,22 @@ def _normalize_correction_rows(
             errors[str(index)] = [str(_("Student is not enrolled in the exam cohort."))]
             continue
         try:
+            validation_kwargs = {}
+            if "components" in row:
+                validation_kwargs["components"] = row["components"]
             values = validate_result_values(
                 score=row.get("score"),
                 note=row.get("note", ""),
                 max_score=max_score,
+                **validation_kwargs,
             )
         except ResultFieldError as exc:
             errors[str(index)] = [exc.message]
             continue
-        normalized.append({"student": student, "score": values.score, "note": values.note})
+        normalized_row = {"student": student, "score": values.score, "note": values.note}
+        if values.components is not None:
+            normalized_row["components"] = list(values.components)
+        normalized.append(normalized_row)
     if errors:
         raise UnprocessableEntity(
             _("One or more correction rows are invalid."),

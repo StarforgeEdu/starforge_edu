@@ -17,3 +17,6 @@ class MarkEntryDTO:
     status: str
     arrived_at: datetime | None = None
     note: str = ""
+    # None means the client omitted the field and an existing card must be
+    # preserved. The empty string is an explicit clear operation.
+    card_type: str | None = None

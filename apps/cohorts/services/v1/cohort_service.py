@@ -35,7 +35,16 @@ from apps.cohorts.teacher_assignments import (
 from apps.teachers.models import TeacherType
 from core.exceptions import ConflictException, ValidationException
 
-_SCALAR_FIELDS = ("name", "level", "start_date", "end_date", "capacity", "is_archived")
+_SCALAR_FIELDS = (
+    "name",
+    "level",
+    "study_month",
+    "lesson_cycle_length",
+    "start_date",
+    "end_date",
+    "capacity",
+    "is_archived",
+)
 
 
 class CohortService(ICohortService):
@@ -56,6 +65,8 @@ class CohortService(ICohortService):
             branch=self._resolve_branch(data.branch_id),
             department=self._resolve_department(data.department_id),
             level=data.level,
+            study_month=data.study_month,
+            lesson_cycle_length=data.lesson_cycle_length,
             start_date=data.start_date,
             end_date=data.end_date,
             capacity=data.capacity,
@@ -343,6 +354,18 @@ class CohortService(ICohortService):
                 _("Capacity cannot be negative."),
                 code="validation_error",
                 fields={"capacity": ["Must be zero or greater."]},
+            )
+        if cohort.lesson_cycle_length not in Cohort.LessonCycleLength.values:
+            raise ValidationException(
+                _("Lesson cycle must contain 8 or 12 lessons."),
+                code="validation_error",
+                fields={"lesson_cycle_length": ["Choose 8 or 12 lessons."]},
+            )
+        if not 1 <= cohort.study_month <= 600:
+            raise ValidationException(
+                _("Study month must be between 1 and 600."),
+                code="validation_error",
+                fields={"study_month": ["Choose a value from 1 to 600."]},
             )
         cls._assert_date_order(cohort.start_date, cohort.end_date)
 

@@ -230,6 +230,21 @@ def mark_attendance(*, lesson: Lesson, entries: list[dict], actor) -> dict:
     _assert_can_mark(lesson, actor, write_scopes=write_scopes)
     _assert_within_correction_window(lesson, actor, settings, write_scopes=write_scopes)
 
+    valid_card_types = {value for value, _label in AttendanceRecord.CardType.choices}
+    invalid_cards: dict[int, object] = {}
+    for index, entry in enumerate(entries):
+        if "card_type" not in entry:
+            continue
+        card_type = entry.get("card_type")
+        if not isinstance(card_type, str) or card_type not in valid_card_types:
+            invalid_cards[index] = card_type
+    if invalid_cards:
+        raise UnprocessableEntity(
+            _("One or more attendance card types are invalid."),
+            code="invalid_card_type",
+            fields={"card_type": invalid_cards},
+        )
+
     student_ids = [e["student"].pk for e in entries]
     # F2-6: membership is checked AS OF THE LESSON DATE, not "right now". A student
     # who was in the cohort when the lesson happened but has since been moved out
@@ -267,16 +282,21 @@ def mark_attendance(*, lesson: Lesson, entries: list[dict], actor) -> dict:
     records: list[AttendanceRecord] = []
     for entry in entries:
         status_value = _resolve_status(entry, lesson, settings)
+        defaults = {
+            "status": status_value,
+            "arrived_at": entry.get("arrived_at"),
+            "note": entry.get("note", ""),
+            "marked_by": actor,
+            "auto_marked": False,
+        }
+        # Omission preserves an already-issued card for compatibility with
+        # older clients. Sending "" is the explicit clear operation.
+        if "card_type" in entry:
+            defaults["card_type"] = entry["card_type"]
         record, was_created = AttendanceRecord.objects.update_or_create(
             student=entry["student"],
             lesson=lesson,
-            defaults={
-                "status": status_value,
-                "arrived_at": entry.get("arrived_at"),
-                "note": entry.get("note", ""),
-                "marked_by": actor,
-                "auto_marked": False,
-            },
+            defaults=defaults,
         )
         created += int(was_created)
         updated += int(not was_created)

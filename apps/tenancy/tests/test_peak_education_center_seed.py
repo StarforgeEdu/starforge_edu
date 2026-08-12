@@ -55,6 +55,8 @@ def test_peak_seed_builds_a_retry_safe_small_graph_across_guarded_models(tenant_
         teachers=3,
         history_days=21,
     )
+    student_prefix = f"sim.{config.username_token}.student."
+    teacher_prefix = f"sim.{config.username_token}.teacher."
 
     with schema_context(tenant_a.schema_name):
         bootstrap_branch = Branch.objects.create(
@@ -78,19 +80,17 @@ def test_peak_seed_builds_a_retry_safe_small_graph_across_guarded_models(tenant_
         command = Command()
         command._execute(config)
         first_counts = {
-            "students": StudentProfile.objects.filter(username__startswith="sim.peak.integration.v1").count(),
-            "teachers": TeacherProfile.objects.filter(username__startswith="sim.peak.integration.v1").count(),
+            "students": StudentProfile.objects.filter(username__startswith=student_prefix).count(),
+            "teachers": TeacherProfile.objects.filter(username__startswith=teacher_prefix).count(),
             "cohorts": Cohort.objects.filter(name__startswith=config.marker).count(),
             "memberships": CohortMembership.objects.filter(
-                student__username__startswith="sim.peak.integration.v1"
+                student__username__startswith=student_prefix
             ).count(),
             "teacher_assignments": CohortTeacher.objects.filter(
-                teacher__username__startswith="sim.peak.integration.v1"
+                teacher__username__startswith=teacher_prefix
             ).count(),
             "attendance": AttendanceRecord.objects.filter(note__startswith=config.marker).count(),
-            "invoices": Invoice.objects.filter(
-                student__username__startswith="sim.peak.integration.v1"
-            ).count(),
+            "invoices": Invoice.objects.filter(student__username__startswith=student_prefix).count(),
             "payments": Payment.objects.filter(
                 idempotency_key__startswith="sim:peak-integration-v1:"
             ).count(),
@@ -101,7 +101,7 @@ def test_peak_seed_builds_a_retry_safe_small_graph_across_guarded_models(tenant_
             ).count(),
             "exams": Exam.objects.filter(title__startswith=config.marker).count(),
             "results": ExamResult.objects.filter(exam__title__startswith=config.marker).count(),
-            "grades": Grade.objects.filter(student__username__startswith="sim.peak.integration.v1").count(),
+            "grades": Grade.objects.filter(student__username__startswith=student_prefix).count(),
             "events": ExamLifecycleEvent.objects.filter(exam__title__startswith=config.marker).count(),
             "threads": Thread.objects.filter(subject__startswith=config.marker).count(),
             "participants": ThreadParticipant.objects.filter(
@@ -127,7 +127,7 @@ def test_peak_seed_builds_a_retry_safe_small_graph_across_guarded_models(tenant_
         assert first_counts["messages"] == 192
 
         command._execute(config)
-        assert StudentProfile.objects.filter(username__startswith="sim.peak.integration.v1").count() == 12
-        assert Invoice.objects.filter(student__username__startswith="sim.peak.integration.v1").count() == 144
+        assert StudentProfile.objects.filter(username__startswith=student_prefix).count() == 12
+        assert Invoice.objects.filter(student__username__startswith=student_prefix).count() == 144
         assert Thread.objects.filter(subject__startswith=config.marker).count() == 12
         assert Message.objects.filter(body__startswith=config.marker).count() == 192

@@ -82,16 +82,22 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
             duplicate_errors[str(index)] = [str(_("A student may appear only once per batch."))]
         seen_student_ids.add(student_id)
         try:
+            validation_kwargs = {}
+            if "components" in row:
+                validation_kwargs["components"] = row["components"]
             values = validate_result_values(
                 score=row.get("score"),
                 note=row.get("note", ""),
                 max_score=exam.max_score,
+                **validation_kwargs,
             )
         except ResultFieldError as exc:
             field_errors.setdefault(str(index), []).append(exc.message)
         else:
             row["score"] = values.score
             row["note"] = values.note
+            if values.components is not None:
+                row["components"] = list(values.components)
     if duplicate_errors:
         raise UnprocessableEntity(
             _("A student may appear only once per batch."),
@@ -157,16 +163,20 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
                 student=student,
                 score=row["score"],
                 note=row.get("note", ""),
+                components=row.get("components", []),
                 graded_by=actor,
                 graded_at=now,
             )
             to_create.append(result)
         else:
-            if result.score == row["score"] and result.note == row.get("note", ""):
+            components_unchanged = "components" not in row or result.components == row["components"]
+            if result.score == row["score"] and result.note == row.get("note", "") and components_unchanged:
                 ordered_results.append(result)
                 continue
             result.score = row["score"]
             result.note = row.get("note", "")
+            if "components" in row:
+                result.components = row["components"]
             result.graded_by = actor
             result.graded_at = now
             to_update.append(result)
@@ -177,7 +187,7 @@ def record_results(*, exam: Exam, rows: list[dict], actor=None) -> dict:
         if to_update:
             ExamResult.objects.bulk_update(
                 to_update,
-                fields=("score", "note", "graded_by", "graded_at"),
+                fields=("score", "note", "components", "graded_by", "graded_at"),
             )
     request = current_request()
     audit_entries = [

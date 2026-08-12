@@ -56,7 +56,7 @@ _AGENT_PRINT_JOB_SCHEMA: dict[str, Any] = {
         },
         "source": {
             "type": "string",
-            "enum": ["assignment", "transcript", "report", "receipt"],
+            "enum": ["assignment", "transcript", "report", "receipt", "content", "upload"],
         },
         "pages": {"type": "integer", "minimum": 1},
         "copies": {"type": "integer", "minimum": 1},
@@ -400,8 +400,11 @@ JOBS_POST_CONTRACT = OperationContract(
     summary="Queue an authorized domain document for printing",
     description=(
         "The caller identifies an in-scope assignment attachment, completed transcript, "
-        "single-branch report run, or confirmed payment receipt. The server derives the exact "
-        "object key, branch, and cohort. Client-supplied storage or routing fields are rejected."
+        "single-branch report run, confirmed payment receipt, visible downloadable library file, "
+        "or an owner-bound print upload grant. The server derives the exact object key and branch. "
+        "A selected active printer is required for library/upload sources; future schedules are "
+        "held in the queue until due. For content/upload, pages is optional and is only a "
+        "consistency hint: the server derives the authoritative PDF/image page count."
     ),
     permission="printing:write plus the selected source's read permission",
     security=UNSAFE_SESSION_SECURITY,
@@ -417,9 +420,10 @@ JOBS_POST_CONTRACT = OperationContract(
         ),
         "404": error_response("The source is absent or outside the caller's visible scope."),
         "409": error_response(
-            "The same open source/key exists with different pages, copies, color, duplex, or cohort."
+            "The same open source/key exists with different physical, printer, or schedule options."
         ),
         "422": error_response("The source file is not ready or the cohort print quota is exceeded."),
+        "503": error_response("Authoritative document inspection or storage is temporarily unavailable."),
         "429": error_response("Authenticated request rate limit exceeded."),
     },
     operation_id="post_printing_jobs",
@@ -429,6 +433,34 @@ JOBS_COLLECTION_CONTRACTS = (
     JOBS_GET_CONTRACT,
     JOBS_HEAD_CONTRACT,
     JOBS_POST_CONTRACT,
+)
+
+PRINT_UPLOAD_CONTRACTS = (
+    OperationContract(
+        method="POST",
+        summary="Request a secure ad-hoc print upload",
+        description=(
+            "Requires printing:write in the exact branch. Returns a ten-minute, exact-size S3 POST "
+            "policy bound to the authenticated account and branch. The resulting grant id, never a "
+            "client-supplied object key, is submitted as source=upload to the jobs endpoint. The "
+            "object is signature-verified and promoted before any branch agent can download it."
+        ),
+        permission="printing:write",
+        security=UNSAFE_SESSION_SECURITY,
+        request_body=json_request("PrintUploadRequest"),
+        responses={
+            "201": json_response(
+                "A short-lived owner-bound upload policy was issued.", "PrintUploadResponse"
+            ),
+            "400": error_response("The closed upload DTO is malformed."),
+            "401": error_response("Session is absent, invalid, expired, or revoked."),
+            "403": error_response("Permission, branch scope, read-only session, or CSRF check failed."),
+            "422": error_response("The filename, type, size, center policy, or active-grant limit failed."),
+            "429": error_response("Authenticated request rate limit exceeded."),
+            "503": error_response("Storage could not issue the upload policy."),
+        },
+        operation_id="post_printing_upload_url",
+    ),
 )
 
 _JOB_PK_PARAMETER = {

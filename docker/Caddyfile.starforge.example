@@ -4,6 +4,13 @@
 import maintenance.d/state.caddy
 
 starforge.example.com {
+	# Staff clients include Android 7 devices. Keep the API leaf certificate on
+	# an RSA key so those clients do not depend on their broken EC certificate
+	# handling. Caddy still owns ACME issuance and renewal in its persistent data.
+	tls {
+		key_type rsa2048
+	}
+
 	route {
 		# Operations must be able to distinguish liveness/readiness from public
 		# business availability while the edge maintenance gate is active.

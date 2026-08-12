@@ -24,6 +24,7 @@ def record_to_dict(record: AttendanceRecord) -> dict:
         "teacher": lesson.teacher_id,
         "teacher_name": lesson.teacher.get_full_name(),
         "status": record.status,
+        "card_type": record.card_type,
         "arrived_at": record.arrived_at.isoformat() if record.arrived_at else None,
         "note": record.note,
         "marked_by": record.marked_by_id,

@@ -15,6 +15,7 @@ from apps.printing.views.v1.printing_views import (
     job_reconcile_view,
     job_reconciliations_view,
     jobs_collection_view,
+    print_upload_url_view,
     printer_detail_view,
     printers_collection_view,
 )
@@ -29,6 +30,7 @@ urlpatterns = [
     ),
     path("agent/jobs/<int:job_id>/status/", agent_job_status_view, name="printing-agent-status"),
     # Staff: jobs.
+    path("upload-url/", print_upload_url_view, name="printing-upload-url"),
     path("jobs/", jobs_collection_view, name="printing-jobs-list"),
     path(
         "jobs/<int:pk>/reconciliations/",

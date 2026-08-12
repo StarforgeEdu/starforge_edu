@@ -19,11 +19,25 @@ class AttendanceRecord(models.Model):
         LATE = "late", _("Late")
         EXCUSED = "excused", _("Excused")
 
+    class CardType(models.TextChoices):
+        NONE = "", _("No card")
+        SMART = "smart", _("Smart card")
+        WARNING = "warning", _("Warning card")
+
     student = models.ForeignKey(
         "students.StudentProfile", on_delete=models.PROTECT, related_name="attendance_records"
     )
     lesson = models.ForeignKey("schedule.Lesson", on_delete=models.PROTECT, related_name="attendance_records")
     status = models.CharField(max_length=8, choices=Status.choices)
+    # Optional classroom feedback issued with this exact lesson mark. This is
+    # deliberately separate from ``note == "card_scan"``: a door-card scan is
+    # attendance provenance, while smart/warning cards are teacher evidence.
+    card_type = models.CharField(
+        max_length=8,
+        choices=CardType.choices,
+        default=CardType.NONE,
+        blank=True,
+    )
     arrived_at = models.DateTimeField(null=True, blank=True)
     note = models.CharField(max_length=500, blank=True)
     # SET_NULL preserves the historical record if the marking user is deleted;
@@ -40,6 +54,10 @@ class AttendanceRecord(models.Model):
         ordering = ("-created_at",)
         constraints = [
             models.UniqueConstraint(fields=("student", "lesson"), name="attendance_unique_student_lesson"),
+            models.CheckConstraint(
+                condition=models.Q(card_type__in=("", "smart", "warning")),
+                name="attendance_card_type_valid",
+            ),
         ]
         indexes = [
             models.Index(fields=("lesson",)),

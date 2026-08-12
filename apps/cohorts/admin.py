@@ -25,8 +25,17 @@ class CohortTeacherInline(admin.TabularInline):
 
 @admin.register(Cohort)
 class CohortAdmin(admin.ModelAdmin):
-    list_display = ("name", "branch", "department", "is_archived", "start_date", "end_date")
-    list_filter = ("is_archived", "branch")
+    list_display = (
+        "name",
+        "branch",
+        "department",
+        "study_month",
+        "lesson_cycle_length",
+        "is_archived",
+        "start_date",
+        "end_date",
+    )
+    list_filter = ("is_archived", "branch", "study_month", "lesson_cycle_length")
     search_fields = ("name", "level")
     # ``primary_teacher`` is a read-compatible projection of the canonical typed
     # assignments. Hiding it prevents two competing teacher editors in admin;

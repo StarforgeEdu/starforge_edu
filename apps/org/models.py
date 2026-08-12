@@ -22,7 +22,7 @@ from core.validators import validate_iana_timezone
 
 
 def _default_allowed_file_types() -> list[str]:
-    return ["pdf", "mp4", "pptx", "docx", "mp3", "jpg", "jpeg", "png", "webp"]  # D2-E-2
+    return ["pdf", "mp4", "pptx", "docx", "mp3", "m4a", "jpg", "jpeg", "png", "webp"]  # D2-E-2
 
 
 def _default_otp_channel_prefs() -> dict[str, bool]:

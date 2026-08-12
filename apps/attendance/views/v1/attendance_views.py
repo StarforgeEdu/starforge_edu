@@ -10,7 +10,6 @@ entries and upserts them (teacher-scope + correction-window enforced in the serv
 from __future__ import annotations
 
 import csv
-import json
 from typing import Any
 
 from django.http import HttpRequest, HttpResponseBase, StreamingHttpResponse
@@ -21,19 +20,23 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.attendance.dto.attendance_dto import MarkEntryDTO
 from apps.attendance.interfaces.services import IAttendanceService
 from apps.attendance.models import AttendanceRecord
+from apps.attendance.openapi_contracts import MARK_CONTRACT, RECORDS_COLLECTION_CONTRACTS
 from apps.attendance.presenters import record_to_dict
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, ValidationException
-from core.http import int_field, str_field
+from core.http import int_field, read_json_array, reject_unknown_fields, str_field
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.responses import error, paginated, success
 from core.spreadsheets import safe_cell
 
 _RESOURCE = "attendance"
 _VALID_STATUSES = {value for value, _label in AttendanceRecord.Status.choices}
+_VALID_CARD_TYPES = {value for value, _label in AttendanceRecord.CardType.choices}
 MAX_EXPORT_ROWS = 50_000
+MAX_MARK_ENTRIES = 5_000
 
 
 def _service() -> IAttendanceService:
@@ -46,6 +49,10 @@ def _roles(request: HttpRequest) -> set[str]:
 
 
 # --- records (read-only, role-scoped) --------------------------------------
+@openapi_contract(
+    path="/api/v1/attendance/records/",
+    operations=RECORDS_COLLECTION_CONTRACTS,
+)
 @csrf_exempt
 @require_auth
 def records_collection_view(request: HttpRequest) -> HttpResponseBase:
@@ -87,6 +94,10 @@ def record_detail_view(request: HttpRequest, pk: int) -> HttpResponseBase:
 
 
 # --- mark (upsert; teacher-scoped) -----------------------------------------
+@openapi_contract(
+    path="/api/v1/attendance/lessons/{lesson_id}/mark/",
+    operations=(MARK_CONTRACT,),
+)
 @csrf_exempt
 @require_auth
 def mark_view(request: HttpRequest, lesson_id: int) -> HttpResponseBase:
@@ -100,7 +111,7 @@ def mark_view(request: HttpRequest, lesson_id: int) -> HttpResponseBase:
     )
     if lesson is None:
         raise NotFoundException(code="not_found")  # incl. a cross-tenant lesson id
-    entries = _mark_entries(request)
+    entries = _mark_entries(read_json_array(request, allow_empty=True))
     result = _service().mark(lesson=lesson, entries=entries, actor=request.user)
     return success(
         {
@@ -173,8 +184,13 @@ def export_view(request: HttpRequest) -> HttpResponseBase:
 
 
 # --- helpers ---------------------------------------------------------------
-def _mark_entries(request: HttpRequest) -> list[MarkEntryDTO]:
-    raw = _read_json_array(request)
+def _mark_entries(raw: list[Any]) -> list[MarkEntryDTO]:
+    if len(raw) > MAX_MARK_ENTRIES:
+        raise ValidationException(
+            f"Too many attendance entries (max {MAX_MARK_ENTRIES}).",
+            code="validation_error",
+            fields={"entries": [f"At most {MAX_MARK_ENTRIES} entries may be submitted."]},
+        )
     entries: list[MarkEntryDTO] = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
@@ -183,6 +199,10 @@ def _mark_entries(request: HttpRequest) -> list[MarkEntryDTO]:
                 code="validation_error",
                 fields={"entries": [f"Item {index} must be an object."]},
             )
+        reject_unknown_fields(
+            item,
+            allowed={"student", "status", "arrived_at", "note", "card_type"},
+        )
         status_value = str_field(item, "status", max_length=20)
         if status_value not in _VALID_STATUSES:
             raise ValidationException(
@@ -197,25 +217,24 @@ def _mark_entries(request: HttpRequest) -> list[MarkEntryDTO]:
                 status=status_value,
                 arrived_at=_entry_datetime(item, "arrived_at"),
                 note=str_field(item, "note", max_length=500),
+                card_type=_entry_card_type(item),
             )
         )
     return entries
 
 
-def _read_json_array(request: HttpRequest) -> list:
-    """The request body as a JSON array (``[]`` when empty). 400 on invalid JSON or a
-    non-array body — the mark payload is a list of entries, unlike ``read_json``."""
-    if not request.body:
-        return []
-    try:
-        data = json.loads(request.body)
-    except (json.JSONDecodeError, ValueError):
-        raise ValidationException("Request body must be valid JSON.", code="invalid_json") from None
-    if not isinstance(data, list):
+def _entry_card_type(item: dict[str, Any]) -> str | None:
+    """Return None for omission, blank for an explicit clear, or a closed enum."""
+    if "card_type" not in item:
+        return None
+    value = str_field(item, "card_type", max_length=8)
+    if value not in _VALID_CARD_TYPES:
         raise ValidationException(
-            "Request body must be a JSON array of attendance entries.", code="invalid_json"
+            "Invalid attendance card type.",
+            code="validation_error",
+            fields={"card_type": [f"Must be one of: {sorted(_VALID_CARD_TYPES)}."]},
         )
-    return data
+    return value
 
 
 def _entry_datetime(item: dict[str, Any], name: str):

@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from django.db import transaction
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
@@ -24,6 +25,10 @@ from apps.cohorts.dto.cohort_dto import (
     TeacherTypeCreateDTO,
 )
 from apps.cohorts.interfaces.cohort_service import ICohortService
+from apps.cohorts.openapi_contracts import (
+    CYCLE_PROGRESS_GET_CONTRACT,
+    TEACHING_PROGRESS_PATCH_CONTRACT,
+)
 from apps.cohorts.presenters import (
     cohort_teacher_to_dict,
     cohort_to_dict,
@@ -32,11 +37,13 @@ from apps.cohorts.presenters import (
 )
 from core.api_auth import check_perm, require_auth
 from core.container import container
-from core.exceptions import NotFoundException, ValidationException
+from core.exceptions import NotFoundException, PermissionException, ValidationException
 from core.http import bool_field, int_field, read_json, str_field
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
+from core.role_principals import request_role_principal
 from core.scoping import (
     assert_permission_membership_scope,
     is_permission_unscoped,
@@ -65,6 +72,17 @@ def _get_in_scope(request: HttpRequest, pk: int, *, permission: str = "cohorts:r
         department_id=cohort.department_id,
         account_kinds={"staff", "teacher"},
     )
+    if getattr(request, "principal_kind", "") == "teacher":
+        # A teacher's branch membership grants the permission, while the typed
+        # assignment/lesson relationship supplies the natural row boundary.
+        # Never let the compatibility User bridge widen one teacher account to
+        # every cohort in that branch.
+        from apps.cohorts.selectors import taught_cohorts
+
+        if not taught_cohorts(user_id=request.user.pk).filter(pk=cohort.pk).exists():
+            from core.exceptions import PermissionException
+
+            raise PermissionException(code="out_of_scope")
     return cohort
 
 
@@ -227,6 +245,138 @@ def cohort_members_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 @csrf_exempt
 @require_auth
+@openapi_contract(
+    path="/api/v1/cohorts/{pk}/cycle-progress/",
+    operations=(CYCLE_PROGRESS_GET_CONTRACT,),
+)
+def cohort_cycle_progress_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method != "GET":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, f"{_RESOURCE}:read")
+    cohort = _get_in_scope(request, pk, permission=f"{_RESOURCE}:read")
+    from apps.cohorts.progression import cohort_cycle_progress
+
+    return success(cohort_cycle_progress(cohort))
+
+
+@csrf_exempt
+@require_auth
+@openapi_contract(
+    path="/api/v1/cohorts/{pk}/teaching-progress/",
+    operations=(TEACHING_PROGRESS_PATCH_CONTRACT,),
+)
+def cohort_teaching_progress_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Let the exact primary teacher maintain bounded curriculum metadata.
+
+    This does not grant general cohort administration. Assistants and co-teachers
+    remain read-only, and the compatibility User bridge is never accepted as the
+    ownership identity.
+    """
+
+    if request.method != "PATCH":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, "academics:write")
+    principal = request_role_principal(request, allowed_kinds={"teacher"})
+    body = read_json(request)
+    allowed = {"level", "study_month", "lesson_cycle_length"}
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise ValidationException(
+            "Unsupported teaching progress field.",
+            code="validation_error",
+            fields={name: ["This field is not supported."] for name in unknown},
+        )
+    changes: dict[str, Any] = {}
+    if "level" in body:
+        changes["level"] = str_field(body, "level", max_length=64)
+    if "study_month" in body:
+        changes["study_month"] = int_field(
+            body,
+            "study_month",
+            required=True,
+            min_value=1,
+            max_value=600,
+        )
+    if "lesson_cycle_length" in body:
+        cycle_length = int_field(
+            body,
+            "lesson_cycle_length",
+            required=True,
+            min_value=8,
+            max_value=12,
+        )
+        if cycle_length not in (8, 12):
+            raise ValidationException(
+                "Lesson cycle must contain 8 or 12 lessons.",
+                code="validation_error",
+                fields={"lesson_cycle_length": ["Choose 8 or 12 lessons."]},
+            )
+        changes["lesson_cycle_length"] = cycle_length
+    if not changes:
+        raise ValidationException(
+            "Choose at least one teaching progress field.",
+            code="validation_error",
+            fields={"body": ["At least one field is required."]},
+        )
+    with transaction.atomic():
+        from apps.cohorts.models import Cohort
+
+        # Ownership and scope are re-read under the same row lock as the write.
+        # A simultaneous reassignment can therefore never leave the previous
+        # primary teacher authorized against stale data.
+        cohort = Cohort.objects.select_for_update().filter(pk=pk).first()
+        if cohort is None:
+            raise NotFoundException(code="not_found")
+        assert_permission_membership_scope(
+            request,
+            permission="academics:write",
+            branch_id=cohort.branch_id,
+            department_id=cohort.department_id,
+            account_kinds={"teacher"},
+        )
+        if cohort.primary_teacher_id != principal.principal_id:
+            raise PermissionException(code="out_of_scope")
+        before = {
+            "level": cohort.level,
+            "study_month": cohort.study_month,
+            "lesson_cycle_length": cohort.lesson_cycle_length,
+            "branch_id": cohort.branch_id,
+            "department_id": cohort.department_id,
+        }
+        updated = _service().update(cohort, changes)
+        from apps.audit.scopes import scoped_audit_scope
+        from apps.audit.services import audit_log
+
+        audit_log(
+            actor=request.user,
+            actor_principal=principal,
+            action="update",
+            resource_type="cohorts.Cohort",
+            resource_id=updated.pk,
+            before=before,
+            after={
+                "level": updated.level,
+                "study_month": updated.study_month,
+                "lesson_cycle_length": updated.lesson_cycle_length,
+                "branch_id": updated.branch_id,
+                "department_id": updated.department_id,
+            },
+            request=request,
+            scope=scoped_audit_scope(updated.branch_id, updated.department_id),
+        )
+    return success(
+        {
+            "cohort": updated.pk,
+            "level": updated.level,
+            "study_month": updated.study_month,
+            "lesson_cycle_length": updated.lesson_cycle_length,
+            "updated_at": updated.updated_at.isoformat(),
+        }
+    )
+
+
+@csrf_exempt
+@require_auth
 def cohort_teachers_view(request: HttpRequest, pk: int) -> HttpResponse:
     """The cohort's canonical typed teacher roster: GET lists, POST assigns."""
     if request.method == "GET":
@@ -304,6 +454,10 @@ def _list(request: HttpRequest) -> HttpResponse:
                 account_kinds={"staff", "teacher"},
             )
         )
+    if getattr(request, "principal_kind", "") == "teacher":
+        from apps.cohorts.selectors import taught_cohorts
+
+        qs = qs.filter(pk__in=taught_cohorts(user_id=request.user.pk).values("pk"))
     qs = apply_filters(
         request,
         qs,
@@ -334,6 +488,20 @@ def _create(request: HttpRequest) -> HttpResponse:
         end_date=_date(body, "end_date", required=True),  # type: ignore[arg-type]
         department_id=department_id,
         level=str_field(body, "level"),
+        study_month=int_field(
+            body,
+            "study_month",
+            default=1,
+            min_value=1,
+            max_value=600,
+        ),  # type: ignore[arg-type]
+        lesson_cycle_length=int_field(
+            body,
+            "lesson_cycle_length",
+            default=12,
+            min_value=8,
+            max_value=12,
+        ),  # type: ignore[arg-type]
         capacity=int_field(body, "capacity"),
         primary_teacher_id=int_field(body, "primary_teacher"),
         default_room_id=int_field(body, "default_room"),
@@ -357,6 +525,23 @@ def _changes(body: dict[str, Any]) -> dict[str, Any]:
         changes["department"] = int_field(body, "department")
     if "level" in body:
         changes["level"] = str_field(body, "level")
+    if "study_month" in body:
+        changes["study_month"] = int_field(
+            body,
+            "study_month",
+            required=True,
+            min_value=1,
+            max_value=600,
+        )
+    if "lesson_cycle_length" in body:
+        value = int_field(body, "lesson_cycle_length", required=True, min_value=8, max_value=12)
+        if value not in (8, 12):
+            raise ValidationException(
+                "Lesson cycle must contain 8 or 12 lessons.",
+                code="validation_error",
+                fields={"lesson_cycle_length": ["Choose 8 or 12 lessons."]},
+            )
+        changes["lesson_cycle_length"] = value
     if "start_date" in body:
         changes["start_date"] = _date(body, "start_date", required=True)
     if "end_date" in body:

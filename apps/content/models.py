@@ -145,6 +145,10 @@ class LessonFile(models.Model):
         CLEAN = "clean", _("Clean")
         REJECTED = "rejected", _("Rejected")
 
+    class SubmissionAudience(models.TextChoices):
+        OWN_STUDENTS = "own_students", _("Own students")
+        GLOBAL = "global", _("Everyone in the center")
+
     lesson = models.ForeignKey(
         ContentLesson, on_delete=models.CASCADE, null=True, blank=True, related_name="files"
     )
@@ -164,6 +168,21 @@ class LessonFile(models.Model):
     download_count = models.PositiveIntegerField(default=0)
     uploaded_by = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    # Explicit mobile teacher submissions retain their role-native identity.
+    # uploaded_by is a compatibility User bridge and may also back a staff
+    # account, so it is not sufficient evidence for the global-draft owner path.
+    submitted_by_teacher = models.ForeignKey(
+        "teachers.TeacherProfile",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="content_submissions",
+    )
+    submission_audience = models.CharField(
+        max_length=16,
+        choices=SubmissionAudience.choices,
+        blank=True,
     )
 
     # F4-5 dual publication approval. A CLEAN file is published to learners only
@@ -192,14 +211,31 @@ class LessonFile(models.Model):
         ordering = ("-created_at",)
         constraints = [
             models.CheckConstraint(
-                condition=Q(lesson__isnull=False) | Q(folder__isnull=False),
+                condition=(
+                    Q(lesson__isnull=False, folder__isnull=True)
+                    | Q(lesson__isnull=True, folder__isnull=False)
+                ),
                 name="lessonfile_lesson_or_folder",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(submission_audience="", submitted_by_teacher__isnull=True)
+                    | Q(
+                        submission_audience__in=("own_students", "global"),
+                        submitted_by_teacher__isnull=False,
+                    )
+                ),
+                name="content_file_submission_audience_shape",
             ),
         ]
         indexes = [
             models.Index(fields=("status",)),
             models.Index(fields=("folder",)),
             models.Index(fields=("lesson",)),
+            models.Index(
+                fields=("submitted_by_teacher", "submission_audience"),
+                name="content_teacher_audience_idx",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover

@@ -78,6 +78,7 @@ _RECEIPT_SCHEMA_RE = re.compile(r"\A[A-Za-z0-9_-]{1,63}\Z")
 _PAYMENT_AMOUNT_MAX_EXCLUSIVE = Decimal("10000000000000000")
 _PAYME_STATEMENT_MAX_ROWS = 10_000
 _WEBHOOK_PROCESSING_LEASE = timedelta(minutes=5)
+_HEADERLESS_CASH_DEDUPE_WINDOW = timedelta(seconds=60)
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +435,11 @@ def create_cash_payment(
     ``Payment.cashier_shift`` — without it the cashier-shift reconciliation report
     always read zero cash). Drives the normal completion chokepoint so the payment
     fiscalizes + auto-allocates against the invoice exactly like a provider
-    payment. Idempotent on ``idempotency_key`` (defaults to a stable per-(schema,
-    invoice, shift) key so a double-submit at the drawer does not double-charge).
+    payment. Idempotent on ``idempotency_key``. Headerless requests with an explicit
+    amount use an exact-intent sliding 60-second window; the invoice row lock makes
+    that fallback safe across time-bucket boundaries and concurrent double-clicks.
+    A direct no-amount service call retains the stable per-(schema, invoice, shift)
+    key because its intent is specifically "pay the current remaining balance".
 
     The invoice row is the lock for its allocation balance.  Every supported
     allocation path uses the same lock, so two cashiers cannot both validate
@@ -481,10 +485,11 @@ def create_cash_payment(
             code="cashier_branch_mismatch",
         )
 
+    # Preserve the direct service contract for an unspecified amount: the intent is
+    # "pay this invoice's remaining balance", so a retry in the same shift must resolve
+    # before the now-reduced balance is validated below.
     key = idempotency_key or stable_hash(f"cash:{current_schema()}:{invoice_id}:{shift.pk}")
-    # The service-level fallback key is derived only after the shift is known.
-    # A direct service retry without an explicit key must coalesce as well.
-    if not idempotency_key:
+    if not idempotency_key and amount_uzs is None:
         existing = Payment.objects.select_related("cashier_shift").filter(idempotency_key=key).first()
         if existing is not None:
             return _cash_idempotent_retry(
@@ -495,12 +500,53 @@ def create_cash_payment(
                 invoice_scope=invoice_scope,
             )
 
+    requested_amount = Decimal(amount_uzs).quantize(Decimal("0.01")) if amount_uzs is not None else None
+    if requested_amount is not None and requested_amount <= Decimal("0"):
+        raise ValidationException(_("Cash amount must be positive."), fields={"amount_uzs": ["invalid"]})
+
+    if not idempotency_key and requested_amount is not None:
+        # Resolve a retry before inspecting the now-reduced invoice balance or paid
+        # status. Otherwise an exact full-balance retry would be rejected instead of
+        # returning the original receipt.
+        #
+        # A rolling interval is deliberately used instead of a clock bucket: adjacent
+        # requests at xx:59.999 and xy:00.001 are still the same accidental retry.
+        # The invoice lock serializes cooperating writers, so a concurrent second
+        # request sees the first committed payment before deciding whether to create.
+        now = timezone.now()
+        recent = (
+            Payment.objects.select_related("cashier_shift")
+            .filter(
+                provider=Payment.Method.CASH,
+                cashier_shift=shift,
+                amount_uzs=requested_amount,
+                metadata__invoice_id=invoice.pk,
+                created_at__gte=now - _HEADERLESS_CASH_DEDUPE_WINDOW,
+                created_at__lte=now,
+            )
+            .order_by("-created_at", "-pk")
+            .first()
+        )
+        if recent is not None:
+            return _cash_idempotent_retry(
+                recent,
+                invoice_id=invoice.pk,
+                cashier_id=cashier.pk,
+                amount_uzs=requested_amount,
+                invoice_scope=invoice_scope,
+            )
+        # The rolling lookup supplies retry semantics. This per-attempt key only
+        # needs to be unique and auditable for the new row.
+        key = stable_hash(
+            f"cash:{current_schema()}:{invoice_id}:{shift.pk}:{cashier.pk}:{requested_amount}:{now.isoformat()}"
+        )
+
     # Reading allocations while holding the invoice lock observes the latest
     # committed balance and prevents any cooperating allocation writer from
     # changing it until this receipt has been completed and allocated.
     allocated = sum(invoice.allocations.values_list("amount_uzs", flat=True), Decimal("0"))
     outstanding = max((invoice.total_uzs - allocated).quantize(Decimal("0.01")), Decimal("0.00"))
-    amount = Decimal(amount_uzs).quantize(Decimal("0.01")) if amount_uzs is not None else outstanding
+    amount = requested_amount if requested_amount is not None else outstanding
     if amount <= Decimal("0"):
         raise ValidationException(_("Cash amount must be positive."), fields={"amount_uzs": ["invalid"]})
     if amount > outstanding:

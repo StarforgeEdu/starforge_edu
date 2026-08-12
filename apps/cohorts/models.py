@@ -9,6 +9,10 @@ from django.utils.translation import gettext_lazy as _
 
 
 class Cohort(models.Model):
+    class LessonCycleLength(models.IntegerChoices):
+        EIGHT = 8, _("8 lessons")
+        TWELVE = 12, _("12 lessons")
+
     name = models.CharField(max_length=120)
     branch = models.ForeignKey("org.Branch", on_delete=models.PROTECT, related_name="cohorts")
     department = models.ForeignKey(
@@ -19,6 +23,17 @@ class Cohort(models.Model):
         related_name="cohorts",
     )
     level = models.CharField(max_length=64, blank=True)
+    # Human-readable position in the centre's curriculum. This is deliberately
+    # explicit rather than guessed from dates: imported cohorts and holiday gaps
+    # make calendar-month arithmetic untrustworthy.
+    study_month = models.PositiveSmallIntegerField(default=1)
+    # A cycle is an operational teaching cadence, not a level catalogue.  The
+    # final slot is exposed as an exam-day signal; changing this value never
+    # mutates the free-text ``level`` field.
+    lesson_cycle_length = models.PositiveSmallIntegerField(
+        choices=LessonCycleLength.choices,
+        default=LessonCycleLength.TWELVE,
+    )
     start_date = models.DateField()
     end_date = models.DateField()
     capacity = models.PositiveSmallIntegerField(null=True, blank=True)
@@ -40,6 +55,16 @@ class Cohort(models.Model):
     class Meta:
         unique_together = (("branch", "name"),)
         ordering = ("-created_at",)
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(study_month__gte=1, study_month__lte=600),
+                name="cohort_study_month_supported",
+            ),
+            models.CheckConstraint(
+                condition=Q(lesson_cycle_length__in=(8, 12)),
+                name="cohort_lesson_cycle_length_supported",
+            ),
+        ]
 
     def __str__(self) -> str:  # pragma: no cover
         return self.name

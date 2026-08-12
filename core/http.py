@@ -28,6 +28,35 @@ def read_json(request: HttpRequest) -> dict[str, Any]:
     return data
 
 
+def read_json_array(request: HttpRequest, *, allow_empty: bool = False) -> list[Any]:
+    """Parse a top-level JSON array for bounded bulk operations.
+
+    Object DTOs use :func:`read_json`; attendance and assessment batches are
+    intentionally arrays. Keeping both parsers in this module lets OpenAPI's
+    executable-contract check prove that a declared JSON body is really parsed.
+    """
+    if not request.body:
+        if allow_empty:
+            return []
+        raise ValidationException(
+            _("Request body must be a JSON array."),
+            code="invalid_json",
+        )
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        raise ValidationException(
+            _("Request body must be valid JSON."),
+            code="invalid_json",
+        ) from None
+    if not isinstance(data, list):
+        raise ValidationException(
+            _("Request body must be a JSON array."),
+            code="invalid_json",
+        )
+    return data
+
+
 def reject_unknown_fields(
     data: dict[str, Any],
     *,

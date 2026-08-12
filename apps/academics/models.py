@@ -126,6 +126,10 @@ class ExamResult(models.Model):
     )
     score = models.DecimalField(max_digits=6, decimal_places=2)
     note = models.CharField(max_length=255, blank=True)
+    # Optional authoritative skill breakdown entered by the grader. Values are
+    # normalized and bounded at every write boundary; an empty list means that
+    # this assessment has only an overall score (never infer components).
+    components = models.JSONField(default=list, blank=True)
     graded_by = models.ForeignKey(
         "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )

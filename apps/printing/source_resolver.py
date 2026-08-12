@@ -29,6 +29,15 @@ SOURCE_READ_PERMISSIONS: dict[str, str] = {
     PrintJob.Source.TRANSCRIPT: "academics:read",
     PrintJob.Source.REPORT: "reports:read",
     PrintJob.Source.RECEIPT: "finance:read",
+    PrintJob.Source.CONTENT: "content:read",
+    PrintJob.Source.UPLOAD: "printing:write",
+}
+
+_PRINTABLE_CONTENT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
 }
 
 
@@ -39,8 +48,10 @@ class ResolvedPrintSource:
     source: str
     source_id: int
     payload_s3_key: str
-    branch_id: int
+    branch_id: int | None
     cohort_id: int | None = None
+    content_type: str | None = None
+    size_bytes: int | None = None
 
 
 def source_read_permission(source: str) -> str:
@@ -86,6 +97,14 @@ def resolve_print_source(
         return _resolve_report(request=request, source_id=source_id)
     if source == PrintJob.Source.RECEIPT:
         return _resolve_receipt(request=request, source_id=source_id)
+    if source == PrintJob.Source.CONTENT:
+        return _resolve_content_file(request=request, source_id=source_id)
+    if source == PrintJob.Source.UPLOAD:
+        raise ValidationException(
+            _("Uploaded print files must use an owned upload grant."),
+            code="invalid_print_upload",
+            fields={"source_id": ["Use the grant id returned by the print upload endpoint."]},
+        )
     source_read_permission(source)  # raises the canonical invalid-source response
     raise AssertionError("unreachable")  # pragma: no cover
 
@@ -226,6 +245,68 @@ def _resolve_receipt(*, request: Any, source_id: int) -> ResolvedPrintSource:
     )
 
 
+def _content_library(file):
+    if file.folder_id is not None:
+        return file.folder.library
+    if file.lesson_id is not None:
+        return file.lesson.module.course.library
+    return None
+
+
+def _content_library_branch(library) -> int | None:
+    from apps.content.models import ContentLibrary
+
+    if library.visibility == ContentLibrary.Visibility.DEPARTMENT and library.department_id:
+        return library.department.branch_id
+    if library.visibility == ContentLibrary.Visibility.COHORT and library.cohort_id:
+        return library.cohort.branch_id
+    return None
+
+
+def _resolve_content_file(*, request: Any, source_id: int) -> ResolvedPrintSource:
+    from apps.content.models import LessonFile
+    from apps.content.selectors import scoped_files
+    from apps.content.storage_keys import trusted_primary_key
+    from apps.printing.document_inspection import MAX_PRINT_DOCUMENT_BYTES
+
+    file = (
+        scoped_files(user=request.user, roles=get_user_roles(request), permission="content:read")
+        .select_related(
+            "folder__library__department",
+            "folder__library__cohort",
+            "lesson__module__course__library__department",
+            "lesson__module__course__library__cohort",
+        )
+        .filter(pk=source_id)
+        .first()
+    )
+    if file is None:
+        _not_found()
+    if (
+        file.status != LessonFile.Status.CLEAN
+        or not file.is_downloadable
+        or file.content_type not in _PRINTABLE_CONTENT_TYPES
+        or file.size_bytes < 1
+        or file.size_bytes > MAX_PRINT_DOCUMENT_BYTES
+    ):
+        _not_ready("The selected library file is not available for printing.")
+    key = trusted_primary_key(file, schema=current_schema())
+    if key is None:
+        _not_ready("The selected library file has an invalid storage reference.")
+    library = _content_library(file)
+    if library is None:
+        _not_ready("The selected library file has no content location.")
+    return ResolvedPrintSource(
+        source=PrintJob.Source.CONTENT,
+        source_id=file.pk,
+        payload_s3_key=key,
+        branch_id=_content_library_branch(library),
+        cohort_id=library.cohort_id,
+        content_type=file.content_type,
+        size_bytes=file.size_bytes,
+    )
+
+
 def is_print_job_source_valid(job: PrintJob) -> bool:
     """Fail closed unless a claimed job still matches its authoritative source.
 
@@ -315,6 +396,58 @@ def is_print_job_source_valid(job: PrintJob) -> bool:
             and payment.branch_at_payment_id == job.branch_id
             and receipt.pdf_key == expected_key
             and job.payload_s3_key == expected_key
+            and job.cohort_id is None
+        )
+
+    if job.source == PrintJob.Source.CONTENT:
+        from apps.content.models import LessonFile
+        from apps.content.storage_keys import trusted_primary_key
+
+        file = (
+            LessonFile.objects.select_related(None)
+            .select_related(
+                "folder__library__department",
+                "folder__library__cohort",
+                "lesson__module__course__library__department",
+                "lesson__module__course__library__cohort",
+            )
+            .select_for_update()
+            .filter(pk=job.source_id)
+            .first()
+        )
+        if file is None:
+            return False
+        library = _content_library(file)
+        authoritative_branch = _content_library_branch(library) if library is not None else None
+        expected_content_key = trusted_primary_key(file, schema=current_schema())
+        expected_cohort = library.cohort_id if library is not None else None
+        return bool(
+            file.status == LessonFile.Status.CLEAN
+            and file.is_downloadable
+            and file.content_type in _PRINTABLE_CONTENT_TYPES
+            and expected_content_key is not None
+            and job.payload_s3_key == expected_content_key
+            and (authoritative_branch is None or authoritative_branch == job.branch_id)
+            and expected_cohort == job.cohort_id
+        )
+
+    if job.source == PrintJob.Source.UPLOAD:
+        from apps.printing.models import PrintUploadGrant
+        from apps.printing.storage_keys import parse_final_print_document_key
+
+        grant = PrintUploadGrant.objects.select_for_update().filter(pk=job.source_id).first()
+        if grant is None:
+            return False
+        parsed = parse_final_print_document_key(grant.durable_key, schema=current_schema())
+        return bool(
+            grant.consumed_at is not None
+            and grant.durable_deleted_at is None
+            and grant.branch_id == job.branch_id
+            and grant.requested_by_id == job.requested_by_id
+            and grant.durable_key == job.payload_s3_key
+            and parsed is not None
+            and parsed.grant_id == grant.pk
+            and parsed.filename == grant.filename
             and job.cohort_id is None
         )
 

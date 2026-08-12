@@ -13,7 +13,11 @@ from apps.org.views.v1.branch_views import (
 )
 from apps.org.views.v1.department_views import department_detail_view, departments_collection_view
 from apps.org.views.v1.room_views import room_detail_view, rooms_collection_view
-from apps.org.views.v1.settings_views import settings_view, system_availability_view
+from apps.org.views.v1.settings_views import (
+    settings_view,
+    staff_app_status_view,
+    system_availability_view,
+)
 from apps.org.views.v1.staff_views import (
     staff_collection_view,
     staff_credentials_view,
@@ -26,6 +30,7 @@ urlpatterns = [
     path("staff/<int:pk>/", staff_detail_view, name="staff-detail"),
     path("staff/<int:pk>/credentials/", staff_credentials_view, name="staff-credentials"),
     path("settings/", settings_view, name="center-settings"),
+    path("app-status/", staff_app_status_view, name="staff-app-status"),
     # Fault-isolation control: app availability status + per-center on/off toggles.
     path("system/apps/", system_availability_view, name="system-app-availability"),
     # branches (+ working-hours / holidays sub-resources)

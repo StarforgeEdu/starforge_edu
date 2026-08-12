@@ -12,7 +12,6 @@ from typing import Any
 
 from django.db.models import Q, QuerySet
 from django.http import HttpRequest, HttpResponse
-from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.payments.interfaces.services import IPaymentService, IProviderConfigService
@@ -50,10 +49,6 @@ from infrastructure.storage.s3_client import presign_download
 
 _PROVIDERS = set(Provider.values)
 _CHECKOUT_PROVIDERS = {"click", "payme"}
-# Idempotency window (seconds) for a headerless cash payment: a resubmit within this
-# window coalesces; a genuine repeat outside it records separately. The client
-# Idempotency-Key header is the precise dedupe; this is only the no-header fallback.
-_CASH_IDEMPOTENCY_WINDOW_S = 60
 # ProviderConfig string fields (write-only credentials + merchant ids), each with its
 # model max_length. Accepted on create/update but never echoed by the read presenter.
 _CONFIG_STR_FIELDS = {
@@ -381,20 +376,11 @@ def payment_cash_view(request: HttpRequest) -> HttpResponse:
     invoice = _int(_require(data, "invoice"), "invoice")
     _assert_invoice_scope(request, [invoice], permission="payments:write")
     amount_uzs = decimal_field(data, "amount_uzs", max_digits=18, decimal_places=2)
-    # Cash idempotency (the correct contract is a client-supplied Idempotency-Key per POS
-    # action — see the flagged follow-up). WITHOUT a header we fall back to an idempotency
-    # TIME WINDOW: key on (invoice, cashier, amount, 60s bucket). This is the standard way
-    # to distinguish an accidental resubmit from a genuine repeat WITHOUT a client key —
-    # the two prior attempts each failed one side: a fully-unique key double-credited a
-    # double-click; a bucketless amount key silently swallowed legitimate equal-amount
-    # installments taken minutes/days apart. With a window, a double-click/retry (same
-    # second) coalesces while installments (different windows) each record. Residuals
-    # (double-click straddling the boundary; two equal payments within one 60s window) are
-    # pathological and are what the client Idempotency-Key exists to eliminate precisely.
-    bucket = int(timezone.now().timestamp()) // _CASH_IDEMPOTENCY_WINDOW_S
-    idem = request.headers.get("Idempotency-Key") or stable_hash(
-        f"cash:{current_schema()}:{invoice}:{request.user.pk}:{amount_uzs}:{bucket}"
-    )
+    # A client key is the authoritative operation identity. Without one, the cash
+    # service applies a transactionally locked sliding dedupe window to the exact
+    # invoice/cashier/amount intent. Keeping that fallback inside the invoice lock
+    # avoids both double credits at minute boundaries and concurrent double-clicks.
+    idem = request.headers.get("Idempotency-Key")
     payment = _payment_service().cash(
         invoice_id=invoice, cashier=request.user, amount_uzs=amount_uzs, idempotency_key=idem
     )

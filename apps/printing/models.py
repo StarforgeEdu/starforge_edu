@@ -69,6 +69,58 @@ class BranchAgent(models.Model):
         return self.revoked_at is not None
 
 
+class PrintUploadGrant(models.Model):
+    """Single-use, owner- and branch-bound staging grant for an ad-hoc print file.
+
+    The signed upload key is never accepted back as authority.  A print request
+    references this row by id; the service locks it, verifies the object against
+    its immutable size/type contract, and promotes it to a record-bound key before
+    a branch agent can receive a download capability.
+    """
+
+    branch = models.ForeignKey(
+        "org.Branch",
+        on_delete=models.CASCADE,
+        related_name="print_upload_grants",
+    )
+    requested_by = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    key = models.CharField(max_length=512, unique=True)
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=127)
+    expected_size_bytes = models.PositiveBigIntegerField()
+    actual_size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
+    page_count = models.PositiveIntegerField(null=True, blank=True)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    source_deleted_at = models.DateTimeField(null=True, blank=True)
+    durable_key = models.CharField(max_length=512, null=True, blank=True, unique=True)
+    deletion_requested_at = models.DateTimeField(null=True, blank=True)
+    durable_deleted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=("requested_by", "consumed_at", "expires_at"),
+                name="print_upload_owner_idx",
+            ),
+            models.Index(
+                fields=("source_deleted_at", "expires_at"),
+                name="print_upload_source_idx",
+            ),
+            models.Index(
+                fields=("durable_deleted_at", "deletion_requested_at"),
+                name="print_upload_delete_idx",
+            ),
+        ]
+
+
 class PrintJob(models.Model):
     """One document to print, pulled by a branch agent. Pull-based, never pushed."""
 
@@ -90,10 +142,22 @@ class PrintJob(models.Model):
         TRANSCRIPT = "transcript", _("Transcript")
         REPORT = "report", _("Report")
         RECEIPT = "receipt", _("Receipt")
+        CONTENT = "content", _("Library content")
+        UPLOAD = "upload", _("Uploaded file")
 
     branch = models.ForeignKey("org.Branch", on_delete=models.CASCADE, related_name="print_jobs")
     printer = models.ForeignKey(
         Printer, on_delete=models.SET_NULL, null=True, blank=True, related_name="print_jobs"
+    )
+    # The immutable routing preference selected by staff. ``printer`` records the
+    # device used by the current physical attempt and may be cleared/reassigned
+    # for unpinned legacy jobs after a safe zero-output retry.
+    preferred_printer = models.ForeignKey(
+        Printer,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="requested_print_jobs",
     )
     agent = models.ForeignKey(
         BranchAgent, on_delete=models.SET_NULL, null=True, blank=True, related_name="print_jobs"
@@ -116,6 +180,7 @@ class PrintJob(models.Model):
     )
     attempts = models.PositiveSmallIntegerField(_("attempts"), default=0)
     next_attempt_at = models.DateTimeField(_("next attempt at"), null=True, blank=True, db_index=True)
+    scheduled_for = models.DateTimeField(_("scheduled for"), null=True, blank=True, db_index=True)
     pages_printed = models.PositiveIntegerField(_("pages printed"), default=0)
     last_error = models.TextField(_("last error"), blank=True)
 

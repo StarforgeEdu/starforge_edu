@@ -23,18 +23,38 @@ from __future__ import annotations
 import secrets
 import unicodedata
 import uuid
+from contextlib import suppress
 from datetime import timedelta
 from typing import Any
 
+from botocore.exceptions import BotoCoreError
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from apps.printing.models import BranchAgent, Printer, PrintJob, PrintJobReconciliation
+from apps.printing.models import (
+    BranchAgent,
+    Printer,
+    PrintJob,
+    PrintJobReconciliation,
+    PrintUploadGrant,
+)
 from apps.printing.signals import print_job_created, print_job_failed
-from core.exceptions import ConflictException, UnprocessableEntity, ValidationException
+from apps.printing.storage_keys import (
+    final_print_document_key,
+    parse_final_print_document_key,
+    parse_pending_print_upload_key,
+    pending_print_upload_key,
+)
+from core.exceptions import (
+    ConflictException,
+    ServiceUnavailableException,
+    UnprocessableEntity,
+    ValidationException,
+)
 from core.utils import current_schema, stable_hash
 
 # Open statuses: a job is still "in the queue" until it reaches done/failed.
@@ -70,7 +90,63 @@ RETRY_BACKOFF_SECONDS = 60
 # Raw agent token length in bytes (hex-encoded -> 2x chars).
 AGENT_TOKEN_BYTES = 32
 
+PRINT_UPLOAD_GRANT_SECONDS = 600
+MAX_ACTIVE_PRINT_UPLOAD_GRANTS = 10
+MAX_PRINT_COPIES = 100
+MAX_SCHEDULE_DAYS = 365
+_PRINTABLE_UPLOAD_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
 _RECONCILIATION_OUTCOMES = set(PrintJobReconciliation.Outcome.values)
+
+
+def authoritative_print_pages(
+    *,
+    key: str,
+    content_type: str,
+    size_bytes: int,
+    requested_pages: int | None,
+) -> int:
+    """Derive physical pages server-side and reject a conflicting client hint."""
+
+    from apps.printing.document_inspection import (
+        PrintDocumentInspectionError,
+        PrintDocumentInspectionUnavailable,
+        authoritative_page_count,
+    )
+
+    try:
+        pages = authoritative_page_count(
+            key=key,
+            content_type=content_type,
+            expected_size_bytes=size_bytes,
+        )
+    except PrintDocumentInspectionError as exc:
+        raise UnprocessableEntity(
+            _("The document could not be safely inspected for printing."),
+            code="print_document_invalid",
+            fields={"source_id": [_("Use a valid, unencrypted PDF or supported image.")]},
+        ) from exc
+    except PrintDocumentInspectionUnavailable as exc:
+        raise ServiceUnavailableException(
+            _("Document inspection is temporarily unavailable."),
+            code="print_document_inspection_unavailable",
+        ) from exc
+    if requested_pages is not None and requested_pages != pages:
+        raise ValidationException(
+            _("The page count does not match the selected document."),
+            code="page_count_mismatch",
+            fields={
+                "pages": [
+                    _("This document has %(pages)s pages. Omit pages or use that value.") % {"pages": pages}
+                ]
+            },
+        )
+    return pages
 
 
 def print_agent_lease_seconds() -> int:
@@ -142,6 +218,332 @@ def _lock_active_agent(agent: BranchAgent) -> BranchAgent:
 
 
 # --------------------------------------------------------------------------- #
+# Staff ad-hoc upload grants
+# --------------------------------------------------------------------------- #
+@transaction.atomic
+def request_print_upload(
+    *,
+    branch_id: int,
+    filename: str,
+    content_type: str,
+    size_bytes: int,
+    requested_by: Any,
+) -> dict[str, Any]:
+    """Issue an exact-size, owner/branch-bound POST policy for one print file."""
+
+    from apps.org.models import Branch
+    from apps.org.selectors import get_center_settings
+    from apps.printing.document_inspection import MAX_PRINT_DOCUMENT_BYTES
+    from core.attachment_storage import allowed_attachment_mime_types
+    from core.storage_keys import normalized_storage_filename
+    from infrastructure.storage.s3_client import presign_post_upload
+
+    if getattr(requested_by, "pk", None) is None:
+        raise ValidationException(_("An authenticated account is required."), code="validation_error")
+    if Branch.objects.filter(pk=branch_id).only("pk").first() is None:
+        raise ValidationException(
+            _("Unknown branch."),
+            code="validation_error",
+            fields={"branch": [_("Choose an existing branch.")]},
+        )
+    safe_filename = normalized_storage_filename(filename)
+    if safe_filename is None:
+        raise UnprocessableEntity(
+            _("That filename is not allowed."),
+            code="invalid_filename",
+            fields={"filename": [_("Provide one safe filename of at most 255 UTF-8 bytes.")]},
+        )
+    filename = safe_filename
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 1:
+        raise UnprocessableEntity(
+            _("The file size is invalid."),
+            code="invalid_file_size",
+            fields={"size_bytes": [_("File size must be a positive integer.")]},
+        )
+    content_type = content_type.partition(";")[0].strip().lower()
+    expected_types = allowed_attachment_mime_types(filename)
+    if (
+        not expected_types
+        or content_type not in expected_types
+        or content_type not in _PRINTABLE_UPLOAD_TYPES
+    ):
+        raise UnprocessableEntity(
+            _("That file type cannot be printed."),
+            code="file_type_not_printable",
+            fields={
+                "content_type": [_("Upload a PDF, JPEG, PNG, or WebP file whose type matches its filename.")]
+            },
+        )
+    center_settings = get_center_settings()
+    allowed_extensions = {
+        str(extension).lower().lstrip(".")
+        for extension in center_settings.allowed_file_types
+        if isinstance(extension, str)
+    }
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in allowed_extensions:
+        raise UnprocessableEntity(
+            _("That file type is not allowed by this center."),
+            code="file_type_not_allowed",
+            fields={"filename": [_("Choose an allowed printable file type.")]},
+        )
+    if size_bytes > center_settings.max_upload_mb * 1024 * 1024:
+        raise UnprocessableEntity(
+            _("That file is too large."),
+            code="file_too_large",
+            fields={"size_bytes": [_("The upload exceeds this center's configured size limit.")]},
+        )
+    if size_bytes > MAX_PRINT_DOCUMENT_BYTES:
+        raise UnprocessableEntity(
+            _("That document is too large to inspect safely for printing."),
+            code="print_document_too_large",
+            fields={"size_bytes": [_("Print files must be 50 MB or smaller.")]},
+        )
+
+    requested_by.__class__.objects.select_for_update().get(pk=requested_by.pk)
+    now = timezone.now()
+    active_count = PrintUploadGrant.objects.filter(
+        requested_by=requested_by,
+        consumed_at__isnull=True,
+        expires_at__gt=now,
+    ).count()
+    if active_count >= MAX_ACTIVE_PRINT_UPLOAD_GRANTS:
+        raise UnprocessableEntity(
+            _("Too many print uploads are waiting."),
+            code="upload_grant_limit",
+            fields={"filename": [_("Use or let an earlier upload expire before requesting another.")]},
+        )
+
+    expires_at = now + timedelta(seconds=PRINT_UPLOAD_GRANT_SECONDS)
+    key = pending_print_upload_key(
+        schema=current_schema(),
+        owner_id=requested_by.pk,
+        upload_id=uuid.uuid4().hex,
+        filename=filename,
+    )
+    grant = PrintUploadGrant.objects.create(
+        branch_id=branch_id,
+        requested_by=requested_by,
+        key=key,
+        filename=filename,
+        content_type=content_type,
+        expected_size_bytes=size_bytes,
+        expires_at=expires_at,
+    )
+    try:
+        post = presign_post_upload(
+            key,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            expires_in=PRINT_UPLOAD_GRANT_SECONDS,
+        )
+    except (BotoCoreError, ImproperlyConfigured, KeyError, ValueError) as exc:
+        raise ServiceUnavailableException(
+            _("Print uploads are temporarily unavailable."),
+            code="print_upload_unavailable",
+        ) from exc
+    return {
+        "grant_id": grant.pk,
+        "url": post["url"],
+        "fields": post["fields"],
+        "method": "POST",
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+def _print_upload_object_error(reason: str) -> UnprocessableEntity:
+    messages = {
+        "missing": _("Upload the file before submitting the print job."),
+        "size": _("The stored file size does not match the upload request."),
+        "content_type": _("The stored file type does not match the upload request."),
+        "content": _("The uploaded bytes do not match the declared printable file type."),
+    }
+    codes = {
+        "missing": "print_upload_missing",
+        "size": "print_upload_size_mismatch",
+        "content_type": "print_upload_type_mismatch",
+        "content": "print_upload_content_mismatch",
+    }
+    return UnprocessableEntity(
+        messages.get(reason, _("The uploaded print file is invalid.")),
+        code=codes.get(reason, "print_upload_invalid"),
+        fields={"source_id": [_("Request a new upload and try again.")]},
+    )
+
+
+def _enqueue_print_upload_source_cleanup(grant_id: int) -> None:
+    schema = current_schema()
+
+    def enqueue() -> None:
+        from celery_tasks.attachment_tasks import cleanup_consumed_upload_sources_for_schema
+
+        cleanup_consumed_upload_sources_for_schema.delay(
+            "printing",
+            [grant_id],
+            _schema_name=schema,
+        )
+
+    transaction.on_commit(enqueue, robust=True)
+
+
+@transaction.atomic
+def enqueue_uploaded_print(
+    *,
+    grant_id: int,
+    requested_by: Any,
+    pages: int | None,
+    copies: int = 1,
+    color: bool = False,
+    duplex: bool = False,
+    preferred_printer_id: int,
+    scheduled_for: Any = None,
+) -> PrintJob:
+    """Consume one owned upload grant and atomically enqueue its durable copy.
+
+    Exact retries remain safe after consumption: the canonical grant-bound key
+    and the open print job are reused only when every physical option matches.
+    """
+
+    from core.attachment_storage import AttachmentObjectError, promote_attachment_object
+    from infrastructure.storage.s3_client import delete_object
+
+    grant = (
+        PrintUploadGrant.objects.select_for_update().filter(pk=grant_id, requested_by=requested_by).first()
+    )
+    if grant is None:
+        from core.exceptions import NotFoundException
+
+        raise NotFoundException(_("Print upload not found."), code="not_found")
+    parsed_source = parse_pending_print_upload_key(grant.key, schema=current_schema())
+    if (
+        parsed_source is None
+        or parsed_source.owner_id != getattr(requested_by, "pk", None)
+        or parsed_source.filename != grant.filename
+    ):
+        raise UnprocessableEntity(_("The print upload reference is invalid."), code="invalid_print_upload")
+
+    durable_key = final_print_document_key(
+        schema=current_schema(),
+        grant_id=grant.pk,
+        filename=grant.filename,
+    )
+    promoted_now = False
+    if grant.consumed_at is None:
+        if grant.expires_at <= timezone.now():
+            raise UnprocessableEntity(
+                _("The print upload has expired."),
+                code="print_upload_expired",
+                fields={"source_id": [_("Request a new upload URL.")]},
+            )
+        try:
+            verified = promote_attachment_object(
+                source_key=grant.key,
+                destination_key=durable_key,
+                filename=grant.filename,
+                expected_size_bytes=grant.expected_size_bytes,
+                expected_content_type=grant.content_type,
+            )
+        except AttachmentObjectError as exc:
+            raise _print_upload_object_error(exc.reason) from exc
+        except (BotoCoreError, ImproperlyConfigured, OSError) as exc:
+            raise ServiceUnavailableException(
+                _("The uploaded print file could not be verified right now."),
+                code="print_upload_verification_unavailable",
+            ) from exc
+        # Promotion has already created the durable object. Inspection is still
+        # part of consumption, so compensate it if authoritative page counting
+        # fails before the grant/job transaction can commit.
+        promoted_now = True
+        grant.actual_size_bytes = verified.size_bytes
+        try:
+            authoritative_pages = authoritative_print_pages(
+                key=durable_key,
+                content_type=grant.content_type,
+                size_bytes=verified.size_bytes,
+                requested_pages=pages,
+            )
+        except Exception:
+            with suppress(Exception):
+                delete_object(durable_key)
+            raise
+        grant.consumed_at = timezone.now()
+        grant.durable_key = durable_key
+        grant.page_count = authoritative_pages
+        grant.save(update_fields=["actual_size_bytes", "page_count", "consumed_at", "durable_key"])
+    else:
+        parsed_durable = parse_final_print_document_key(grant.durable_key, schema=current_schema())
+        if (
+            parsed_durable is None
+            or parsed_durable.grant_id != grant.pk
+            or parsed_durable.filename != grant.filename
+            or grant.durable_key != durable_key
+            or grant.durable_deleted_at is not None
+        ):
+            raise ConflictException(
+                _("This print upload is no longer available."),
+                code="print_upload_unavailable",
+            )
+        # A grant is a single physical-print submission, not a reusable object
+        # capability.  Only an exact retry of its still-open job may proceed.
+        # Without this guard a caller could create a second job in the short
+        # interval between the first job becoming terminal and asynchronous
+        # deletion of the durable object.
+        if (
+            grant.deletion_requested_at is not None
+            or _existing_open_job(
+                branch_id=grant.branch_id,
+                source=PrintJob.Source.UPLOAD,
+                source_id=grant.pk,
+                payload_s3_key=durable_key,
+            )
+            is None
+        ):
+            raise ConflictException(
+                _("This print upload has already been used."),
+                code="print_upload_already_used",
+            )
+        if grant.page_count is None or grant.page_count < 1:
+            raise ConflictException(
+                _("This print upload has no verified page count."),
+                code="print_upload_unavailable",
+            )
+        authoritative_pages = authoritative_print_pages(
+            key=durable_key,
+            content_type=grant.content_type,
+            size_bytes=grant.actual_size_bytes or grant.expected_size_bytes,
+            requested_pages=pages,
+        )
+        if authoritative_pages != grant.page_count:
+            raise ConflictException(
+                _("This print upload no longer matches its verified page count."),
+                code="print_upload_unavailable",
+            )
+
+    try:
+        job = enqueue_print(
+            source=PrintJob.Source.UPLOAD,
+            source_id=grant.pk,
+            payload_s3_key=durable_key,
+            branch_id=grant.branch_id,
+            requested_by=requested_by,
+            pages=authoritative_pages,
+            copies=copies,
+            color=color,
+            duplex=duplex,
+            preferred_printer_id=preferred_printer_id,
+            scheduled_for=scheduled_for,
+        )
+    except Exception:
+        if promoted_now:
+            with suppress(Exception):
+                delete_object(durable_key)
+        raise
+    if promoted_now:
+        _enqueue_print_upload_source_cleanup(grant.pk)
+    return job
+
+
+# --------------------------------------------------------------------------- #
 # Quotas (D4-LD-5)
 # --------------------------------------------------------------------------- #
 def _current_term_window() -> tuple[Any, Any] | None:
@@ -193,6 +595,8 @@ def _assert_within_quota(
     copies: int,
     color: bool,
     duplex: bool,
+    preferred_printer_id: int | None,
+    scheduled_for: Any,
 ) -> PrintJob | None:
     """Raise ``print_quota_exceeded`` when this job would exceed the term quota."""
     from apps.org.selectors import get_center_settings
@@ -237,6 +641,8 @@ def _assert_within_quota(
             color=color,
             duplex=duplex,
             cohort_id=cohort_id,
+            preferred_printer_id=preferred_printer_id,
+            scheduled_for=scheduled_for,
         )
     used = _cohort_term_pages_used(cohort_id=cohort_id, window=window)
     requested = pages * copies
@@ -277,6 +683,8 @@ def _assert_exact_print_retry(
     color: bool,
     duplex: bool,
     cohort_id: int | None,
+    preferred_printer_id: int | None = None,
+    scheduled_for: Any = None,
 ) -> PrintJob:
     """Return an exact retry or reject an idempotency-key/source collision.
 
@@ -291,6 +699,8 @@ def _assert_exact_print_retry(
         "color": color,
         "duplex": duplex,
         "cohort": cohort_id,
+        "printer": preferred_printer_id,
+        "scheduled_for": scheduled_for,
     }
     recorded = {
         "pages": existing.pages,
@@ -298,6 +708,8 @@ def _assert_exact_print_retry(
         "color": existing.color,
         "duplex": existing.duplex,
         "cohort": existing.cohort_id,
+        "printer": existing.preferred_printer_id,
+        "scheduled_for": existing.scheduled_for,
     }
     conflicting_fields = sorted(name for name, value in requested.items() if recorded[name] != value)
     if conflicting_fields:
@@ -325,20 +737,24 @@ def enqueue_print(
     color: bool = False,
     duplex: bool = False,
     cohort_id: int | None = None,
+    preferred_printer_id: int | None = None,
+    scheduled_for: Any = None,
 ) -> PrintJob:
     """Create (idempotently) a queued PrintJob and schedule the agent hand-off."""
     if source not in PrintJob.Source.values:
         raise ValidationException(_("Unknown print source."), code="invalid_source")
-    if pages < 1:
+    if isinstance(pages, bool) or not isinstance(pages, int) or pages < 1:
         raise ValidationException(_("A print job must have at least one page."), code="invalid_pages")
-    if copies < 1:
-        raise ValidationException(_("A print job must have at least one copy."), code="invalid_copies")
-
-    # Idempotency: an OPEN job for the same (branch, source, source_id, payload
-    # key) is a no-op — return it (a duplicate transcript/receipt/report hand-off).
-    # branch_id MUST be in the filter: two branches can legitimately submit the
-    # same payload key, and without it branch B's job would be silently routed to
-    # branch A's agent (claim_job filters by branch).
+    if isinstance(copies, bool) or not isinstance(copies, int) or not 1 <= copies <= MAX_PRINT_COPIES:
+        raise ValidationException(
+            _("A print job must have between 1 and 100 copies."),
+            code="invalid_copies",
+            fields={"copies": [_("Choose between 1 and 100 copies.")]},
+        )
+    # Check the durable open-source identity before applying a moving schedule
+    # window. A client may safely retry the exact request after its scheduled
+    # time has passed and must receive the original job, not a new validation
+    # failure.
     existing = _existing_open_job(
         branch_id=branch_id,
         source=source,
@@ -353,7 +769,25 @@ def enqueue_print(
             color=color,
             duplex=duplex,
             cohort_id=cohort_id,
+            preferred_printer_id=preferred_printer_id,
+            scheduled_for=scheduled_for,
         )
+    now = timezone.now()
+    if scheduled_for is not None:
+        if not hasattr(scheduled_for, "utcoffset") or timezone.is_naive(scheduled_for):
+            raise ValidationException(
+                _("The print schedule must include a timezone."),
+                code="invalid_schedule",
+                fields={"scheduled_for": [_("Provide an ISO 8601 date-time with an offset.")]},
+            )
+        if scheduled_for < now - timedelta(minutes=1) or scheduled_for > now + timedelta(
+            days=MAX_SCHEDULE_DAYS
+        ):
+            raise ValidationException(
+                _("The print schedule is outside the allowed window."),
+                code="invalid_schedule",
+                fields={"scheduled_for": [_("Choose now or a time within the next 365 days.")]},
+            )
 
     existing = _assert_within_quota(
         branch_id=branch_id,
@@ -365,9 +799,40 @@ def enqueue_print(
         copies=copies,
         color=color,
         duplex=duplex,
+        preferred_printer_id=preferred_printer_id,
+        scheduled_for=scheduled_for,
     )
     if existing is not None:
         return existing
+
+    preferred_printer = None
+    if preferred_printer_id is not None:
+        preferred_printer = (
+            Printer.objects.select_for_update()
+            .filter(pk=preferred_printer_id, branch_id=branch_id, is_active=True)
+            .first()
+        )
+        if preferred_printer is None:
+            raise ValidationException(
+                _("The selected printer is not available in this branch."),
+                code="printer_unavailable",
+                fields={"printer": [_("Choose an active printer in the print job branch.")]},
+            )
+        capabilities = (
+            preferred_printer.capabilities if isinstance(preferred_printer.capabilities, dict) else {}
+        )
+        if color and capabilities.get("color") is not True:
+            raise ValidationException(
+                _("The selected printer does not support color printing."),
+                code="printer_incompatible",
+                fields={"color": [_("Turn off color or choose a color printer.")]},
+            )
+        if duplex and capabilities.get("duplex") is not True:
+            raise ValidationException(
+                _("The selected printer does not support duplex printing."),
+                code="printer_incompatible",
+                fields={"duplex": [_("Turn off duplex or choose a duplex printer.")]},
+            )
 
     try:
         # The savepoint keeps the outer transaction usable if a concurrent
@@ -387,7 +852,10 @@ def enqueue_print(
                 duplex=duplex,
                 cohort_id=cohort_id,
                 requested_by=requested_by if getattr(requested_by, "pk", None) else None,
-                next_attempt_at=timezone.now(),
+                preferred_printer=preferred_printer,
+                printer=preferred_printer,
+                scheduled_for=scheduled_for,
+                next_attempt_at=(scheduled_for if scheduled_for and scheduled_for > now else now),
             )
     except IntegrityError:
         existing = _existing_open_job(
@@ -405,6 +873,8 @@ def enqueue_print(
             color=color,
             duplex=duplex,
             cohort_id=cohort_id,
+            preferred_printer_id=preferred_printer_id,
+            scheduled_for=scheduled_for,
         )
 
     schema_name = current_schema()
@@ -481,12 +951,34 @@ def claim_job(*, agent: BranchAgent) -> PrintJob | None:
     """
     agent = _lock_active_agent(agent)
     now = timezone.now()
+    active_printers = Printer.objects.filter(
+        branch_id=agent.branch_id,
+        is_active=True,
+    ).values("pk")
+    color_printers = Printer.objects.filter(
+        branch_id=agent.branch_id,
+        is_active=True,
+        capabilities__color=True,
+    ).values("pk")
+    duplex_printers = Printer.objects.filter(
+        branch_id=agent.branch_id,
+        is_active=True,
+        capabilities__duplex=True,
+    ).values("pk")
     job = (
         PrintJob.objects.select_for_update(skip_locked=True)
         .filter(
             branch_id=agent.branch_id,
             status=PrintJob.Status.QUEUED,
             next_attempt_at__lte=now,
+        )
+        .filter(
+            Q(preferred_printer__isnull=True)
+            | (
+                Q(preferred_printer_id__in=active_printers)
+                & (Q(color=False) | Q(preferred_printer_id__in=color_printers))
+                & (Q(duplex=False) | Q(preferred_printer_id__in=duplex_printers))
+            )
         )
         .order_by("created_at")
         .first()
@@ -504,7 +996,9 @@ def claim_job(*, agent: BranchAgent) -> PrintJob | None:
     job.reconciliation_reason = ""
     job.reconciliation_previous_status = ""
     job.next_attempt_at = None
-    if job.printer_id is None:
+    if job.preferred_printer_id is not None:
+        job.printer_id = job.preferred_printer_id
+    elif job.printer_id is None:
         _assign_least_loaded_printer(job)
     job.save(
         update_fields=[
@@ -577,6 +1071,7 @@ def reject_invalid_claim(*, agent: BranchAgent, job_id: int) -> PrintJob:
         ]
     )
     _audit_job(job, action="print.job_rejected", agent_id=agent.pk)
+    _schedule_terminal_upload_cleanup(job)
     return job
 
 
@@ -781,6 +1276,7 @@ def update_job_status(
             ]
         )
         _audit_job(job, action="print.job_done", agent_id=reporting_agent_id)
+        _schedule_terminal_upload_cleanup(job)
         return job
 
     # Once PRINTING began (or any page progress was recorded), a failure can
@@ -807,7 +1303,7 @@ def update_job_status(
         job.status = PrintJob.Status.QUEUED
         job.next_attempt_at = now + timedelta(seconds=backoff)
         job.pages_printed = 0
-        job.printer = None
+        job.printer = job.preferred_printer
         job.claimed_at = None
         job.save(
             update_fields=[
@@ -865,6 +1361,7 @@ def _clear_current_lease(job: PrintJob) -> None:
 
 
 def _schedule_final_failure(job: PrintJob) -> None:
+    _schedule_terminal_upload_cleanup(job)
     schema_name = current_schema()
     requested_by_id = job.requested_by_id
     job_pk = job.pk
@@ -892,6 +1389,34 @@ def _schedule_final_failure(job: PrintJob) -> None:
             )
 
     transaction.on_commit(_post_commit)
+
+
+def _schedule_terminal_upload_cleanup(job: PrintJob) -> None:
+    """Delete an ad-hoc durable object only after its job becomes terminal."""
+
+    if job.source != PrintJob.Source.UPLOAD:
+        return
+    now = timezone.now()
+    marked = PrintUploadGrant.objects.filter(
+        pk=job.source_id,
+        branch_id=job.branch_id,
+        requested_by_id=job.requested_by_id,
+        durable_key=job.payload_s3_key,
+        consumed_at__isnull=False,
+        deletion_requested_at__isnull=True,
+        durable_deleted_at__isnull=True,
+    ).update(deletion_requested_at=now)
+    if not marked:
+        return
+    schema = current_schema()
+    grant_id = job.source_id
+
+    def enqueue() -> None:
+        from celery_tasks.attachment_tasks import delete_attachment_objects
+
+        delete_attachment_objects.delay("printing", [grant_id], _schema_name=schema)
+
+    transaction.on_commit(enqueue, robust=True)
 
 
 def _validated_reconciliation_key(raw: str) -> str:
@@ -1065,7 +1590,7 @@ def reconcile_print_job(
             job.next_attempt_at = None
             job.finished_at = now
         job.agent = None
-        job.printer = None
+        job.printer = job.preferred_printer
         _clear_current_lease(job)
     else:
         job.status = PrintJob.Status.FAILED
@@ -1073,7 +1598,7 @@ def reconcile_print_job(
         job.next_attempt_at = None
         job.finished_at = now
         job.agent = None
-        job.printer = None
+        job.printer = job.preferred_printer
         _clear_current_lease(job)
 
     job.save(
@@ -1103,6 +1628,8 @@ def reconcile_print_job(
     )
     if job.status == PrintJob.Status.FAILED:
         _schedule_final_failure(job)
+    elif job.status == PrintJob.Status.DONE:
+        _schedule_terminal_upload_cleanup(job)
     return job
 
 

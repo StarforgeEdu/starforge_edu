@@ -5,6 +5,7 @@ from __future__ import annotations
 from django.urls import path
 
 from apps.cohorts.views.v1.cohort_views import (
+    cohort_cycle_progress_view,
     cohort_detail_view,
     cohort_enroll_view,
     cohort_members_view,
@@ -12,6 +13,7 @@ from apps.cohorts.views.v1.cohort_views import (
     cohort_remove_student_view,
     cohort_teacher_detail_view,
     cohort_teachers_view,
+    cohort_teaching_progress_view,
     cohort_unarchive_view,
     cohorts_collection_view,
     teacher_type_detail_view,
@@ -31,6 +33,16 @@ urlpatterns = [
     path("<int:pk>/move-student/", cohort_move_student_view, name="cohorts-move-student"),
     path("<int:pk>/remove-student/", cohort_remove_student_view, name="cohorts-remove-student"),
     path("<int:pk>/members/", cohort_members_view, name="cohorts-members"),
+    path(
+        "<int:pk>/cycle-progress/",
+        cohort_cycle_progress_view,
+        name="cohorts-cycle-progress",
+    ),
+    path(
+        "<int:pk>/teaching-progress/",
+        cohort_teaching_progress_view,
+        name="cohorts-teaching-progress",
+    ),
     path("<int:pk>/teachers/", cohort_teachers_view, name="cohorts-teachers"),
     path(
         "<int:pk>/teachers/<int:assignment_id>/",

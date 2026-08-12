@@ -460,7 +460,7 @@ def test_receipt_read_methods_are_observational_and_generation_is_explicit_post(
     } == {"pending", "generating"}
 
 
-def test_print_job_create_contract_excludes_storage_and_routing_capabilities():
+def test_print_job_create_contract_excludes_storage_and_server_owned_scope():
     schema = build_schema(None)
     item = schema["paths"]["/api/v1/printing/jobs/"]
     assert _operation_methods(item) == {"get", "head", "post"}
@@ -480,6 +480,7 @@ def test_print_job_create_contract_excludes_storage_and_routing_capabilities():
             "409",
             "422",
             "429",
+            "503",
         }
         | TENANT_RUNTIME_RESPONSES
     )
@@ -489,6 +490,7 @@ def test_print_job_create_contract_excludes_storage_and_routing_capabilities():
 
     request_schema = schema["components"]["schemas"]["PrintJobCreateRequest"]
     assert request_schema["additionalProperties"] is False
+    assert request_schema["required"] == ["source", "source_id"]
     assert set(request_schema["properties"]) == {
         "source",
         "source_id",
@@ -497,8 +499,27 @@ def test_print_job_create_contract_excludes_storage_and_routing_capabilities():
         "copies",
         "color",
         "duplex",
+        "printer",
+        "scheduled_for",
     }
     assert {"payload_s3_key", "branch", "cohort"}.isdisjoint(request_schema["properties"])
+
+    upload = schema["paths"]["/api/v1/printing/upload-url/"]["post"]
+    assert upload["security"] == [
+        {"sessionAuth": []},
+        {"cookieSession": [], "csrfHeader": []},
+    ]
+    upload_request = schema["components"]["schemas"]["PrintUploadRequest"]
+    assert upload_request["additionalProperties"] is False
+    assert upload_request["required"] == ["branch", "filename", "content_type", "size_bytes"]
+    assert upload_request["properties"]["content_type"]["enum"] == [
+        "application/pdf",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    ]
+    upload_data = schema["components"]["schemas"]["PrintUploadData"]
+    assert {"key", "payload_s3_key", "durable_key"}.isdisjoint(upload_data["properties"])
 
 
 def test_print_reconciliation_contract_is_scoped_closed_and_never_automatic():

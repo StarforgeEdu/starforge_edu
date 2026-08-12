@@ -507,13 +507,21 @@ def emit_due_reminders() -> int:
         reminder_sent_at__isnull=True,
         starts_at__gte=now + dt.timedelta(minutes=25),
         starts_at__lte=now + dt.timedelta(minutes=35),
-    )
+    ).select_related("cohort")
     schema = current_schema()
     count = 0
     for lesson in due:
+        from apps.cohorts.progression import lesson_cycle_signal
+
+        cycle_signal = lesson_cycle_signal(lesson)
         lesson.reminder_sent_at = now
         lesson.save(update_fields=["reminder_sent_at"])
-        lesson_reminder_due.send(sender=Lesson, lesson_id=lesson.pk, schema_name=schema)
+        lesson_reminder_due.send(
+            sender=Lesson,
+            lesson_id=lesson.pk,
+            schema_name=schema,
+            **cycle_signal,
+        )
         count += 1
     return count
 

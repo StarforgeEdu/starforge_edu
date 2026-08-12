@@ -19,16 +19,18 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.org.models import Branch
+from apps.printing import services as printing_domain
 from apps.printing.agent_auth import require_branch_agent
 from apps.printing.interfaces.services import (
     IBranchAgentService,
     IPrinterService,
     IPrintJobService,
 )
-from apps.printing.models import PrintJob, PrintJobReconciliation
+from apps.printing.models import PrintJob, PrintJobReconciliation, PrintUploadGrant
 from apps.printing.openapi_contracts import (
     AGENT_CLAIM_CONTRACTS,
     AGENT_JOB_HEARTBEAT_CONTRACTS,
@@ -36,6 +38,7 @@ from apps.printing.openapi_contracts import (
     JOB_RECONCILE_CONTRACTS,
     JOB_RECONCILIATIONS_CONTRACTS,
     JOBS_COLLECTION_CONTRACTS,
+    PRINT_UPLOAD_CONTRACTS,
 )
 from apps.printing.presenters import (
     agent_print_job_to_dict,
@@ -56,6 +59,7 @@ from core.exceptions import (
     ConflictException,
     NotFoundException,
     ServiceUnavailableException,
+    UnprocessableEntity,
     ValidationException,
 )
 from core.http import bool_field, int_field, read_json, str_field
@@ -115,6 +119,38 @@ def jobs_collection_view(request: HttpRequest) -> HttpResponse:
         # request-body contract; the helper only validates the closed DTO below.
         return _create_job(request, body=read_json(request))
     return error("Method not allowed.", code="method_not_allowed", status=405)
+
+
+@openapi_contract(
+    path="/api/v1/printing/upload-url/",
+    operations=PRINT_UPLOAD_CONTRACTS,
+)
+@csrf_exempt
+@require_auth
+def print_upload_url_view(request: HttpRequest) -> HttpResponse:
+    if request.method != "POST":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, "printing:write")
+    body = read_json(request)
+    unknown_fields = sorted(set(body) - {"branch", "filename", "content_type", "size_bytes"})
+    if unknown_fields:
+        raise ValidationException(
+            "The print upload request contains unsupported fields.",
+            code="validation_error",
+            fields={field: ["This field is unsupported."] for field in unknown_fields},
+        )
+    branch_id = _required_pos_int(body, "branch")
+    _assert_branch_write(request, branch_id)
+    result = _job_service().request_upload(
+        data={
+            "branch": branch_id,
+            "filename": str_field(body, "filename", max_length=255),
+            "content_type": str_field(body, "content_type", max_length=127),
+            "size_bytes": _required_pos_int(body, "size_bytes"),
+        },
+        requested_by=request.user,
+    )
+    return created(result)
 
 
 @csrf_exempt
@@ -423,6 +459,8 @@ def _create_job(request: HttpRequest, *, body: dict[str, Any]) -> HttpResponse:
         "copies",
         "color",
         "duplex",
+        "printer",
+        "scheduled_for",
     }
     unknown_fields = sorted(set(body) - allowed_fields)
     if unknown_fields:
@@ -432,32 +470,126 @@ def _create_job(request: HttpRequest, *, body: dict[str, Any]) -> HttpResponse:
             fields={name: ["This field is server-managed or unsupported."] for name in unknown_fields},
         )
     source = _choice(body, "source", _SOURCES)
+    source_id = _required_pos_int(body, "source_id")
     source_permission = source_read_permission(source)
     check_perm(request, source_permission)
+    printer_id = _optional_pos_int(body, "printer")
+    scheduled_for = _optional_schedule(body)
+
+    if source == PrintJob.Source.UPLOAD:
+        if "attachment_index" in body:
+            raise ValidationException(
+                "attachment_index is only valid for assignment sources.",
+                code="validation_error",
+                fields={"attachment_index": ["Remove this field for an uploaded print file."]},
+            )
+        if printer_id is None:
+            raise ValidationException(
+                "printer is required for an uploaded print file.",
+                code="validation_error",
+                fields={"printer": ["Choose an available printer."]},
+            )
+        grant = (
+            PrintUploadGrant.objects.filter(
+                pk=source_id,
+                requested_by_id=getattr(request.user, "pk", None),
+            )
+            .only("branch_id")
+            .first()
+        )
+        if grant is None:
+            raise NotFoundException(code="not_found")
+        printer = _visible_printers(request, permission="printing:write").filter(pk=printer_id).first()
+        if printer is None:
+            raise NotFoundException(code="not_found")
+        if printer.branch_id != grant.branch_id:
+            raise ValidationException(
+                "The selected printer is outside the upload branch.",
+                code="printer_source_branch_mismatch",
+                fields={"printer": ["Choose a printer in the upload branch."]},
+            )
+        assert_permission_membership_scope(
+            request,
+            permission="printing:write",
+            branch_id=grant.branch_id,
+            enforce_department=False,
+        )
+        data = {
+            "source_id": source_id,
+            "pages": _optional_pos_int(body, "pages"),
+            "copies": _positive_default(body, "copies", 1),
+            "color": bool_field(body, "color", default=False),
+            "duplex": bool_field(body, "duplex", default=False),
+            "printer": printer_id,
+            "scheduled_for": scheduled_for,
+        }
+        return created(print_job_to_dict(_job_service().enqueue_upload(data=data, requested_by=request.user)))
+
     resolved = resolve_print_source(
         request=request,
         source=source,
-        source_id=_required_pos_int(body, "source_id"),
+        source_id=source_id,
         attachment_index=_optional_nonneg_int(body, "attachment_index"),
     )
+    printer = None
+    if printer_id is not None:
+        printer = _visible_printers(request, permission="printing:write").filter(pk=printer_id).first()
+        if printer is None:
+            raise NotFoundException(code="not_found")
+    if source == PrintJob.Source.CONTENT and printer is None:
+        raise ValidationException(
+            "printer is required for a library file.",
+            code="validation_error",
+            fields={"printer": ["Choose an available printer."]},
+        )
+    branch_id = resolved.branch_id if resolved.branch_id is not None else getattr(printer, "branch_id", None)
+    if branch_id is None:
+        raise ValidationException(
+            "The print source has no branch route.",
+            code="validation_error",
+            fields={"printer": ["Choose an available printer."]},
+        )
+    if printer is not None and printer.branch_id != branch_id:
+        raise ValidationException(
+            "The selected printer is outside the source branch.",
+            code="printer_source_branch_mismatch",
+            fields={"printer": ["Choose a printer in the document's branch."]},
+        )
+    requested_pages = _optional_pos_int(body, "pages")
+    if source == PrintJob.Source.CONTENT:
+        if resolved.content_type is None or resolved.size_bytes is None:
+            raise UnprocessableEntity(
+                "The selected library file has no printable metadata.",
+                code="print_source_not_ready",
+            )
+        pages = printing_domain.authoritative_print_pages(
+            key=resolved.payload_s3_key,
+            content_type=resolved.content_type,
+            size_bytes=resolved.size_bytes,
+            requested_pages=requested_pages,
+        )
+    else:
+        pages = _required_pos_int(body, "pages")
     # The source query proves read scope. Independently require that the exact
     # membership supplying printing:write covers the source's authoritative branch.
     assert_permission_membership_scope(
         request,
         permission="printing:write",
-        branch_id=resolved.branch_id,
+        branch_id=branch_id,
         enforce_department=False,
     )
     data = {
         "source": resolved.source,
         "source_id": resolved.source_id,
         "payload_s3_key": resolved.payload_s3_key,
-        "branch": resolved.branch_id,
-        "pages": _required_pos_int(body, "pages"),
+        "branch": branch_id,
+        "pages": pages,
         "copies": _positive_default(body, "copies", 1),
         "color": bool_field(body, "color", default=False),
         "duplex": bool_field(body, "duplex", default=False),
         "cohort": resolved.cohort_id,
+        "printer": printer_id,
+        "scheduled_for": scheduled_for,
     }
     return created(print_job_to_dict(_job_service().enqueue(data=data, requested_by=request.user)))
 
@@ -615,6 +747,32 @@ def _optional_nonneg_int(body: dict[str, Any], name: str) -> int | None:
             fields={name: ["Must be an integer >= 0."]},
         )
     return value
+
+
+def _optional_pos_int(body: dict[str, Any], name: str) -> int | None:
+    if name not in body:
+        return None
+    return _required_pos_int(body, name)
+
+
+def _optional_schedule(body: dict[str, Any]):
+    if "scheduled_for" not in body or body["scheduled_for"] is None:
+        return None
+    value = body["scheduled_for"]
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValidationException(
+            "scheduled_for must be an ISO 8601 date-time.",
+            code="validation_error",
+            fields={"scheduled_for": ["Provide a date-time with an explicit timezone offset."]},
+        )
+    parsed = parse_datetime(value)
+    if parsed is None or timezone.is_naive(parsed):
+        raise ValidationException(
+            "scheduled_for must include a timezone.",
+            code="validation_error",
+            fields={"scheduled_for": ["Provide a date-time with an explicit timezone offset."]},
+        )
+    return parsed
 
 
 def _required_uuid(body: dict[str, Any], name: str) -> UUID:

@@ -103,6 +103,17 @@ def test_settings_accepts_valid_json_knobs(as_role):
     assert body["otp_channel_prefs"] == {"sms": True, "email": False}
 
 
+def test_mobile_voice_note_type_is_a_reviewed_default(as_role):
+    client, _ = as_role(Role.DIRECTOR)
+    fetched = client.get(URL)
+    assert fetched.status_code == 200
+    assert "m4a" in fetched.json()["data"]["allowed_file_types"]
+
+    restricted = client.patch(URL, {"allowed_file_types": ["m4a"]}, format="json")
+    assert restricted.status_code == 200, restricted.content
+    assert restricted.json()["data"]["allowed_file_types"] == ["m4a"]
+
+
 def test_settings_exposes_and_updates_language_and_absence_knobs(as_role):
     client, _ = as_role(Role.DIRECTOR)
     payload = {

@@ -50,7 +50,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libharfbuzz-subset0 \
         libjpeg62-turbo \
         libopenjp2-7 \
+        poppler-utils \
         shared-mime-info \
+        util-linux \
         fonts-dejavu-core \
         curl \
     && rm -rf /var/lib/apt/lists/* \

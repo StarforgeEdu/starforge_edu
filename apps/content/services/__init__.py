@@ -34,7 +34,7 @@ from apps.content.storage_keys import (
 )
 from apps.org.models import CenterSettings
 from apps.org.selectors import get_center_settings
-from core.attachment_storage import allowed_attachment_mime_types
+from core.attachment_storage import allowed_attachment_mime_types, attachment_content_matches
 from core.exceptions import (
     ConflictException,
     NotFoundException,
@@ -132,7 +132,18 @@ def _validate_upload_inputs(*, filename: str, content_type: str, size_bytes: int
 
 @transaction.atomic
 def request_upload(
-    *, filename, content_type, size_bytes, user=None, lesson=None, folder=None, title=None, previous=None
+    *,
+    filename,
+    content_type,
+    size_bytes,
+    user=None,
+    lesson=None,
+    folder=None,
+    title=None,
+    previous=None,
+    is_downloadable=True,
+    submitted_by_teacher=None,
+    submission_audience="",
 ) -> dict:
     """Validate against the knobs and create a `pending` LessonFile with a tmp
     key + presigned PUT URL. `previous` links a new version."""
@@ -166,6 +177,9 @@ def request_upload(
         version=(previous.version + 1) if previous else 1,
         previous_version=previous,
         uploaded_by=user,
+        is_downloadable=is_downloadable,
+        submitted_by_teacher=submitted_by_teacher,
+        submission_audience=submission_audience,
     )
     expires_in = 600
     url = presign_upload(
@@ -247,8 +261,11 @@ def _sniff_matches(*, sniffed: str, declared: str, ext: str) -> bool:
     """The libmagic sniff must match the exact MIME(s) allowed for the file's
     extension (D2-E-4). Unknown organization-configured extensions fail closed
     instead of relying on a broad top-level MIME family."""
-    expected = allowed_attachment_mime_types(f"upload.{ext}")
-    return bool(expected) and declared in expected and sniffed in expected
+    return attachment_content_matches(
+        filename=f"upload.{ext}",
+        declared=declared,
+        sniffed=sniffed,
+    )
 
 
 def _bounded_image_payload(key: str, *, max_bytes: int) -> bytes:

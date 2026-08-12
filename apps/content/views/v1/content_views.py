@@ -8,7 +8,7 @@ approval, and AI-drafted library materials (draft -> generate -> edit -> publish
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, cast
 
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -24,6 +24,7 @@ from apps.content.interfaces.services import (
     IModuleService,
 )
 from apps.content.models import ContentLesson, ContentLibrary, Folder, LibraryMaterial
+from apps.content.openapi_contracts import CONTENT_UPLOAD_URL_OPERATIONS
 from apps.content.presenters import (
     course_to_dict,
     folder_to_dict,
@@ -37,8 +38,9 @@ from apps.content.selectors import scoped_libraries
 from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
-from core.http import bool_field, parse_bool, read_json
+from core.http import bool_field, parse_bool, read_json, reject_unknown_fields
 from core.listing import apply_filters, paginate
+from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.responses import created, error, no_content, paginated, success
 from core.role_principals import request_role_principal
@@ -85,6 +87,7 @@ def _roles(request: HttpRequest) -> set[str]:
 # --- value validators (never-500) ------------------------------------------
 
 _FILENAME_ALLOWED = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,254}$")
+_UPLOAD_AUDIENCES = frozenset({"own_students", "global"})
 
 
 def _reject(field: str, message: str) -> ValidationException:
@@ -646,22 +649,84 @@ def file_approve_manager_view(request: HttpRequest, pk: int) -> HttpResponse:
 
 @csrf_exempt
 @require_auth
+@openapi_contract(
+    path="/api/v1/content/upload-url/",
+    operations=CONTENT_UPLOAD_URL_OPERATIONS,
+)
 def content_upload_url_view(request: HttpRequest) -> HttpResponse:
     if request.method != "POST":
         return _method_not_allowed()
     check_perm(request, "content:write")
     data = read_json(request)
+    reject_unknown_fields(
+        data,
+        allowed={
+            "filename",
+            "content_type",
+            "size_bytes",
+            "title",
+            "lesson",
+            "folder",
+            "audience",
+            "is_downloadable",
+        },
+    )
     filename = _sanitize_filename(_require(data, "filename"))
     content_type = _str_value(_require(data, "content_type"), "content_type", max_length=127)
     size_bytes = _int_value(_require(data, "size_bytes"), "size_bytes", min_value=1)
     title = _str_value(data.get("title", ""), "title", max_length=255, allow_blank=True)
+    audience = (
+        None if "audience" not in data else _choice_value(data["audience"], "audience", _UPLOAD_AUDIENCES)
+    )
+    is_downloadable = (
+        True if "is_downloadable" not in data else parse_bool(data["is_downloadable"], "is_downloadable")
+    )
+    if (data.get("lesson") is None) == (data.get("folder") is None):
+        raise _reject("lesson", "Choose exactly one lesson or folder.")
+
     # Writes are scoped like reads: a writer may only attach into a lesson/folder whose
     # library they can see (an out-of-scope pk -> 400, closing the read/write asymmetry).
-    libs = scoped_libraries(
-        user=request.user,
-        roles=_roles(request),
-        permission="content:write",
-    )
+    if audience is None:
+        submitted_by_teacher = None
+        libs = scoped_libraries(
+            user=request.user,
+            roles=_roles(request),
+            permission="content:write",
+        )
+    else:
+        # Explicit mobile audiences are a teacher authoring feature. Resolving
+        # the exact session principal prevents a shared User bridge (for example
+        # teacher + receptionist) from borrowing teacher cohort ownership.
+        principal = request_role_principal(
+            request,
+            allowed_kinds={"teacher"},
+            error_code="content_teacher_principal_required",
+        )
+        from apps.teachers.models import TeacherProfile
+
+        submitted_by_teacher = TeacherProfile.objects.filter(
+            pk=principal.principal_id,
+            user=cast(Any, request.user),
+            is_active=True,
+        ).first()
+        if submitted_by_teacher is None:  # defense in depth behind request_role_principal
+            raise PermissionException(
+                "This workflow is unavailable for the active account session.",
+                code="content_teacher_principal_required",
+            )
+        if audience == "global":
+            libs = ContentLibrary.objects.filter(
+                visibility=ContentLibrary.Visibility.TENANT,
+                is_active=True,
+            )
+        else:
+            from apps.cohorts.selectors import taught_cohorts
+
+            libs = ContentLibrary.objects.filter(
+                visibility=ContentLibrary.Visibility.COHORT,
+                cohort__in=taught_cohorts(teacher=submitted_by_teacher),
+                is_active=True,
+            )
     lesson = folder = None
     if data.get("lesson") is not None:
         lesson = ContentLesson.objects.filter(
@@ -682,6 +747,9 @@ def content_upload_url_view(request: HttpRequest) -> HttpResponse:
         "title": title,
         "lesson": lesson,
         "folder": folder,
+        "is_downloadable": is_downloadable,
+        "submitted_by_teacher": submitted_by_teacher,
+        "submission_audience": audience or "",
     }
     result = _file_service().request_upload(data=payload, user=request.user)
     return success(_upload_payload(result))

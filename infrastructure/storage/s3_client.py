@@ -8,6 +8,7 @@ direct operations: presigned URLs, multipart uploads, bucket admin.
 from __future__ import annotations
 
 from functools import lru_cache
+from os import PathLike
 from typing import Any
 from urllib.parse import quote
 
@@ -19,6 +20,10 @@ from django.core.exceptions import ImproperlyConfigured
 
 class StorageObjectTooLarge(ValueError):
     """Raised before an object can be materialized beyond a caller's bound."""
+
+
+class StorageObjectSizeMismatch(ValueError):
+    """Raised when an immutable object-size contract no longer matches storage."""
 
 
 def _storage_options() -> dict[str, Any]:
@@ -206,6 +211,56 @@ def download_bytes(key: str, *, max_bytes: int | None = None) -> bytes:
     if len(data) > max_bytes:
         raise StorageObjectTooLarge("Storage object exceeds the permitted size")
     return data
+
+
+def download_to_path(
+    key: str,
+    path: str | PathLike[str],
+    *,
+    max_bytes: int,
+    expected_size_bytes: int | None = None,
+) -> int:
+    """Stream one object to a caller-owned path under authoritative byte bounds."""
+
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    if expected_size_bytes is not None and (
+        isinstance(expected_size_bytes, bool)
+        or not isinstance(expected_size_bytes, int)
+        or not 1 <= expected_size_bytes <= max_bytes
+    ):
+        raise ValueError("expected_size_bytes must be within max_bytes")
+
+    resp = get_s3_client().get_object(Bucket=_storage_options()["bucket_name"], Key=key)
+    body = resp["Body"]
+    try:
+        try:
+            declared_size = int(resp.get("ContentLength", -1))
+        except (TypeError, ValueError):
+            declared_size = -1
+        if declared_size > max_bytes:
+            raise StorageObjectTooLarge("Storage object exceeds the permitted size")
+        if expected_size_bytes is not None and declared_size not in (-1, expected_size_bytes):
+            raise StorageObjectSizeMismatch("Storage object size does not match the record")
+
+        total = 0
+        with open(path, "xb") as destination:
+            while True:
+                remaining = max_bytes - total
+                chunk = body.read(min(1024 * 1024, remaining + 1))
+                if not chunk:
+                    break
+                if not isinstance(chunk, bytes):
+                    raise OSError("Storage returned a non-byte stream")
+                total += len(chunk)
+                if total > max_bytes:
+                    raise StorageObjectTooLarge("Storage object exceeds the permitted size")
+                destination.write(chunk)
+        if expected_size_bytes is not None and total != expected_size_bytes:
+            raise StorageObjectSizeMismatch("Storage object size does not match the record")
+        return total
+    finally:
+        body.close()
 
 
 def copy_object(*, src_key: str, dest_key: str) -> str:

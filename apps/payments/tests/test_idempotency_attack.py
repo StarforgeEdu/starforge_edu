@@ -234,12 +234,45 @@ def test_cash_double_submit_same_amount_is_coalesced(invoice_a, user_in, as_user
             cashier=cashier, branch=inv.student.branch, opening_cash_uzs=Decimal("0.00")
         )
     client = as_user(tenant_a, cashier)
-    body = {"invoice": inv.id, "amount_uzs": "50000.00"}
+    body = {"invoice": inv.id, "amount_uzs": "150000.00"}
     r1 = client.post("/api/v1/payments/cash/", body, format="json")  # no Idempotency-Key
     r2 = client.post("/api/v1/payments/cash/", body, format="json")  # accidental resubmit
     assert r1.status_code in (200, 201), r1.content
     assert r2.status_code in (200, 201), r2.content
     assert r1.json()["data"]["id"] == r2.json()["data"]["id"]  # coalesced, one payment
+    with schema_context(tenant_a.schema_name):
+        assert Payment.objects.filter(provider=Payment.Method.CASH, status="completed").count() == 1
+
+
+def test_cash_double_submit_across_minute_boundary_is_coalesced(invoice_a, user_in, as_user):
+    """The headerless fallback is a sliding interval, not a clock bucket.
+
+    A double-click straddling a minute boundary must never double-credit the
+    drawer merely because the wall clock advanced to the next bucket.
+    """
+    import time_machine
+
+    from apps.finance import services as finance_services
+    from apps.payments.models import Payment
+
+    tenant_a, inv = invoice_a
+    cashier = user_in(tenant_a, roles=["cashier"], branch=inv.student.branch)
+    client = as_user(tenant_a, cashier)
+    body = {"invoice": inv.id, "amount_uzs": "50000.00"}
+    with time_machine.travel("2026-06-16 10:00:59.999 +05:00", tick=False):
+        with schema_context(tenant_a.schema_name):
+            finance_services.open_cashier_shift(
+                cashier=cashier,
+                branch=inv.student.branch,
+                opening_cash_uzs=Decimal("0.00"),
+            )
+        first = client.post("/api/v1/payments/cash/", body, format="json")
+    with time_machine.travel("2026-06-16 10:01:00.001 +05:00", tick=False):
+        retry = client.post("/api/v1/payments/cash/", body, format="json")
+
+    assert first.status_code in (200, 201), first.content
+    assert retry.status_code in (200, 201), retry.content
+    assert first.json()["data"]["id"] == retry.json()["data"]["id"]
     with schema_context(tenant_a.schema_name):
         assert Payment.objects.filter(provider=Payment.Method.CASH, status="completed").count() == 1
 

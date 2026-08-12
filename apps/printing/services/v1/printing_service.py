@@ -44,6 +44,29 @@ class PrintJobService(IPrintJobService):
             color=data["color"],
             duplex=data["duplex"],
             cohort_id=data["cohort"],
+            preferred_printer_id=data.get("printer"),
+            scheduled_for=data.get("scheduled_for"),
+        )
+
+    def request_upload(self, *, data: dict[str, Any], requested_by) -> dict[str, Any]:
+        return domain.request_print_upload(
+            branch_id=data["branch"],
+            filename=data["filename"],
+            content_type=data["content_type"],
+            size_bytes=data["size_bytes"],
+            requested_by=requested_by,
+        )
+
+    def enqueue_upload(self, *, data: dict[str, Any], requested_by) -> PrintJob:
+        return domain.enqueue_uploaded_print(
+            grant_id=data["source_id"],
+            requested_by=requested_by,
+            pages=data["pages"],
+            copies=data["copies"],
+            color=data["color"],
+            duplex=data["duplex"],
+            preferred_printer_id=data["printer"],
+            scheduled_for=data.get("scheduled_for"),
         )
 
     def claim(self, *, agent: BranchAgent) -> PrintJob | None:

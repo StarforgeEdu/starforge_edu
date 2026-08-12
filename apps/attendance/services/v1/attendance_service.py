@@ -48,15 +48,17 @@ class AttendanceService(IAttendanceService):
                 code="student_not_in_cohort",
                 fields={"students": missing},
             )
-        resolved = [
-            {
-                "student": found[e.student_id],
-                "status": e.status,
-                "arrived_at": e.arrived_at,
-                "note": e.note,
+        resolved = []
+        for entry in entries:
+            row = {
+                "student": found[entry.student_id],
+                "status": entry.status,
+                "arrived_at": entry.arrived_at,
+                "note": entry.note,
             }
-            for e in entries
-        ]
+            if entry.card_type is not None:
+                row["card_type"] = entry.card_type
+            resolved.append(row)
         return mark_attendance(lesson=lesson, entries=resolved, actor=actor)
 
     def term_summary(self, *, user, roles: set[str], student_id: int, term_id: int) -> dict:

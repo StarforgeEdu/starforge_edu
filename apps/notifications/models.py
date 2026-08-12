@@ -34,6 +34,10 @@ class EventType(models.TextChoices):
     ASSIGNMENTS_DUE_SOON = "assignments.due_soon", _("Assignment due soon")
     ASSIGNMENTS_GRADED = "assignments.graded", _("Assignment graded")
     SCHEDULE_LESSON_REMINDER = "schedule.lesson_reminder", _("Lesson reminder")
+    SCHEDULE_CYCLE_EXAM_REMINDER = (
+        "schedule.cycle_exam_reminder",
+        _("Cycle exam reminder"),
+    )
     AUTH_NEW_DEVICE_LOGIN = "auth.new_device_login", _("New device login")
     STUDENTS_ENROLLMENT_CHANGED = "students.enrollment_changed", _("Enrollment changed")
     FINANCE_INVOICE_ISSUED = "finance.invoice_issued", _("Invoice issued")

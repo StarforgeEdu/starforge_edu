@@ -142,6 +142,52 @@ def test_concurrent_cash_idempotent_retries_create_one_receipt(tenant_a, user_in
         assert PaymentAllocation.objects.get(invoice_id=invoice.pk).amount_uzs == Decimal("70000.00")
 
 
+@override_settings(FISCALIZATION_ENABLED=False)
+def test_concurrent_headerless_cash_retries_create_one_receipt(tenant_a, user_in):
+    """The fallback must serialize a real double-tap even without a client key."""
+    from apps.finance import services as finance_services
+    from apps.finance.models import PaymentAllocation
+    from apps.payments import services
+    from apps.payments.tests import _helpers as helpers
+
+    invoice = helpers.seed_open_invoice(
+        tenant_a,
+        number="INV-CASH-HEADERLESS-RACE-1",
+        amount_uzs="100000.00",
+    )
+    cashier = user_in(tenant_a, roles=["cashier"], branch=invoice.student.branch)
+    with schema_context(tenant_a.schema_name):
+        finance_services.open_cashier_shift(
+            cashier=cashier,
+            branch=invoice.student.branch,
+            opening_cash_uzs=Decimal("0.00"),
+        )
+    barrier = Barrier(2)
+
+    def run():
+        close_old_connections()
+        try:
+            with schema_context(tenant_a.schema_name):
+                barrier.wait(timeout=10)
+                payment = services.create_cash_payment(
+                    invoice_id=invoice.pk,
+                    cashier=cashier,
+                    amount_uzs=Decimal("70000.00"),
+                )
+                return payment.pk
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        payment_ids = list(pool.map(lambda _index: run(), range(2)))
+
+    assert len(set(payment_ids)) == 1
+    with schema_context(tenant_a.schema_name):
+        assert Payment.objects.filter(provider=Payment.Method.CASH).count() == 1
+        assert PaymentAllocation.objects.filter(invoice_id=invoice.pk).count() == 1
+        assert PaymentAllocation.objects.get(invoice_id=invoice.pk).amount_uzs == Decimal("70000.00")
+
+
 def test_concurrent_payme_create_allows_one_open_transaction_per_invoice(tenant_a):
     from apps.payments import services
     from apps.payments.tests import _helpers as helpers

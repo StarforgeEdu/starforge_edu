@@ -15,10 +15,19 @@ _EXTENSION_MIME: dict[str, frozenset[str]] = {
     "pptx": frozenset({"application/vnd.openxmlformats-officedocument.presentationml.presentation"}),
     "docx": frozenset({"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}),
     "mp3": frozenset({"audio/mpeg"}),
+    # Flutter's native AAC recorder writes an ISO-BMFF M4A container and sends
+    # the standards-based upload type audio/mp4. libmagic identifies the same
+    # reviewed container signature as audio/x-m4a on common production images,
+    # so declared and sniffed MIME contracts are deliberately separated below.
+    "m4a": frozenset({"audio/mp4"}),
     "jpg": frozenset({"image/jpeg"}),
     "jpeg": frozenset({"image/jpeg"}),
     "png": frozenset({"image/png"}),
     "webp": frozenset({"image/webp"}),
+}
+
+_EXTENSION_SNIFFED_MIME: dict[str, frozenset[str]] = {
+    "m4a": frozenset({"audio/x-m4a", "audio/mp4"}),
 }
 
 
@@ -58,12 +67,16 @@ def allowed_attachment_mime_types(filename: str) -> frozenset[str]:
     return _EXTENSION_MIME.get(extension, frozenset())
 
 
-def _content_matches(*, filename: str, declared: str, sniffed: str) -> bool:
+def attachment_content_matches(*, filename: str, declared: str, sniffed: str) -> bool:
+    """Match one extension against its reviewed declared and sniffed MIME sets."""
+
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     expected = allowed_attachment_mime_types(filename)
+    expected_sniffed = _EXTENSION_SNIFFED_MIME.get(extension, expected)
     # Fail closed for an organization-configured extension that has no reviewed
     # signature mapping. Generic ZIP is intentionally insufficient evidence for
     # DOCX/PPTX because any archive can be relabelled with those extensions.
-    return bool(expected) and declared in expected and sniffed in expected
+    return bool(expected) and declared in expected and sniffed in expected_sniffed
 
 
 def verify_attachment_object(
@@ -97,7 +110,7 @@ def verify_attachment_object(
         raise AttachmentObjectError("content_type")
 
     sniffed = _sniff_mime(get_object_range(key, start=0, end=8191))
-    if not _content_matches(filename=filename, declared=declared, sniffed=sniffed):
+    if not attachment_content_matches(filename=filename, declared=declared, sniffed=sniffed):
         raise AttachmentObjectError("content")
     return VerifiedAttachment(
         size_bytes=actual_size,

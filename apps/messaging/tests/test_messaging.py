@@ -54,6 +54,31 @@ def _attachment_key(client, monkeypatch, *, filename="photo.jpg", size=3, conten
     return key
 
 
+def test_mobile_m4a_voice_note_receives_an_exact_audio_upload_policy(tenant_a, as_role, monkeypatch):
+    teacher_client, _teacher = as_role(Role.TEACHER)
+    captured = {}
+
+    def presign(key, **kwargs):
+        captured.update(key=key, **kwargs)
+        return {"url": "https://storage.invalid/upload", "fields": {"key": key}}
+
+    monkeypatch.setattr("apps.messaging.services.presign_post_upload", presign)
+    response = teacher_client.post(
+        UPLOAD,
+        {
+            "filename": "voice-note.m4a",
+            "size_bytes": 4096,
+            "content_type": "audio/mp4",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert captured["content_type"] == "audio/mp4"
+    assert captured["size_bytes"] == 4096
+    assert captured["key"].endswith("/voice-note.m4a")
+
+
 def _role_client(client_for, tenant, *, username: str):
     login = client_for(tenant)
     response = login.post(
