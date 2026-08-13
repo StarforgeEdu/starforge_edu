@@ -212,11 +212,13 @@ def test_primary_teacher_can_update_only_bounded_teaching_progress(
 
 
 def test_exact_teacher_principal_reads_only_taught_cohorts(tenant_a, user_in, client_for):
+    from apps.cohorts.models import CohortTeacher
+    from apps.cohorts.selectors import taught_cohorts
     from apps.cohorts.tests.factories import CohortFactory
-    from apps.teachers.models import TeacherProfile
-    from apps.teachers.tests.factories import TeacherProfileFactory
     from apps.schedule.models import Lesson
     from apps.schedule.tests.factories import TermFactory
+    from apps.teachers.models import TeacherProfile, TeacherType
+    from apps.teachers.tests.factories import TeacherProfileFactory
     from core.session_auth import create_session
 
     user = user_in(tenant_a, roles=[Role.TEACHER])
@@ -226,6 +228,12 @@ def test_exact_teacher_principal_reads_only_taught_cohorts(tenant_a, user_in, cl
         if teacher is None:
             teacher = TeacherProfileFactory(user=user, branch=membership_branch)
         own = CohortFactory(branch=membership_branch, primary_teacher=teacher)
+        additional = CohortFactory(branch=membership_branch)
+        CohortTeacher.objects.create(
+            cohort=additional,
+            teacher=teacher,
+            teacher_type=TeacherType.objects.get(slug="co-teacher"),
+        )
         other = CohortFactory(branch=membership_branch)
         Lesson.objects.create(
             term=TermFactory(),
@@ -236,6 +244,12 @@ def test_exact_teacher_principal_reads_only_taught_cohorts(tenant_a, user_in, cl
             ends_at=timezone.now() + timedelta(hours=1),
         )
         session = create_session(user, principal_kind="teacher", principal_id=teacher.pk)
+        assert set(
+            taught_cohorts(
+                teacher_id=teacher.pk,
+                include_lesson_teacher=False,
+            ).values_list("pk", flat=True)
+        ) == {own.pk, additional.pk}
     client = client_for(tenant_a)
     client.credentials(HTTP_AUTHORIZATION=f"Bearer {session.key}")
 
@@ -244,7 +258,7 @@ def test_exact_teacher_principal_reads_only_taught_cohorts(tenant_a, user_in, cl
     other_detail = client.get(f"/api/v1/cohorts/{other.pk}/")
 
     assert listed.status_code == 200, listed.content
-    assert {row["id"] for row in listed.json()["data"]} == {own.pk}
+    assert {row["id"] for row in listed.json()["data"]} == {own.pk, additional.pk}
     assert own_detail.status_code == 200
     assert other_detail.status_code == 403
     assert other_detail.json()["code"] == "out_of_scope"

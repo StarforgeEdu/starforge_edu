@@ -79,8 +79,9 @@ def _get_in_scope(request: HttpRequest, pk: int, *, permission: str = "cohorts:r
         # every cohort in that branch.
         from apps.cohorts.selectors import taught_cohorts
 
+        principal = request_role_principal(request, allowed_kinds={"teacher"})
         if not taught_cohorts(
-            user_id=request.user.pk,
+            teacher_id=principal.principal_id,
             include_lesson_teacher=False,
         ).filter(pk=cohort.pk).exists():
             from core.exceptions import PermissionException
@@ -460,9 +461,10 @@ def _list(request: HttpRequest) -> HttpResponse:
     if getattr(request, "principal_kind", "") == "teacher":
         from apps.cohorts.selectors import taught_cohorts
 
+        principal = request_role_principal(request, allowed_kinds={"teacher"})
         qs = qs.filter(
             pk__in=taught_cohorts(
-                user_id=request.user.pk,
+                teacher_id=principal.principal_id,
                 include_lesson_teacher=False,
             ).values("pk")
         )
