@@ -55,6 +55,8 @@ def test_storage_bootstrap_creates_exact_non_root_identities_and_policies():
     assert 'mc mb --ignore-existing "source/$MEDIA_BUCKET" "source/$STATIC_BUCKET"' in CONFIGURE
     assert 'mc anonymous set none "source/$MEDIA_BUCKET"' in CONFIGURE
     assert "public-static-policy.json" in CONFIGURE
+    assert 'mc cors set "source/$MEDIA_BUCKET" /policies/media-cors.xml' in CONFIGURE
+    assert 'mc cors set "source/$STATIC_BUCKET" /policies/static-cors.xml' in CONFIGURE
     assert "starforge-media-runtime-v1" in CONFIGURE
     assert "starforge-static-writer-v1" in CONFIGURE
     assert "mc admin user add" in CONFIGURE
@@ -87,6 +89,8 @@ def test_policy_renderer_scopes_each_identity_and_explicitly_denies_the_other_bu
     media = json.loads((tmp_path / "media-runtime-policy.json").read_text(encoding="utf-8"))
     static = json.loads((tmp_path / "static-writer-policy.json").read_text(encoding="utf-8"))
     public = json.loads((tmp_path / "public-static-policy.json").read_text(encoding="utf-8"))
+    media_cors = (tmp_path / "media-cors.xml").read_text(encoding="utf-8")
+    static_cors = (tmp_path / "static-cors.xml").read_text(encoding="utf-8")
 
     assert any(
         statement["Effect"] == "Allow" and statement["Resource"] == ["arn:aws:s3:::starforge-media/*"]
@@ -110,6 +114,11 @@ def test_policy_renderer_scopes_each_identity_and_explicitly_denies_the_other_bu
     ]
     assert "s3:ListAllMyBuckets" not in json.dumps(media)
     assert "s3:ListAllMyBuckets" not in json.dumps(static)
+    assert "<AllowedOrigin>https://app.example.test</AllowedOrigin>" in media_cors
+    assert "<AllowedMethod>POST</AllowedMethod>" in media_cors
+    assert "<AllowedMethod>PUT</AllowedMethod>" in media_cors
+    assert "<AllowedMethod>GET</AllowedMethod>" in static_cors
+    assert "<AllowedMethod>POST</AllowedMethod>" not in static_cors
 
 
 def _render_and_write_valid_iam_evidence(root: Path) -> tuple[Path, Path]:

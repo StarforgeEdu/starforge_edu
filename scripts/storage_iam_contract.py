@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from xml.sax.saxutils import escape
 
 MEDIA_POLICY_NAME = "starforge-media-runtime-v1"
 STATIC_POLICY_NAME = "starforge-static-writer-v1"
@@ -139,6 +140,25 @@ def _public_static_policy(static_bucket: str) -> dict[str, Any]:
     }
 
 
+def _cors_document(origins: list[str], methods: tuple[str, ...]) -> str:
+    allowed_origins = "\n".join(
+        f"    <AllowedOrigin>{escape(origin)}</AllowedOrigin>" for origin in origins
+    )
+    allowed_methods = "\n".join(
+        f"    <AllowedMethod>{method}</AllowedMethod>" for method in methods
+    )
+    return f"""<CORSConfiguration>
+  <CORSRule>
+{allowed_origins}
+{allowed_methods}
+    <AllowedHeader>*</AllowedHeader>
+    <ExposeHeader>ETag</ExposeHeader>
+    <MaxAgeSeconds>3600</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>
+"""
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
@@ -173,6 +193,20 @@ def render(args: argparse.Namespace) -> None:
         _service_policy(static_bucket, media_bucket),
     )
     _write_json(destination / "public-static-policy.json", _public_static_policy(static_bucket))
+    # MinIO's process-level origin setting does not publish a bucket CORS
+    # document. Browser uploads therefore fail after a perfectly valid presign
+    # unless the exact media bucket is configured too. Keep these artifacts in
+    # the same reviewed render step as IAM so deployment cannot drift them.
+    (destination / "media-cors.xml").write_text(
+        _cors_document(app_origins, ("GET", "PUT", "POST", "HEAD")),
+        encoding="utf-8",
+    )
+    (destination / "static-cors.xml").write_text(
+        _cors_document(app_origins, ("GET", "HEAD")),
+        encoding="utf-8",
+    )
+    (destination / "media-cors.xml").chmod(0o600)
+    (destination / "static-cors.xml").chmod(0o600)
 
 
 def _read_json_lines(path: Path, *, exactly_one: bool = False) -> list[dict[str, Any]]:

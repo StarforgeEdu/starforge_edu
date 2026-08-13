@@ -152,17 +152,32 @@ class TaskService(ITaskService):
                     else {grant.branch_id for grant in write_grants if grant.department_id is None}
                 ),
             )
-        if branch is None and not is_superuser:
-            branch_wide = {
-                grant.branch_id
+        if branch is None and department is None and not is_unscoped:
+            # A scoped staff member should be able to create a personal task
+            # without knowing internal branch/department identifiers. Infer only
+            # when their effective write grants collapse to one exact boundary;
+            # ambiguous memberships remain fail-closed and require an explicit
+            # selection. Department-scoped grants must stay department-scoped —
+            # treating one as a branch-wide grant would expose another team's
+            # backlog.
+            boundaries = {
+                (grant.branch_id, grant.department_id)
                 for grant in write_grants
-                if not grant.is_organization_wide and grant.department_id is None
+                if not grant.is_organization_wide
             }
-            if len(branch_wide) == 1:
-                branch = self._resolve_branch(
-                    next(iter(branch_wide)),
-                    allowed_branch_ids=branch_wide,
-                )
+            if len(boundaries) == 1:
+                inferred_branch_id, inferred_department_id = next(iter(boundaries))
+                if inferred_department_id is not None:
+                    department = self._resolve_department(
+                        inferred_department_id,
+                        allowed_grants=write_grants,
+                    )
+                    branch = department.branch
+                else:
+                    branch = self._resolve_branch(
+                        inferred_branch_id,
+                        allowed_branch_ids={inferred_branch_id},
+                    )
         _assert_scope(is_unscoped, branch, department, write_grants)
         assignee = self._resolve_assignee(
             data.assignee_id,

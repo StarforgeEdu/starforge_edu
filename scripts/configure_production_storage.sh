@@ -174,6 +174,8 @@ docker run --rm --pull=never --read-only \
     mc mb --ignore-existing "source/$MEDIA_BUCKET" "source/$STATIC_BUCKET" >/dev/null
     mc anonymous set none "source/$MEDIA_BUCKET" >/dev/null
     mc anonymous set-json /policies/public-static-policy.json "source/$STATIC_BUCKET" >/dev/null
+    mc cors set "source/$MEDIA_BUCKET" /policies/media-cors.xml >/dev/null
+    mc cors set "source/$STATIC_BUCKET" /policies/static-cors.xml >/dev/null
     mc admin policy create source starforge-media-runtime-v1 /policies/media-runtime-policy.json >/dev/null
     mc admin policy create source starforge-static-writer-v1 /policies/static-writer-policy.json >/dev/null
     if ! mc admin user info source "$MEDIA_ACCESS_KEY" >/dev/null 2>&1; then

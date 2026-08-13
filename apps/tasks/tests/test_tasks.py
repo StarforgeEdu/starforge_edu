@@ -501,6 +501,25 @@ def test_department_only_write_grant_does_not_expand_to_branch_backlog(tenant_a,
         RoleMembership.objects.filter(user=teacher_user, branch=branch).update(department=department)
     teacher = as_user(tenant_a, teacher_user)
 
+    personal = teacher.post(
+        TASKS,
+        {
+            "title": "Personal teaching task",
+            "assignee_principal": {
+                "kind": teacher_user.test_principal_kind,
+                "id": teacher_user.test_principal_id,
+            },
+        },
+        format="json",
+    )
+    assert personal.status_code == 201, personal.content
+    personal_payload = personal.json()["data"]
+    assert personal_payload["branch"] == branch.pk
+    assert personal_payload["department"] == department.pk
+    assert personal_payload["assignee_principal"]["kind"] == teacher_user.test_principal_kind
+    assert personal_payload["assignee_principal"]["id"] == teacher_user.test_principal_id
+    assert personal_payload["assignee_principal"]["display_name"]
+
     scoped = teacher.post(
         TASKS,
         {"title": "Department task", "department": department.pk},
