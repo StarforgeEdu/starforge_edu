@@ -370,13 +370,9 @@ def test_exact_teacher_can_only_create_list_and_grant_inside_taught_groups(
         principal_id=other_profile.pk,
     )
 
-    own = teacher.post(
-        ACH, {"name": "My group star", "scope": "group", "cohort": mine.pk}, format="json"
-    )
+    own = teacher.post(ACH, {"name": "My group star", "scope": "group", "cohort": mine.pk}, format="json")
     assert own.status_code == 201, own.content
-    blocked = teacher.post(
-        ACH, {"name": "Wrong group", "scope": "group", "cohort": theirs.pk}, format="json"
-    )
+    blocked = teacher.post(ACH, {"name": "Wrong group", "scope": "group", "cohort": theirs.pk}, format="json")
     assert blocked.status_code == 400
     assert blocked.json()["errors"] == {"cohort": ["Not found."]}
 
@@ -388,14 +384,12 @@ def test_exact_teacher_can_only_create_list_and_grant_inside_taught_groups(
     assert own.json()["data"]["id"] in visible_ids
     assert other_achievement.json()["data"]["id"] not in visible_ids
 
-    global_id = director.post(
-        ACH, {"name": "Centre star", "scope": "global"}, format="json"
-    ).json()["data"]["id"]
-    assert teacher.post(
-        f"{ACH}{global_id}/grant/", {"student": my_student.pk}, format="json"
-    ).status_code == 201
-    denied = teacher.post(
-        f"{ACH}{global_id}/grant/", {"student": other_student.pk}, format="json"
+    global_id = director.post(ACH, {"name": "Centre star", "scope": "global"}, format="json").json()["data"][
+        "id"
+    ]
+    assert (
+        teacher.post(f"{ACH}{global_id}/grant/", {"student": my_student.pk}, format="json").status_code == 201
     )
+    denied = teacher.post(f"{ACH}{global_id}/grant/", {"student": other_student.pk}, format="json")
     assert denied.status_code == 404
     assert denied.json()["code"] == "not_found"

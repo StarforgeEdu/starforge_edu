@@ -93,6 +93,11 @@ def transfers_collection_view(request: HttpRequest) -> HttpResponse:
             min_value=1,
         )
         to_branch_id = int_field(body, "to_branch", required=True, min_value=1)
+        # ``required=True`` raises before returning ``None``. Keep that runtime
+        # contract explicit for static callers instead of hiding all keyword
+        # types inside an untyped dictionary expansion.
+        assert subject_id is not None
+        assert to_branch_id is not None
         from_branch_id = int_field(body, "from_branch", min_value=1)
         to_department_id = int_field(body, "to_department", min_value=1)
         reason = trimmed_str_field(body, "reason", max_length=64)
@@ -103,22 +108,29 @@ def transfers_collection_view(request: HttpRequest) -> HttpResponse:
             if is_permission_unscoped(request, permission=permission)
             else permission_membership_branch_wide_ids(roles=roles, permission=permission)
         )
-        shared = {
-            "to_branch_id": to_branch_id,
-            "reason": reason,
-            "actor": request.user,
-            "actor_principal_kind": getattr(request, "principal_kind", ""),
-            "actor_principal_id": getattr(request, "principal_id", None),
-            "allowed_branch_ids": allowed_branch_ids,
-        }
+        actor_principal_kind = getattr(request, "principal_kind", "")
+        actor_principal_id = getattr(request, "principal_id", None)
         if subject_kind == BranchTransfer.SubjectKind.STUDENT:
-            transfer = _service().transfer_student(student_id=subject_id, **shared)
+            transfer = _service().transfer_student(
+                student_id=subject_id,
+                to_branch_id=to_branch_id,
+                reason=reason,
+                actor=request.user,
+                actor_principal_kind=actor_principal_kind,
+                actor_principal_id=actor_principal_id,
+                allowed_branch_ids=allowed_branch_ids,
+            )
         elif subject_kind == BranchTransfer.SubjectKind.TEACHER:
             transfer = _service().transfer_teacher(
                 teacher_id=subject_id,
+                to_branch_id=to_branch_id,
                 to_department_id=to_department_id,
+                reason=reason,
                 confirm_impacts=confirm_impacts,
-                **shared,
+                actor=request.user,
+                actor_principal_kind=actor_principal_kind,
+                actor_principal_id=actor_principal_id,
+                allowed_branch_ids=allowed_branch_ids,
             )
         elif subject_kind == BranchTransfer.SubjectKind.STAFF:
             if from_branch_id is None:
@@ -130,15 +142,25 @@ def transfers_collection_view(request: HttpRequest) -> HttpResponse:
             transfer = _service().transfer_staff(
                 staff_id=subject_id,
                 from_branch_id=from_branch_id,
+                to_branch_id=to_branch_id,
                 to_department_id=to_department_id,
-                **shared,
+                reason=reason,
+                actor=request.user,
+                actor_principal_kind=actor_principal_kind,
+                actor_principal_id=actor_principal_id,
+                allowed_branch_ids=allowed_branch_ids,
             )
         else:
             transfer = _service().transfer_cohort(
                 cohort_id=subject_id,
+                to_branch_id=to_branch_id,
                 to_department_id=to_department_id,
+                reason=reason,
                 confirm_impacts=confirm_impacts,
-                **shared,
+                actor=request.user,
+                actor_principal_kind=actor_principal_kind,
+                actor_principal_id=actor_principal_id,
+                allowed_branch_ids=allowed_branch_ids,
             )
         return created(transfer_to_dict(transfer))
     return error("Method not allowed.", code="method_not_allowed", status=405)

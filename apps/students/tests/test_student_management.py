@@ -253,19 +253,17 @@ def test_department_hod_student_surfaces_exclude_sibling_department(tenant_a, us
     assert client.get("/api/v1/students/stats/").json()["data"]["total"] == 1
 
 
-def test_exact_teacher_principal_reads_only_students_in_taught_cohorts(
-    tenant_a, user_in, client_for
-):
+def test_exact_teacher_principal_reads_only_students_in_taught_cohorts(tenant_a, user_in, client_for):
     from datetime import timedelta
 
     from django.utils import timezone
 
     from apps.cohorts.tests.factories import CohortFactory
+    from apps.schedule.models import Lesson
+    from apps.schedule.tests.factories import TermFactory
     from apps.students.tests.factories import StudentProfileFactory
     from apps.teachers.models import TeacherProfile
     from apps.teachers.tests.factories import TeacherProfileFactory
-    from apps.schedule.models import Lesson
-    from apps.schedule.tests.factories import TermFactory
     from core.session_auth import create_session
 
     user = user_in(tenant_a, roles=[Role.TEACHER])

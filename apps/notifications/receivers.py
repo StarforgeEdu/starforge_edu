@@ -611,8 +611,7 @@ def _connect_tasks() -> None:
                 "due_at": task.due_at.isoformat() if task.due_at else "",
             },
             dedupe_key=(
-                f"task.assigned:{task.pk}:{task.assignee_principal_kind}:"
-                f"{task.assignee_principal_id}"
+                f"task.assigned:{task.pk}:{task.assignee_principal_kind}:{task.assignee_principal_id}"
             ),
         )
 

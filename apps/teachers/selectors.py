@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
-from django.db.models import Count, Q
-from django.db.models import QuerySet
+from django.db.models import Count, Q, QuerySet
 from django.utils import timezone
 
 from apps.teachers.models import TeacherProfile
@@ -142,7 +141,9 @@ def teacher_dashboard(*, teacher: TeacherProfile, user, roles, range_key: str = 
 
     graduations = [
         {"cohort": cohort.name, "end_date": cohort.end_date}
-        for cohort in sorted((item for item in cohorts if item.end_date >= today), key=lambda item: item.end_date)[:10]
+        for cohort in sorted(
+            (item for item in cohorts if item.end_date >= today), key=lambda item: item.end_date
+        )[:10]
     ]
 
     attendance_records = list(
@@ -153,9 +154,7 @@ def teacher_dashboard(*, teacher: TeacherProfile, user, roles, range_key: str = 
         ).select_related("lesson")
     )
     attendance_by_day: dict = defaultdict(lambda: {"present": 0, "counted": 0})
-    attendance_by_group: dict = defaultdict(
-        lambda: {"present": 0, "counted": 0, "smart": 0, "warning": 0}
-    )
+    attendance_by_group: dict = defaultdict(lambda: {"present": 0, "counted": 0, "smart": 0, "warning": 0})
     for record in attendance_records:
         day = timezone.localtime(record.lesson.starts_at).date()
         day_bucket = attendance_by_day[day]
@@ -191,7 +190,7 @@ def teacher_dashboard(*, teacher: TeacherProfile, user, roles, range_key: str = 
 
     week_start = local_today - timedelta(days=local_today.weekday())
     week_end = week_start + timedelta(days=7)
-    teaching_load = defaultdict(int)
+    teaching_load: defaultdict[date, int] = defaultdict(int)
     for lesson in Lesson.objects.filter(
         teacher=teacher,
         starts_at__gte=_aware_start(week_start),
@@ -280,9 +279,7 @@ def teacher_dashboard(*, teacher: TeacherProfile, user, roles, range_key: str = 
                 "id": cohort.id,
                 "name": cohort.name,
                 "attendance": (
-                    round(bucket["present"] / bucket["counted"] * 100, 1)
-                    if bucket["counted"]
-                    else None
+                    round(bucket["present"] / bucket["counted"] * 100, 1) if bucket["counted"] else None
                 ),
                 "attendance_sample_size": bucket["counted"],
                 "up_cards": bucket["smart"],

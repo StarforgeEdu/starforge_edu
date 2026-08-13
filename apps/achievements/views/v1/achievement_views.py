@@ -58,9 +58,7 @@ def _teacher_cohort_ids(request: HttpRequest) -> set[int] | None:
     if teacher is None:
         return set()
     return set(
-        taught_cohorts(teacher=teacher, include_lesson_teacher=False)
-        .order_by()
-        .values_list("id", flat=True)
+        taught_cohorts(teacher=teacher, include_lesson_teacher=False).order_by().values_list("id", flat=True)
     )
 
 
@@ -194,9 +192,12 @@ def achievement_grant_view(request: HttpRequest, pk: int) -> HttpResponse:
         branch_ids=branch_ids,
     )
     teacher_cohort_ids = _teacher_cohort_ids(request)
-    if teacher_cohort_ids is not None and student is not None:
-        if student.current_cohort_id not in teacher_cohort_ids:
-            student = None
+    if (
+        teacher_cohort_ids is not None
+        and student is not None
+        and student.current_cohort_id not in teacher_cohort_ids
+    ):
+        student = None
     if student is None:
         # Missing and outside-scope identifiers are resolved through the same
         # queryset and deliberately return the same response.

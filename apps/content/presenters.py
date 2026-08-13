@@ -96,13 +96,14 @@ def folder_to_dict(folder: Folder) -> dict:
 
 
 def lesson_file_to_dict(f: LessonFile) -> dict:
-    library = (
-        f.folder.library
-        if f.folder_id
-        else f.lesson.module.course.library
-        if f.lesson_id
-        else None
-    )
+    if f.folder_id:
+        assert f.folder is not None
+        library = f.folder.library
+    elif f.lesson_id:
+        assert f.lesson is not None
+        library = f.lesson.module.course.library
+    else:
+        library = None
     thumbnail_url = None
     storage_key = trusted_thumbnail_key(f, schema=current_schema())
     if storage_key:

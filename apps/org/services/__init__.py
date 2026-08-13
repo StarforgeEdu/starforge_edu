@@ -258,9 +258,7 @@ def record_transfer(
     student_resolved = student is not None and user is not None and student.user_id == user.pk
     if not subject_kind:
         subject_kind = (
-            BranchTransfer.SubjectKind.STUDENT
-            if student_resolved
-            else BranchTransfer.SubjectKind.LEGACY
+            BranchTransfer.SubjectKind.STUDENT if student_resolved else BranchTransfer.SubjectKind.LEGACY
         )
     if subject_kind == BranchTransfer.SubjectKind.STUDENT:
         if not student_resolved:
@@ -463,9 +461,7 @@ def _locked_transfer_branches(
             code="same_branch",
             fields={"to_branch": [_("Choose a different branch.")]},
         )
-    branches = Branch.objects.select_for_update().filter(
-        pk__in=sorted({from_branch_id, to_branch_id})
-    )
+    branches = Branch.objects.select_for_update().filter(pk__in=sorted({from_branch_id, to_branch_id}))
     branch_by_id = {branch.pk: branch for branch in branches}
     from_branch = branch_by_id.get(from_branch_id)
     to_branch = branch_by_id.get(to_branch_id)
@@ -483,11 +479,15 @@ def _locked_transfer_branches(
 def _target_department(*, department_id: int | None, to_branch: Branch) -> Department | None:
     if department_id is None:
         return None
-    department = Department.objects.select_for_update().filter(
-        pk=department_id,
-        branch=to_branch,
-        is_active=True,
-    ).first()
+    department = (
+        Department.objects.select_for_update()
+        .filter(
+            pk=department_id,
+            branch=to_branch,
+            is_active=True,
+        )
+        .first()
+    )
     if department is None:
         raise ValidationException(
             _("Choose an active department in the target branch."),
@@ -521,7 +521,11 @@ def _move_principal_memberships(
         if row.revoked_at is None
         and row.branch_id == from_branch.pk
         and (
-            (row.account_type_id is not None and row.account_type.account_kind == account_kind)
+            (
+                row.account_type_id is not None
+                and row.account_type is not None
+                and row.account_type.account_kind == account_kind
+            )
             or (row.account_type_id is None and row.role in legacy_roles)
         )
     ]
@@ -768,7 +772,9 @@ def transfer_cohort(
         starts_at__gte=timezone.now(),
         status=Lesson.Status.SCHEDULED,
     ).count()
-    if (memberships or teacher_count or cohort.primary_teacher_id or rule_count or future_lessons) and not confirm_impacts:
+    if (
+        memberships or teacher_count or cohort.primary_teacher_id or rule_count or future_lessons
+    ) and not confirm_impacts:
         raise ValidationException(
             _("Confirm the student, teaching, and schedule changes before moving this group."),
             code="transfer_confirmation_required",
@@ -794,9 +800,7 @@ def transfer_cohort(
     cohort.primary_teacher = None
     cohort.default_room = None
     cohort.full_clean()
-    cohort.save(
-        update_fields=["branch", "department", "primary_teacher", "default_room", "updated_at"]
-    )
+    cohort.save(update_fields=["branch", "department", "primary_teacher", "default_room", "updated_at"])
 
     for membership in memberships:
         transfer_student(
