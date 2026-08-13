@@ -80,10 +80,14 @@ def _get_in_scope(request: HttpRequest, pk: int, *, permission: str = "cohorts:r
         from apps.cohorts.selectors import taught_cohorts
 
         principal = request_role_principal(request, allowed_kinds={"teacher"})
-        if not taught_cohorts(
-            teacher_id=principal.principal_id,
-            include_lesson_teacher=False,
-        ).filter(pk=cohort.pk).exists():
+        if (
+            not taught_cohorts(
+                teacher_id=principal.principal_id,
+                include_lesson_teacher=False,
+            )
+            .filter(pk=cohort.pk)
+            .exists()
+        ):
             from core.exceptions import PermissionException
 
             raise PermissionException(code="out_of_scope")
