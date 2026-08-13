@@ -216,12 +216,16 @@ def archive_branch(branch: Branch) -> Branch:
 
 def record_transfer(
     *,
-    user,
+    user=None,
     from_branch: Branch,
     to_branch: Branch,
     reason: str = "",
     actor=None,
     student=None,
+    subject_kind: str = "",
+    subject_id: int | None = None,
+    subject_name: str = "",
+    subject_reference: str = "",
     actor_principal_kind: str = "",
     actor_principal_id: int | None = None,
 ) -> BranchTransfer:
@@ -251,7 +255,33 @@ def record_transfer(
             user_id=actor.pk,
             field="actor",
         )
-    student_resolved = student is not None and student.user_id == user.pk
+    student_resolved = student is not None and user is not None and student.user_id == user.pk
+    if not subject_kind:
+        subject_kind = (
+            BranchTransfer.SubjectKind.STUDENT
+            if student_resolved
+            else BranchTransfer.SubjectKind.LEGACY
+        )
+    if subject_kind == BranchTransfer.SubjectKind.STUDENT:
+        if not student_resolved:
+            raise ValidationException(
+                _("Student transfer attribution is invalid."),
+                code="validation_error",
+            )
+        subject_id = student.pk
+        subject_name = student.get_full_name()
+        subject_reference = student.student_id
+    elif subject_kind in (
+        BranchTransfer.SubjectKind.TEACHER,
+        BranchTransfer.SubjectKind.STAFF,
+    ):
+        if user is None or subject_id is None or not subject_name.strip():
+            raise ValidationException(_("Transfer attribution is invalid."), code="validation_error")
+    elif subject_kind == BranchTransfer.SubjectKind.COHORT:
+        if user is not None or subject_id is None or not subject_name.strip():
+            raise ValidationException(_("Group transfer attribution is invalid."), code="validation_error")
+    elif subject_kind != BranchTransfer.SubjectKind.LEGACY:
+        raise ValidationException(_("Transfer type is invalid."), code="validation_error")
     actor_name = _principal_display_name(
         actor,
         kind=actor_principal_kind,
@@ -259,6 +289,10 @@ def record_transfer(
     )
     return BranchTransfer.objects.create(
         user=user,
+        subject_kind=subject_kind,
+        subject_id=subject_id,
+        subject_name=subject_name.strip()[:452],
+        subject_reference=subject_reference.strip()[:150],
         student=student if student_resolved else None,
         student_public_id=student.student_id if student_resolved else "",
         student_name=student.get_full_name() if student_resolved else "",
@@ -408,6 +442,382 @@ def transfer_student(
         reason=reason,
         actor=actor,
         student=student,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+
+
+def _locked_transfer_branches(
+    *,
+    from_branch_id: int,
+    to_branch_id: int,
+    allowed_branch_ids: set[int] | None,
+) -> tuple[Branch, Branch]:
+    if allowed_branch_ids is not None and (
+        from_branch_id not in allowed_branch_ids or to_branch_id not in allowed_branch_ids
+    ):
+        raise NotFoundException(code="not_found")
+    if from_branch_id == to_branch_id:
+        raise ValidationException(
+            _("Choose a different target branch."),
+            code="same_branch",
+            fields={"to_branch": [_("Choose a different branch.")]},
+        )
+    branches = Branch.objects.select_for_update().filter(
+        pk__in=sorted({from_branch_id, to_branch_id})
+    )
+    branch_by_id = {branch.pk: branch for branch in branches}
+    from_branch = branch_by_id.get(from_branch_id)
+    to_branch = branch_by_id.get(to_branch_id)
+    if from_branch is None:
+        raise ValidationException(_("Current branch is unavailable."), code="invalid_source_branch")
+    if to_branch is None or not to_branch.is_active or to_branch.archived_at is not None:
+        raise ValidationException(
+            _("Choose an active target branch."),
+            code="invalid_target_branch",
+            fields={"to_branch": [_("Choose an active branch.")]},
+        )
+    return from_branch, to_branch
+
+
+def _target_department(*, department_id: int | None, to_branch: Branch) -> Department | None:
+    if department_id is None:
+        return None
+    department = Department.objects.select_for_update().filter(
+        pk=department_id,
+        branch=to_branch,
+        is_active=True,
+    ).first()
+    if department is None:
+        raise ValidationException(
+            _("Choose an active department in the target branch."),
+            code="department_branch_mismatch",
+            fields={"to_department": [_("Choose a department in the target branch.")]},
+        )
+    return department
+
+
+def _move_principal_memberships(
+    *,
+    user_id: int,
+    from_branch: Branch,
+    to_branch: Branch,
+    to_department: Department | None,
+    account_kind: str,
+    legacy_roles: tuple[str, ...],
+) -> int:
+    """Move active grants without broadening a department scope accidentally."""
+    from apps.users.models import RoleMembership
+
+    rows = list(
+        RoleMembership.objects.select_for_update(of=("self",))
+        .select_related("account_type")
+        .filter(user_id=user_id)
+        .order_by("pk")
+    )
+    matching = [
+        row
+        for row in rows
+        if row.revoked_at is None
+        and row.branch_id == from_branch.pk
+        and (
+            (row.account_type_id is not None and row.account_type.account_kind == account_kind)
+            or (row.account_type_id is None and row.role in legacy_roles)
+        )
+    ]
+    now = timezone.now()
+    for row in matching:
+        duplicate = next(
+            (
+                candidate
+                for candidate in rows
+                if candidate.pk != row.pk
+                and candidate.branch_id == to_branch.pk
+                and candidate.department_id == (to_department.pk if to_department else None)
+                and candidate.account_type_id == row.account_type_id
+                and (candidate.account_type_id is not None or candidate.role == row.role)
+            ),
+            None,
+        )
+        if duplicate is not None:
+            if duplicate.revoked_at is not None:
+                duplicate.revoked_at = None
+                duplicate.save(update_fields=["revoked_at"])
+            row.revoked_at = now
+            row.save(update_fields=["revoked_at"])
+            continue
+        row.branch = to_branch
+        row.department = to_department
+        row.save(update_fields=["branch", "department"])
+    return len(matching)
+
+
+@transaction.atomic
+def transfer_teacher(
+    *,
+    teacher_id: int,
+    to_branch_id: int,
+    to_department_id: int | None = None,
+    reason: str = "",
+    confirm_impacts: bool = False,
+    actor=None,
+    actor_principal_kind: str = "",
+    actor_principal_id: int | None = None,
+    allowed_branch_ids: set[int] | None = None,
+) -> BranchTransfer:
+    """Move a teacher and end source-branch work that cannot follow them safely."""
+    from apps.access.models import AccountType
+    from apps.cohorts.models import Cohort, CohortTeacher
+    from apps.schedule.models import Lesson, RecurrenceRule
+    from apps.teachers.models import TeacherProfile
+    from apps.users.models import User
+
+    teacher = (
+        TeacherProfile.objects.select_for_update()
+        .select_related("branch", "user")
+        .filter(pk=teacher_id)
+        .first()
+    )
+    if teacher is None:
+        raise NotFoundException(_("Teacher not found."), code="not_found")
+    from_branch, to_branch = _locked_transfer_branches(
+        from_branch_id=teacher.branch_id,
+        to_branch_id=to_branch_id,
+        allowed_branch_ids=allowed_branch_ids,
+    )
+    to_department = _target_department(department_id=to_department_id, to_branch=to_branch)
+    User.objects.select_for_update().get(pk=teacher.user_id)
+
+    assignment_count = CohortTeacher.objects.filter(
+        teacher=teacher,
+        cohort__branch=from_branch,
+    ).count()
+    primary_count = Cohort.objects.filter(
+        branch=from_branch,
+        primary_teacher=teacher,
+    ).count()
+    rule_count = RecurrenceRule.objects.filter(
+        teacher=teacher,
+        cohort__branch=from_branch,
+        is_active=True,
+    ).count()
+    future_lessons = Lesson.objects.filter(
+        teacher=teacher,
+        cohort__branch=from_branch,
+        starts_at__gte=timezone.now(),
+        status=Lesson.Status.SCHEDULED,
+    ).count()
+    impact_total = assignment_count + primary_count + rule_count + future_lessons
+    if impact_total and not confirm_impacts:
+        raise ValidationException(
+            _("Confirm the teaching and schedule changes before moving this teacher."),
+            code="transfer_confirmation_required",
+            fields={"confirm_impacts": [_("Review and confirm the transfer impact.")]},
+        )
+
+    CohortTeacher.objects.filter(teacher=teacher, cohort__branch=from_branch).delete()
+    Cohort.objects.filter(branch=from_branch, primary_teacher=teacher).update(primary_teacher=None)
+    RecurrenceRule.objects.filter(
+        teacher=teacher,
+        cohort__branch=from_branch,
+        is_active=True,
+    ).update(is_active=False, updated_at=timezone.now())
+    Lesson.objects.filter(
+        teacher=teacher,
+        cohort__branch=from_branch,
+        starts_at__gte=timezone.now(),
+        status=Lesson.Status.SCHEDULED,
+    ).update(
+        status=Lesson.Status.CANCELLED,
+        cancel_reason=(f"Teacher branch transfer: {reason.strip()}"[:255]),
+        updated_at=timezone.now(),
+    )
+
+    ensure_role_membership(
+        teacher,
+        branch=to_branch,
+        department=to_department,
+        role=Role.TEACHER,
+    )
+    _move_principal_memberships(
+        user_id=teacher.user_id,
+        from_branch=from_branch,
+        to_branch=to_branch,
+        to_department=to_department,
+        account_kind=AccountType.AccountKind.TEACHER,
+        legacy_roles=(Role.TEACHER,),
+    )
+    teacher.branch = to_branch
+    teacher.department = to_department
+    teacher.save(update_fields=["branch", "department", "updated_at"])
+    return record_transfer(
+        user=teacher.user,
+        subject_kind=BranchTransfer.SubjectKind.TEACHER,
+        subject_id=teacher.pk,
+        subject_name=teacher.get_full_name() or teacher.username or f"Teacher {teacher.pk}",
+        subject_reference=teacher.username or "",
+        from_branch=from_branch,
+        to_branch=to_branch,
+        reason=reason,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+
+
+@transaction.atomic
+def transfer_staff(
+    *,
+    staff_id: int,
+    from_branch_id: int,
+    to_branch_id: int,
+    to_department_id: int | None = None,
+    reason: str = "",
+    actor=None,
+    actor_principal_kind: str = "",
+    actor_principal_id: int | None = None,
+    allowed_branch_ids: set[int] | None = None,
+) -> BranchTransfer:
+    """Move every active staff responsibility from one branch to another."""
+    from apps.access.models import AccountType
+    from apps.users.models import User
+
+    staff = StaffProfile.objects.select_for_update().select_related("user").filter(pk=staff_id).first()
+    if staff is None:
+        raise NotFoundException(_("Staff member not found."), code="not_found")
+    from_branch, to_branch = _locked_transfer_branches(
+        from_branch_id=from_branch_id,
+        to_branch_id=to_branch_id,
+        allowed_branch_ids=allowed_branch_ids,
+    )
+    to_department = _target_department(department_id=to_department_id, to_branch=to_branch)
+    User.objects.select_for_update().get(pk=staff.user_id)
+    moved = _move_principal_memberships(
+        user_id=staff.user_id,
+        from_branch=from_branch,
+        to_branch=to_branch,
+        to_department=to_department,
+        account_kind=AccountType.AccountKind.STAFF,
+        legacy_roles=STAFF_ROLES,
+    )
+    if moved == 0:
+        raise ValidationException(
+            _("This staff member has no active responsibilities in the selected branch."),
+            code="invalid_source_branch",
+            fields={"from_branch": [_("Choose a branch where this person currently works.")]},
+        )
+    return record_transfer(
+        user=staff.user,
+        subject_kind=BranchTransfer.SubjectKind.STAFF,
+        subject_id=staff.pk,
+        subject_name=staff.get_full_name() or staff.username or f"Staff {staff.pk}",
+        subject_reference=staff.username or "",
+        from_branch=from_branch,
+        to_branch=to_branch,
+        reason=reason,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+
+
+@transaction.atomic
+def transfer_cohort(
+    *,
+    cohort_id: int,
+    to_branch_id: int,
+    to_department_id: int | None = None,
+    reason: str = "",
+    confirm_impacts: bool = False,
+    actor=None,
+    actor_principal_kind: str = "",
+    actor_principal_id: int | None = None,
+    allowed_branch_ids: set[int] | None = None,
+) -> BranchTransfer:
+    """Move a whole group and its active students as one database transaction."""
+    from apps.cohorts.models import Cohort, CohortMembership, CohortTeacher
+    from apps.schedule.models import Lesson, RecurrenceRule
+
+    cohort = Cohort.objects.select_for_update().select_related("branch").filter(pk=cohort_id).first()
+    if cohort is None:
+        raise NotFoundException(_("Group not found."), code="not_found")
+    if cohort.is_archived:
+        raise ValidationException(_("An archived group cannot be moved."), code="archived_group")
+    from_branch, to_branch = _locked_transfer_branches(
+        from_branch_id=cohort.branch_id,
+        to_branch_id=to_branch_id,
+        allowed_branch_ids=allowed_branch_ids,
+    )
+    if Cohort.objects.filter(branch=to_branch, name__iexact=cohort.name).exclude(pk=cohort.pk).exists():
+        raise ValidationException(
+            _("A group with this name already exists in the target branch."),
+            code="duplicate_group",
+            fields={"to_branch": [_("Choose another branch or rename the group first.")]},
+        )
+    to_department = _target_department(department_id=to_department_id, to_branch=to_branch)
+    memberships = list(
+        CohortMembership.objects.select_for_update()
+        .select_related("student", "student__user")
+        .filter(cohort=cohort, end_date__isnull=True)
+        .order_by("pk")
+    )
+    teacher_count = CohortTeacher.objects.filter(cohort=cohort).count()
+    rule_count = RecurrenceRule.objects.filter(cohort=cohort, is_active=True).count()
+    future_lessons = Lesson.objects.filter(
+        cohort=cohort,
+        starts_at__gte=timezone.now(),
+        status=Lesson.Status.SCHEDULED,
+    ).count()
+    if (memberships or teacher_count or cohort.primary_teacher_id or rule_count or future_lessons) and not confirm_impacts:
+        raise ValidationException(
+            _("Confirm the student, teaching, and schedule changes before moving this group."),
+            code="transfer_confirmation_required",
+            fields={"confirm_impacts": [_("Review and confirm the transfer impact.")]},
+        )
+
+    CohortTeacher.objects.filter(cohort=cohort).delete()
+    RecurrenceRule.objects.filter(cohort=cohort, is_active=True).update(
+        is_active=False,
+        updated_at=timezone.now(),
+    )
+    Lesson.objects.filter(
+        cohort=cohort,
+        starts_at__gte=timezone.now(),
+        status=Lesson.Status.SCHEDULED,
+    ).update(
+        status=Lesson.Status.CANCELLED,
+        cancel_reason=(f"Group branch transfer: {reason.strip()}"[:255]),
+        updated_at=timezone.now(),
+    )
+    cohort.branch = to_branch
+    cohort.department = to_department
+    cohort.primary_teacher = None
+    cohort.default_room = None
+    cohort.full_clean()
+    cohort.save(
+        update_fields=["branch", "department", "primary_teacher", "default_room", "updated_at"]
+    )
+
+    for membership in memberships:
+        transfer_student(
+            student_id=membership.student_id,
+            to_branch_id=to_branch.pk,
+            reason=reason,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+            allowed_branch_ids=allowed_branch_ids,
+        )
+    return record_transfer(
+        user=None,
+        subject_kind=BranchTransfer.SubjectKind.COHORT,
+        subject_id=cohort.pk,
+        subject_name=cohort.name,
+        subject_reference=f"group-{cohort.pk}",
+        from_branch=from_branch,
+        to_branch=to_branch,
+        reason=reason,
+        actor=actor,
         actor_principal_kind=actor_principal_kind,
         actor_principal_id=actor_principal_id,
     )

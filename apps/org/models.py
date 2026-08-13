@@ -468,7 +468,19 @@ class BranchHoliday(models.Model):
 
 
 class BranchTransfer(models.Model):
-    """Append-only student branch movement with immutable public attribution."""
+    """Append-only branch movement with immutable public attribution.
+
+    ``student`` and the student snapshot columns remain for backwards-compatible
+    student history.  ``subject_*`` is the stable, role-neutral attribution used
+    by new student, teacher, staff, and whole-group transfers.
+    """
+
+    class SubjectKind(models.TextChoices):
+        LEGACY = "legacy", _("Legacy record")
+        STUDENT = "student", _("Student")
+        TEACHER = "teacher", _("Teacher")
+        STAFF = "staff", _("Staff member")
+        COHORT = "cohort", _("Group")
 
     class AttributionStatus(models.TextChoices):
         RESOLVED = "resolved", _("Resolved")
@@ -476,7 +488,23 @@ class BranchTransfer(models.Model):
 
     # Retained only as an internal compatibility principal for old relations;
     # API presenters must use the role-native student fields below.
-    user = models.ForeignKey("users.User", on_delete=models.PROTECT, related_name="branch_transfers")
+    user = models.ForeignKey(
+        "users.User",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="branch_transfers",
+    )
+    subject_kind = models.CharField(
+        max_length=16,
+        choices=SubjectKind.choices,
+        default=SubjectKind.LEGACY,
+        editable=False,
+        db_index=True,
+    )
+    subject_id = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    subject_name = models.CharField(max_length=452, blank=True, editable=False)
+    subject_reference = models.CharField(max_length=150, blank=True, editable=False)
     student = models.ForeignKey(
         "students.StudentProfile",
         on_delete=models.PROTECT,
@@ -546,7 +574,42 @@ class BranchTransfer(models.Model):
                 condition=~models.Q(from_branch=models.F("to_branch")),
                 name="branch_transfer_branches_differ",
             ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        subject_kind="legacy",
+                        subject_id__isnull=True,
+                        subject_name="",
+                        subject_reference="",
+                    )
+                    | models.Q(
+                        subject_kind="student",
+                        subject_id=models.F("student_id"),
+                        student__isnull=False,
+                        user__isnull=False,
+                    )
+                    | (
+                        models.Q(
+                            subject_kind__in=("teacher", "staff"),
+                            subject_id__isnull=False,
+                            student__isnull=True,
+                            user__isnull=False,
+                        )
+                        & ~models.Q(subject_name="")
+                    )
+                    | (
+                        models.Q(
+                            subject_kind="cohort",
+                            subject_id__isnull=False,
+                            student__isnull=True,
+                            user__isnull=True,
+                        )
+                        & ~models.Q(subject_name="")
+                    )
+                ),
+                name="branch_transfer_subject_consistent",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover
-        return f"{self.user_id}:{self.from_branch_id}->{self.to_branch_id}"
+        return f"{self.subject_kind}:{self.subject_id}:{self.from_branch_id}->{self.to_branch_id}"

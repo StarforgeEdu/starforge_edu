@@ -1,4 +1,4 @@
-"""BranchTransferService — scoped audit reads + transactional student moves."""
+"""BranchTransferService — scoped audit reads + transactional branch moves."""
 
 from __future__ import annotations
 
@@ -41,3 +41,18 @@ class BranchTransferService(IBranchTransferService):
             actor_principal_id=actor_principal_id,
             allowed_branch_ids=allowed_branch_ids,
         )
+
+    def transfer_teacher(self, **kwargs) -> BranchTransfer:
+        from apps.org.services import transfer_teacher
+
+        return transfer_teacher(**kwargs)
+
+    def transfer_staff(self, **kwargs) -> BranchTransfer:
+        from apps.org.services import transfer_staff
+
+        return transfer_staff(**kwargs)
+
+    def transfer_cohort(self, **kwargs) -> BranchTransfer:
+        from apps.org.services import transfer_cohort
+
+        return transfer_cohort(**kwargs)

@@ -14,7 +14,8 @@ pytestmark = pytest.mark.django_db(transaction=True)
 LEGACY_TARGET = ("org", "0019_centersettings_organization_timezone")
 CURRENT_TARGET = ("org", "0021_durable_center_settings")
 INTEGRITY_TARGET = ("org", "0020_org_scope_and_history_integrity")
-ORG_MIGRATIONS = (INTEGRITY_TARGET, CURRENT_TARGET)
+GENERALIZED_TRANSFER_TARGET = ("org", "0024_generalize_branch_transfers")
+ORG_MIGRATIONS = (INTEGRITY_TARGET, CURRENT_TARGET, GENERALIZED_TRANSFER_TARGET)
 
 
 def _legacy_models():

@@ -172,6 +172,12 @@ def cohort_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         if cohort.is_archived:
             raise ValidationException("Cohort is archived.", code="cohort_archived")
         changes = _changes(read_json(request))
+        if "branch" in changes and changes["branch"] != cohort.branch_id:
+            raise ValidationException(
+                "Use the branch transfer workflow to move a group.",
+                code="use_branch_transfer",
+                fields={"branch": ["Move this group from its branch movement section."]},
+            )
         if "branch" in changes or "department" in changes:
             assert_permission_membership_scope(
                 request,

@@ -177,6 +177,26 @@ def test_update_rejects_blank_name_negative_capacity_and_cross_branch_room(tenan
         assert cohort.default_room_id is None
 
 
+def test_update_branch_change_requires_transfer_workflow(tenant_a, as_role):
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.org.tests.factories import BranchFactory
+
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        source = BranchFactory()
+        target = BranchFactory()
+        cohort = CohortFactory(branch=source)
+
+    response = client.patch(f"{URL}{cohort.id}/", {"branch": target.id}, format="json")
+    assert response.status_code == 400
+    assert response.json()["code"] == "use_branch_transfer"
+    assert "branch" in response.json()["errors"]
+
+    with schema_context(tenant_a.schema_name):
+        cohort.refresh_from_db()
+        assert cohort.branch_id == source.id
+
+
 def test_list_is_branch_scoped(tenant_a, user_in, as_user):
     from apps.cohorts.tests.factories import CohortFactory
     from apps.org.tests.factories import BranchFactory

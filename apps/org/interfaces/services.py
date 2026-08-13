@@ -115,6 +115,51 @@ class IBranchTransferService(ABC):
         allowed_branch_ids: set[int] | None,
     ) -> BranchTransfer: ...
 
+    @abstractmethod
+    def transfer_teacher(
+        self,
+        *,
+        teacher_id: int,
+        to_branch_id: int,
+        to_department_id: int | None,
+        reason: str,
+        confirm_impacts: bool,
+        actor: Any,
+        actor_principal_kind: str,
+        actor_principal_id: int | None,
+        allowed_branch_ids: set[int] | None,
+    ) -> BranchTransfer: ...
+
+    @abstractmethod
+    def transfer_staff(
+        self,
+        *,
+        staff_id: int,
+        from_branch_id: int,
+        to_branch_id: int,
+        to_department_id: int | None,
+        reason: str,
+        actor: Any,
+        actor_principal_kind: str,
+        actor_principal_id: int | None,
+        allowed_branch_ids: set[int] | None,
+    ) -> BranchTransfer: ...
+
+    @abstractmethod
+    def transfer_cohort(
+        self,
+        *,
+        cohort_id: int,
+        to_branch_id: int,
+        to_department_id: int | None,
+        reason: str,
+        confirm_impacts: bool,
+        actor: Any,
+        actor_principal_kind: str,
+        actor_principal_id: int | None,
+        allowed_branch_ids: set[int] | None,
+    ) -> BranchTransfer: ...
+
 
 class ICenterSettingsService(ABC):
     @abstractmethod

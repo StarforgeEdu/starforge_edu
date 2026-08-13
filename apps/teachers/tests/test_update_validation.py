@@ -33,27 +33,32 @@ def test_patch_cross_branch_department_400(as_role, setup):
     assert resp.status_code == 400
     assert "department" in resp.json()["errors"]
 
-    # Branch change that orphans the existing department -> 400.
+    # Branch changes cannot bypass the audited transfer workflow.
     resp = client.patch(url, {"branch": setup["other_branch"].id}, format="json")
     assert resp.status_code == 400
-    assert "department" in resp.json()["errors"]
+    assert resp.json()["code"] == "use_branch_transfer"
+    assert "branch" in resp.json()["errors"]
 
 
-def test_patch_consistent_branch_and_department_200(as_role, setup, tenant_a):
+def test_patch_branch_change_requires_transfer_workflow(as_role, setup, tenant_a):
     client, _ = as_role(Role.DIRECTOR)
     url = f"/api/v1/teachers/{setup['teacher'].id}/"
 
-    # Clearing the department skips the check; then both may move together.
+    # Department maintenance remains available on the profile itself.
     resp = client.patch(url, {"department": None}, format="json")
     assert resp.status_code == 200
 
+    # Moving the branch is an audited transaction and cannot bypass the
+    # dedicated transfer service, even when the target department is valid.
     resp = client.patch(
         url,
         {"branch": setup["other_branch"].id, "department": setup["other_dept"].id},
         format="json",
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "use_branch_transfer"
+    assert "branch" in resp.json()["errors"]
     with schema_context(tenant_a.schema_name):
         setup["teacher"].refresh_from_db()
-        assert setup["teacher"].branch_id == setup["other_branch"].id
-        assert setup["teacher"].department_id == setup["other_dept"].id
+        assert setup["teacher"].branch_id == setup["branch"].id
+        assert setup["teacher"].department_id is None

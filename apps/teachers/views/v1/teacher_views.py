@@ -173,6 +173,12 @@ def teacher_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
         body = read_json(request)
         _reject_unknown_fields(body, allowed=_UPDATE_FIELDS, operation="teacher update")
         changes = _changes(body)
+        if "branch" in changes and changes["branch"] != teacher.branch_id:
+            raise ValidationException(
+                "Use the branch transfer workflow to move a teacher.",
+                code="use_branch_transfer",
+                fields={"branch": ["Move this teacher from the branch movement section."]},
+            )
         target_branch_id = changes.get("branch", teacher.branch_id)
         target_department_id = changes.get("department", teacher.department_id)
         if "branch" in changes or "department" in changes:

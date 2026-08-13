@@ -134,6 +134,10 @@ def transfer_to_dict(t: BranchTransfer) -> dict[str, Any]:
     # bridge, not a stable public student or actor identifier.
     return {
         "id": t.id,
+        "subject_kind": t.subject_kind,
+        "subject_id": t.subject_id,
+        "subject_name": t.subject_name or None,
+        "subject_reference": t.subject_reference or None,
         "student": t.student_id,
         "student_public_id": t.student_public_id or None,
         "student_name": t.student_name or None,
