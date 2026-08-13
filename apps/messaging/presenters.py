@@ -58,7 +58,29 @@ def thread_to_dict(
     }
 
 
-def message_to_dict(message: Message) -> dict:
+def message_to_dict(
+    message: Message,
+    *,
+    viewer_principal_kind: str = "",
+    viewer_principal_id: int | None = None,
+) -> dict:
+    deleted = message.deleted_at is not None
+    reaction_rows = [] if deleted else getattr(message, "active_reactions", None)
+    if reaction_rows is None:
+        reaction_rows = list(message.reactions.filter(removed_at__isnull=True).order_by("created_at", "id"))
+    grouped: dict[str, dict] = {}
+    for reaction in reaction_rows:
+        item = grouped.setdefault(
+            reaction.emoji,
+            {"emoji": reaction.emoji, "count": 0, "reacted_by_me": False},
+        )
+        item["count"] += 1
+        if (
+            viewer_principal_id is not None
+            and reaction.reactor_principal_kind == viewer_principal_kind
+            and reaction.reactor_principal_id == viewer_principal_id
+        ):
+            item["reacted_by_me"] = True
     return {
         "id": message.id,
         "thread": message.thread_id,
@@ -66,8 +88,13 @@ def message_to_dict(message: Message) -> dict:
         "sender_principal_kind": message.sender_principal_kind,
         "sender_principal_id": message.sender_principal_id,
         "sender_attribution_status": message.sender_attribution_status,
-        "body": message.body,
-        "attachments": message.attachments,
+        "body": "" if deleted else message.body,
+        "attachments": [] if deleted else message.attachments,
+        "version": message.version,
+        "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+        "deleted_at": message.deleted_at.isoformat() if message.deleted_at else None,
+        "is_deleted": deleted,
+        "reactions": sorted(grouped.values(), key=lambda item: item["emoji"]),
         "created_at": message.created_at.isoformat(),
     }
 

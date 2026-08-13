@@ -1,9 +1,9 @@
 """In-app messaging (F4-4 / D-6): threads, participants, messages.
 
 A `Thread` is a conversation between a set of `ThreadParticipant`s (e.g. a student
-and one or more teachers). `Message`s are append-only (accountability DNA — a
-conversation record can't be quietly rewritten). `ThreadParticipant.last_read_at`
-drives unread counts.
+and one or more teachers). Message mutations retain append-only revisions and
+soft-deletion tombstones (accountability DNA — a conversation record can't be
+quietly rewritten). `ThreadParticipant.last_read_at` drives unread counts.
 """
 
 from __future__ import annotations
@@ -378,6 +378,9 @@ class Message(models.Model):
     )
     body = models.TextField()
     attachments = models.JSONField(default=list, blank=True)  # S3 keys
+    version = models.PositiveIntegerField(default=1)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
@@ -393,6 +396,10 @@ class Message(models.Model):
             ),
         ]
         constraints = [
+            models.CheckConstraint(
+                condition=models.Q(version__gt=0),
+                name="messaging_message_version_positive",
+            ),
             models.CheckConstraint(
                 condition=(
                     models.Q(
@@ -411,7 +418,7 @@ class Message(models.Model):
                     )
                 ),
                 name="message_sender_attribution_shape",
-            )
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover
@@ -423,8 +430,145 @@ class Message(models.Model):
         super().save(*args, **kwargs)
 
 
+class MessageRevisionKind(models.TextChoices):
+    EDITED = "edited", _("Edited")
+    DELETED = "deleted", _("Deleted")
+
+
+class MessageRevision(models.Model):
+    """Immutable evidence for every user-visible message mutation."""
+
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="revisions")
+    version = models.PositiveIntegerField()
+    kind = models.CharField(max_length=12, choices=MessageRevisionKind.choices)
+    actor = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    actor_principal_kind = models.CharField(
+        max_length=16,
+        choices=ParticipantPrincipalKind.choices,
+        editable=False,
+    )
+    actor_principal_id = models.PositiveBigIntegerField(editable=False)
+    previous_body = models.TextField()
+    previous_edited_at = models.DateTimeField(null=True, blank=True)
+    previous_deleted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("message_id", "version")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("message", "version"),
+                name="one_messaging_revision_per_version",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(version__gt=1)
+                    & models.Q(actor_principal_kind__in=ParticipantPrincipalKind.values)
+                    & models.Q(actor_principal_id__gt=0)
+                ),
+                name="messaging_revision_shape",
+            ),
+        ]
+
+    def save(self, *args, **kwargs) -> None:
+        if not self._state.adding:
+            raise ValidationError(_("Message revisions are append-only."))
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("Message revisions are append-only."))
+
+
+class MessageReaction(models.Model):
+    """One exact-principal reaction; removal is retained as immutable history."""
+
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="reactions")
+    reactor = models.ForeignKey(
+        "users.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    reactor_principal_kind = models.CharField(
+        max_length=16,
+        choices=ParticipantPrincipalKind.choices,
+        editable=False,
+    )
+    reactor_principal_id = models.PositiveBigIntegerField(editable=False)
+    emoji = models.CharField(max_length=16)
+    created_at = models.DateTimeField(auto_now_add=True)
+    removed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("created_at", "id")
+        indexes = [
+            models.Index(
+                fields=("message", "removed_at", "emoji"),
+                name="msg_reaction_active_idx",
+            )
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("message", "reactor_principal_kind", "reactor_principal_id", "emoji"),
+                condition=models.Q(removed_at__isnull=True),
+                name="one_active_message_reaction",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(reactor_principal_kind__in=ParticipantPrincipalKind.values)
+                    & models.Q(reactor_principal_id__gt=0)
+                ),
+                name="messaging_reaction_actor_shape",
+            ),
+        ]
+
+    def save(self, *args, **kwargs) -> None:
+        if not self._state.adding and self.pk is not None:
+            previous = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values(
+                    "message_id",
+                    "reactor_id",
+                    "reactor_principal_kind",
+                    "reactor_principal_id",
+                    "emoji",
+                    "created_at",
+                    "removed_at",
+                )
+                .first()
+            )
+            if previous is not None:
+                if (
+                    previous["message_id"] != self.message_id
+                    or previous["reactor_id"] != self.reactor_id
+                    or previous["reactor_principal_kind"] != self.reactor_principal_kind
+                    or previous["reactor_principal_id"] != self.reactor_principal_id
+                    or previous["emoji"] != self.emoji
+                    or previous["created_at"] != self.created_at
+                ):
+                    raise ValidationError(_("Message reaction attribution is immutable."))
+                if previous["removed_at"] is not None or self.removed_at is None:
+                    raise ValidationError(_("A removed message reaction is immutable."))
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(_("Message reactions use retained soft removal."))
+
+
 class ThreadEventKind(models.TextChoices):
     MESSAGE_CREATED = "message.created", _("Message created")
+    MESSAGE_UPDATED = "message.updated", _("Message updated")
+    MESSAGE_DELETED = "message.deleted", _("Message deleted")
+    REACTION_ADDED = "reaction.added", _("Reaction added")
+    REACTION_REMOVED = "reaction.removed", _("Reaction removed")
     READ_UPDATED = "read.updated", _("Read state updated")
 
 
@@ -452,8 +596,8 @@ class ThreadRealtimeEvent(models.Model):
         editable=False,
     )
     actor_principal_id = models.PositiveBigIntegerField(editable=False)
-    # For message.created this is the created message; for read.updated it is
-    # the exact inclusive message through which the actor has read.
+    # For message/reaction events this is the affected message; for read.updated
+    # it is the exact inclusive message through which the actor has read.
     message = models.ForeignKey(Message, on_delete=models.PROTECT, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -11,6 +11,7 @@ from apps.messaging.interfaces.repositories import IThreadRepository
 from apps.messaging.models import (
     DELIVERABLE_PARTICIPANT_STATUSES,
     Message,
+    MessageReaction,
     Thread,
     ThreadParticipant,
     ThreadRealtimeEvent,
@@ -134,7 +135,44 @@ class ThreadRepository(BaseRepository[Thread], IThreadRepository):
         )
 
     def messages_of(self, *, thread: Thread) -> QuerySet[Message]:
-        return Message.objects.filter(thread=thread).select_related("sender")
+        return (
+            Message.objects.filter(thread=thread)
+            .select_related("sender")
+            .prefetch_related(
+                Prefetch(
+                    "reactions",
+                    queryset=MessageReaction.objects.filter(removed_at__isnull=True),
+                    to_attr="active_reactions",
+                )
+            )
+        )
+
+    def get_participant_message(
+        self,
+        *,
+        user,
+        principal_kind: str,
+        principal_id: int,
+        pk: int,
+    ) -> Message | None:
+        return (
+            Message.objects.filter(
+                pk=pk,
+                thread__participants__user_id=user.pk,
+                thread__participants__principal_kind=principal_kind,
+                thread__participants__principal_id=principal_id,
+                thread__participants__attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
+            )
+            .select_related("sender", "thread")
+            .prefetch_related(
+                Prefetch(
+                    "reactions",
+                    queryset=MessageReaction.objects.filter(removed_at__isnull=True),
+                    to_attr="active_reactions",
+                )
+            )
+            .first()
+        )
 
     def event_page(
         self,

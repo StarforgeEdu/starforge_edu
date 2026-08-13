@@ -326,6 +326,9 @@ async def test_thread_websocket_streams_scoped_pointers_and_recovers_missed_even
     assert ready["payload"]["capabilities"] == {
         "missed_event_recovery": True,
         "read_receipts": True,
+        "message_edits": True,
+        "soft_deletion": True,
+        "reactions": True,
         "typing": False,
         "delivery_receipts": False,
         "presence": "not_provided",

@@ -227,6 +227,9 @@ class ThreadConsumer(HeartbeatConsumerMixin):
                     "capabilities": {
                         "missed_event_recovery": True,
                         "read_receipts": True,
+                        "message_edits": True,
+                        "soft_deletion": True,
+                        "reactions": True,
                         "typing": False,
                         "delivery_receipts": False,
                         "presence": "not_provided",

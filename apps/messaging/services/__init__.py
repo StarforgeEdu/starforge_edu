@@ -8,9 +8,11 @@ apps.notifications.dispatch (pointers only, never the body).
 
 from __future__ import annotations
 
+import unicodedata
 import uuid
 from contextlib import suppress
 from datetime import timedelta
+from itertools import pairwise
 
 from django.db import transaction
 from django.db.models import Q
@@ -22,6 +24,9 @@ from apps.messaging.models import (
     DELIVERABLE_PARTICIPANT_STATUSES,
     Message,
     MessageAttachmentUploadGrant,
+    MessageReaction,
+    MessageRevision,
+    MessageRevisionKind,
     ParticipantAttributionStatus,
     Thread,
     ThreadEventKind,
@@ -40,7 +45,13 @@ from core.attachment_storage import (
     allowed_attachment_mime_types,
     promote_attachment_object,
 )
-from core.exceptions import NotFoundException, PermissionException, UnprocessableEntity, ValidationException
+from core.exceptions import (
+    ConflictException,
+    NotFoundException,
+    PermissionException,
+    UnprocessableEntity,
+    ValidationException,
+)
 from core.storage_keys import normalized_storage_filename
 from core.utils import current_schema
 from infrastructure.storage.s3_client import delete_object, presign_download, presign_post_upload
@@ -50,6 +61,8 @@ _MAX_OTHER_PARTICIPANTS = 100
 _MAX_ACTIVE_UPLOAD_GRANTS = 30
 _UPLOAD_GRANT_SECONDS = 600
 _MAX_MESSAGE_BODY_CHARS = 10_000
+_MAX_REACTION_EMOJI_CHARS = 16
+_MAX_REACTION_EMOJI_BYTES = 64
 _MAX_DATABASE_ID = 9_223_372_036_854_775_807
 
 
@@ -393,13 +406,20 @@ def attachment_download_url(*, thread: Thread, key: str) -> str:
                 pk=parsed.message_id,
                 thread=thread,
                 attachments__contains=[key],
+                deleted_at__isnull=True,
             )
             .first()
         )
         grant = _trusted_final_attachment(message, key) if message is not None else None
     elif parse_legacy_attachment_key(key, schema=schema) is not None:
         message = (
-            Message.objects.select_for_update().filter(thread=thread, attachments__contains=[key]).first()
+            Message.objects.select_for_update()
+            .filter(
+                thread=thread,
+                attachments__contains=[key],
+                deleted_at__isnull=True,
+            )
+            .first()
         )
         grant = _trusted_legacy_attachment(message, key) if message is not None else None
     else:
@@ -679,6 +699,346 @@ def _append_realtime_event(
     return event
 
 
+def _normalize_reaction_emoji(value: str) -> str:
+    emoji = unicodedata.normalize("NFC", value.strip())
+    encoded = emoji.encode("utf-8")
+    if not emoji or len(emoji) > _MAX_REACTION_EMOJI_CHARS or len(encoded) > _MAX_REACTION_EMOJI_BYTES:
+        raise ValidationException(
+            _("Choose one valid emoji reaction."),
+            code="invalid_reaction",
+            fields={"emoji": [_("Use one emoji of at most 16 Unicode characters.")]},
+        )
+    if any(
+        char.isspace() or (unicodedata.category(char).startswith("C") and char not in {"\u200d", "\ufe0f"})
+        for char in emoji
+    ):
+        raise ValidationException(
+            _("Choose one valid emoji reaction."),
+            code="invalid_reaction",
+            fields={"emoji": [_("Text and control characters are not reactions.")]},
+        )
+    base_positions = [
+        index
+        for index, char in enumerate(emoji)
+        if (unicodedata.category(char) == "So" or ord(char) >= 0x1F000)
+        and not 0x1F3FB <= ord(char) <= 0x1F3FF
+    ]
+    has_keycap = "\u20e3" in emoji and emoji[0] in "#*0123456789"
+    if not base_positions and not has_keycap:
+        raise ValidationException(
+            _("Choose one valid emoji reaction."),
+            code="invalid_reaction",
+            fields={"emoji": [_("Provide an emoji rather than text.")]},
+        )
+    regional = [index for index in base_positions if 0x1F1E6 <= ord(emoji[index]) <= 0x1F1FF]
+    if regional and (len(regional) != 2 or len(base_positions) != 2):
+        raise ValidationException(
+            _("Choose one valid emoji reaction."),
+            code="invalid_reaction",
+            fields={"emoji": [_("Provide one complete flag emoji.")]},
+        )
+    if not regional and len(base_positions) > 1:
+        for left, right in pairwise(base_positions):
+            if "\u200d" not in emoji[left + 1 : right]:
+                raise ValidationException(
+                    _("Choose one valid emoji reaction."),
+                    code="invalid_reaction",
+                    fields={"emoji": [_("Provide only one emoji reaction.")]},
+                )
+    return emoji
+
+
+def _lock_message_for_actor(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+) -> tuple[Thread, Message]:
+    locked_thread = Thread.objects.select_for_update().filter(pk=message.thread_id).first()
+    if locked_thread is None:
+        raise NotFoundException(_("Message not found."), code="not_found")
+    locked_message = Message.objects.select_for_update().filter(pk=message.pk, thread=locked_thread).first()
+    if locked_message is None:
+        raise NotFoundException(_("Message not found."), code="not_found")
+    if not ThreadParticipant.objects.filter(
+        thread=locked_thread,
+        user=actor,
+        principal_kind=actor_principal_kind,
+        principal_id=actor_principal_id,
+        attribution_status__in=DELIVERABLE_PARTICIPANT_STATUSES,
+    ).exists():
+        raise NotFoundException(_("Message not found."), code="not_found")
+    return locked_thread, locked_message
+
+
+def _assert_message_author(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+) -> None:
+    if not (
+        message.sender_id == actor.pk
+        and message.sender_principal_kind == actor_principal_kind
+        and message.sender_principal_id == actor_principal_id
+        and message.sender_attribution_status in DELIVERABLE_PARTICIPANT_STATUSES
+    ):
+        raise PermissionException(
+            _("Only the original sender can change this message."),
+            code="message_not_owned",
+        )
+
+
+def _revision_before_mutation(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+    version: int,
+    kind: str,
+) -> MessageRevision:
+    return MessageRevision.objects.create(
+        message=message,
+        version=version,
+        kind=kind,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+        previous_body=message.body,
+        previous_edited_at=message.edited_at,
+        previous_deleted_at=message.deleted_at,
+    )
+
+
+def _refresh_active_reactions(message: Message) -> None:
+    message.active_reactions = list(  # type: ignore[attr-defined]
+        MessageReaction.objects.filter(message=message, removed_at__isnull=True).order_by("created_at", "id")
+    )
+
+
+@transaction.atomic
+def edit_message(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+    body: str,
+    expected_version: int | None = None,
+) -> Message:
+    body = body.strip()
+    if not body:
+        raise ValidationException(
+            _("An edited message needs text."),
+            code="empty_message",
+            fields={"body": [_("Provide message text.")]},
+        )
+    if len(body) > _MAX_MESSAGE_BODY_CHARS:
+        raise ValidationException(
+            _("The message is too long."),
+            code="validation_error",
+            fields={"body": [_("Use at most 10,000 characters.")]},
+        )
+    locked_thread, locked_message = _lock_message_for_actor(
+        message=message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+    _assert_message_author(
+        message=locked_message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+    if expected_version is not None and expected_version != locked_message.version:
+        raise ConflictException(
+            _("The message changed before this edit was applied."),
+            code="message_version_conflict",
+        )
+    if locked_message.deleted_at is not None:
+        raise ConflictException(_("A deleted message cannot be edited."), code="message_deleted")
+    if locked_message.body == body:
+        _refresh_active_reactions(locked_message)
+        return locked_message
+
+    now = timezone.now()
+    new_version = locked_message.version + 1
+    _revision_before_mutation(
+        message=locked_message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+        version=new_version,
+        kind=MessageRevisionKind.EDITED,
+    )
+    Message.objects.filter(pk=locked_message.pk).update(
+        body=body,
+        version=new_version,
+        edited_at=now,
+    )
+    Thread.objects.filter(pk=locked_thread.pk).update(updated_at=now)
+    locked_message.body = body
+    locked_message.version = new_version
+    locked_message.edited_at = now
+    _append_realtime_event(
+        locked_thread=locked_thread,
+        kind=ThreadEventKind.MESSAGE_UPDATED,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+        message=locked_message,
+    )
+    _refresh_active_reactions(locked_message)
+    return locked_message
+
+
+@transaction.atomic
+def delete_message(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+) -> Message:
+    locked_thread, locked_message = _lock_message_for_actor(
+        message=message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+    _assert_message_author(
+        message=locked_message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+    if locked_message.deleted_at is not None:
+        return locked_message
+
+    now = timezone.now()
+    new_version = locked_message.version + 1
+    _revision_before_mutation(
+        message=locked_message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+        version=new_version,
+        kind=MessageRevisionKind.DELETED,
+    )
+    Message.objects.filter(pk=locked_message.pk).update(
+        version=new_version,
+        deleted_at=now,
+    )
+    MessageReaction.objects.filter(message=locked_message, removed_at__isnull=True).update(removed_at=now)
+    Thread.objects.filter(pk=locked_thread.pk).update(updated_at=now)
+    locked_message.version = new_version
+    locked_message.deleted_at = now
+    _append_realtime_event(
+        locked_thread=locked_thread,
+        kind=ThreadEventKind.MESSAGE_DELETED,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+        message=locked_message,
+    )
+    locked_message.active_reactions = []  # type: ignore[attr-defined]
+    return locked_message
+
+
+@transaction.atomic
+def add_message_reaction(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+    emoji: str,
+) -> Message:
+    emoji = _normalize_reaction_emoji(emoji)
+    locked_thread, locked_message = _lock_message_for_actor(
+        message=message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+    if locked_message.deleted_at is not None:
+        raise ConflictException(_("A deleted message cannot receive reactions."), code="message_deleted")
+    existing = MessageReaction.objects.filter(
+        message=locked_message,
+        reactor_principal_kind=actor_principal_kind,
+        reactor_principal_id=actor_principal_id,
+        emoji=emoji,
+        removed_at__isnull=True,
+    ).first()
+    if existing is None:
+        MessageReaction.objects.create(
+            message=locked_message,
+            reactor=actor,
+            reactor_principal_kind=actor_principal_kind,
+            reactor_principal_id=actor_principal_id,
+            emoji=emoji,
+        )
+        now = timezone.now()
+        Thread.objects.filter(pk=locked_thread.pk).update(updated_at=now)
+        _append_realtime_event(
+            locked_thread=locked_thread,
+            kind=ThreadEventKind.REACTION_ADDED,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+            message=locked_message,
+        )
+    _refresh_active_reactions(locked_message)
+    return locked_message
+
+
+@transaction.atomic
+def remove_message_reaction(
+    *,
+    message: Message,
+    actor,
+    actor_principal_kind: str,
+    actor_principal_id: int,
+    emoji: str,
+) -> Message:
+    emoji = _normalize_reaction_emoji(emoji)
+    locked_thread, locked_message = _lock_message_for_actor(
+        message=message,
+        actor=actor,
+        actor_principal_kind=actor_principal_kind,
+        actor_principal_id=actor_principal_id,
+    )
+    reaction = (
+        MessageReaction.objects.select_for_update()
+        .filter(
+            message=locked_message,
+            reactor_principal_kind=actor_principal_kind,
+            reactor_principal_id=actor_principal_id,
+            emoji=emoji,
+            removed_at__isnull=True,
+        )
+        .first()
+    )
+    if reaction is not None:
+        now = timezone.now()
+        MessageReaction.objects.filter(pk=reaction.pk).update(removed_at=now)
+        Thread.objects.filter(pk=locked_thread.pk).update(updated_at=now)
+        _append_realtime_event(
+            locked_thread=locked_thread,
+            kind=ThreadEventKind.REACTION_REMOVED,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+            message=locked_message,
+        )
+    _refresh_active_reactions(locked_message)
+    return locked_message
+
+
 @transaction.atomic
 def post_message(
     *,
@@ -948,9 +1308,7 @@ def set_notifications_muted(
     ).update(notifications_muted=muted)
 
 
-def set_archived(
-    *, thread: Thread, user, principal_kind: str, principal_id: int, archived: bool
-) -> None:
+def set_archived(*, thread: Thread, user, principal_kind: str, principal_id: int, archived: bool) -> None:
     """Archive or restore one conversation for the exact signed-in role account."""
     updated = ThreadParticipant.objects.filter(
         thread=thread,

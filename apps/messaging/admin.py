@@ -2,7 +2,13 @@ from django.contrib import admin
 
 from core.admin_mixins import ReadOnlyAdmin
 
-from .models import Message, MessageAttachmentUploadGrant, ThreadRealtimeEvent
+from .models import (
+    Message,
+    MessageAttachmentUploadGrant,
+    MessageReaction,
+    MessageRevision,
+    ThreadRealtimeEvent,
+)
 
 
 @admin.register(Message)
@@ -42,6 +48,40 @@ class MessageAttachmentUploadGrantAdmin(ReadOnlyAdmin):
     search_fields = ("requested_by__username",)
     list_select_related = ("requested_by",)
     exclude = ("key", "durable_key")
+
+
+@admin.register(MessageRevision)
+class MessageRevisionAdmin(ReadOnlyAdmin):
+    """Mutation evidence is reviewable, but private prior text is never listed."""
+
+    list_display = (
+        "message_id",
+        "version",
+        "kind",
+        "actor_principal_kind",
+        "actor_principal_id",
+        "created_at",
+    )
+    list_filter = ("kind", "actor_principal_kind")
+    exclude = ("previous_body",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).defer("previous_body")
+
+
+@admin.register(MessageReaction)
+class MessageReactionAdmin(ReadOnlyAdmin):
+    """Retained reaction history; removed rows remain immutable evidence."""
+
+    list_display = (
+        "message_id",
+        "emoji",
+        "reactor_principal_kind",
+        "reactor_principal_id",
+        "created_at",
+        "removed_at",
+    )
+    list_filter = ("reactor_principal_kind", "removed_at")
 
 
 @admin.register(ThreadRealtimeEvent)

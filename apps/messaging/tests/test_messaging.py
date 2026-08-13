@@ -843,20 +843,24 @@ def test_director_and_student_share_exact_threads_in_both_directions(tenant_a, a
 # --------------------------------------------------------------------------- #
 # review hardening
 # --------------------------------------------------------------------------- #
-def test_staff_cannot_open_a_two_student_thread(tenant_a, as_role):
-    # The safeguarding invariant is on the participant SET, not just the opener:
-    # even a teacher cannot co-locate two students (no unsupervised peer channel).
+def test_teacher_can_open_a_supervised_two_student_thread(tenant_a, as_role):
+    # A teacher remains a durable participant, so this is a supervised class
+    # conversation rather than a student-created peer channel.
     teacher_client, _t = as_role(Role.TEACHER)
     _s1c, s1 = as_role(Role.STUDENT)
     _s2c, s2 = as_role(Role.STUDENT)
     r = teacher_client.post(
         THREADS, {"participant_ids": [s1.id, s2.id], "first_body": "group"}, format="json"
     )
-    assert r.status_code == 403
-    assert r.json()["code"] == "non_staff_recipient"
+    assert r.status_code == 201, r.content
+    assert {row["user"] for row in r.json()["data"]["participants"]} == {
+        _t.pk,
+        s1.pk,
+        s2.pk,
+    }
 
 
-def test_safeguarding_uses_canonical_account_kind_when_legacy_roles_drift(
+def test_supervised_group_uses_canonical_account_kind_when_legacy_roles_drift(
     tenant_a,
     as_role,
 ):
@@ -877,8 +881,11 @@ def test_safeguarding_uses_canonical_account_kind_when_legacy_roles_drift(
         format="json",
     )
 
-    assert response.status_code == 403
-    assert response.json()["code"] == "non_staff_recipient"
+    assert response.status_code == 201, response.content
+    assert {row["principal_kind"] for row in response.json()["data"]["participants"]} == {
+        "teacher",
+        "student",
+    }
 
 
 def test_teacher_parent_student_thread_allowed(tenant_a, as_role):

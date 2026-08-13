@@ -27,6 +27,16 @@ class IThreadRepository(IBaseRepository[Thread]):
     def messages_of(self, *, thread: Thread) -> QuerySet[Message]:
         raise NotImplementedError
 
+    def get_participant_message(
+        self,
+        *,
+        user,
+        principal_kind: str,
+        principal_id: int,
+        pk: int,
+    ) -> Message | None:
+        raise NotImplementedError
+
     def event_page(
         self,
         *,

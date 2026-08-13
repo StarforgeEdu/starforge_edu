@@ -13,13 +13,22 @@ _PRINCIPAL_KIND = {"type": "string", "enum": ["student", "teacher", "parent", "s
 _POSITIVE_ID = {"type": "integer", "format": "int64", "minimum": 1}
 _CURSOR = {"type": "integer", "format": "int64", "minimum": 0}
 
+_EVENT_KINDS = [
+    "message.created",
+    "message.updated",
+    "message.deleted",
+    "reaction.added",
+    "reaction.removed",
+    "read.updated",
+]
+
 _EVENT = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
         "thread_id": _POSITIVE_ID,
         "sequence": {"type": "integer", "format": "int64", "minimum": 1},
-        "kind": {"type": "string", "enum": ["message.created", "read.updated"]},
+        "kind": {"type": "string", "enum": _EVENT_KINDS},
         "message_id": _POSITIVE_ID,
         "actor_principal_kind": _PRINCIPAL_KIND,
         "actor_principal_id": _POSITIVE_ID,
@@ -34,6 +43,73 @@ _EVENT = {
         "actor_principal_id",
         "created_at",
     ],
+}
+
+_REACTION = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "emoji": {"type": "string", "minLength": 1, "maxLength": 16},
+        "count": {"type": "integer", "minimum": 1},
+        "reacted_by_me": {"type": "boolean"},
+    },
+    "required": ["emoji", "count", "reacted_by_me"],
+}
+
+_MESSAGE_DATA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "id": _POSITIVE_ID,
+        "thread": _POSITIVE_ID,
+        "sender": {**_POSITIVE_ID, "nullable": True},
+        "sender_principal_kind": {**_PRINCIPAL_KIND, "nullable": True},
+        "sender_principal_id": {**_POSITIVE_ID, "nullable": True},
+        "sender_attribution_status": {
+            "type": "string",
+            "enum": ["captured", "resolved", "unresolved", "conflicting", "quarantined"],
+        },
+        "body": {"type": "string", "maxLength": 10000},
+        "attachments": {"type": "array", "items": {"type": "string", "maxLength": 512}},
+        "version": {"type": "integer", "minimum": 1},
+        "edited_at": {"type": "string", "format": "date-time", "nullable": True},
+        "deleted_at": {"type": "string", "format": "date-time", "nullable": True},
+        "is_deleted": {"type": "boolean"},
+        "reactions": {"type": "array", "items": _REACTION},
+        "created_at": {"type": "string", "format": "date-time"},
+    },
+    "required": [
+        "id",
+        "thread",
+        "sender",
+        "sender_principal_kind",
+        "sender_principal_id",
+        "sender_attribution_status",
+        "body",
+        "attachments",
+        "version",
+        "edited_at",
+        "deleted_at",
+        "is_deleted",
+        "reactions",
+        "created_at",
+    ],
+}
+
+_MESSAGE_ID_PARAMETER = {
+    "name": "pk",
+    "in": "path",
+    "required": True,
+    "schema": _POSITIVE_ID,
+    "description": "Participant-scoped message identifier.",
+}
+
+_EMOJI_PARAMETER = {
+    "name": "emoji",
+    "in": "path",
+    "required": True,
+    "schema": {"type": "string", "minLength": 1, "maxLength": 16},
+    "description": "URL-encoded emoji previously added by this exact principal.",
 }
 
 _EVENT_PAGE_DATA = {
@@ -189,4 +265,124 @@ THREAD_READ_POST_CONTRACT = OperationContract(
         "429": error_response("Authenticated request rate limit exceeded."),
     },
     operation_id="post_messaging_thread_read_state",
+)
+
+
+MESSAGE_PATCH_CONTRACT = OperationContract(
+    method="PATCH",
+    summary="Edit an authored message",
+    description=(
+        "Edits only the body of a non-deleted message authored by the exact active principal. "
+        "The previous body is retained in an immutable revision and a durable message.updated "
+        "pointer is appended. expected_version is optional optimistic-concurrency protection."
+    ),
+    security=UNSAFE_SESSION_SECURITY,
+    permission="messaging:write",
+    parameters=(_MESSAGE_ID_PARAMETER,),
+    request_body={
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "body": {"type": "string", "minLength": 1, "maxLength": 10000},
+                        "expected_version": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["body"],
+                }
+            }
+        },
+    },
+    responses={
+        "200": _success_response("Edited message with current reactions.", _MESSAGE_DATA),
+        "400": error_response("The body or expected version is invalid."),
+        "401": error_response("The session is absent, invalid, expired, or revoked."),
+        "403": error_response("The principal lacks write authority or does not own the message."),
+        "404": error_response("The message is absent or outside the exact participant principal."),
+        "409": error_response("The message was deleted or its version changed."),
+        "429": error_response("Authenticated request rate limit exceeded."),
+    },
+    operation_id="patch_messaging_message",
+)
+
+
+MESSAGE_DELETE_CONTRACT = OperationContract(
+    method="DELETE",
+    summary="Soft-delete an authored message",
+    description=(
+        "Creates an immutable deletion revision and returns a participant-visible tombstone. "
+        "Repeating the same author's deletion is idempotent; attachments and prior content remain "
+        "private audit evidence and are no longer returned to participants."
+    ),
+    security=UNSAFE_SESSION_SECURITY,
+    permission="messaging:write",
+    parameters=(_MESSAGE_ID_PARAMETER,),
+    responses={
+        "204": {"description": "Message is soft-deleted."},
+        "401": error_response("The session is absent, invalid, expired, or revoked."),
+        "403": error_response("The principal lacks write authority or does not own the message."),
+        "404": error_response("The message is absent or outside the exact participant principal."),
+        "429": error_response("Authenticated request rate limit exceeded."),
+    },
+    operation_id="delete_messaging_message",
+)
+
+
+MESSAGE_REACTION_POST_CONTRACT = OperationContract(
+    method="POST",
+    summary="Add a message reaction",
+    description=(
+        "Adds one Unicode emoji for the exact participant principal. Repeating an active reaction "
+        "is idempotent and does not append a duplicate realtime event."
+    ),
+    security=UNSAFE_SESSION_SECURITY,
+    permission="messaging:write",
+    parameters=(_MESSAGE_ID_PARAMETER,),
+    request_body={
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"emoji": {"type": "string", "minLength": 1, "maxLength": 16}},
+                    "required": ["emoji"],
+                }
+            }
+        },
+    },
+    responses={
+        "200": _success_response("Message with current aggregated reactions.", _MESSAGE_DATA),
+        "400": error_response("The reaction is missing or is not an emoji."),
+        "401": error_response("The session is absent, invalid, expired, or revoked."),
+        "403": error_response("The principal lacks messaging write authority."),
+        "404": error_response("The message is absent or outside the exact participant principal."),
+        "409": error_response("The message is deleted."),
+        "429": error_response("Authenticated request rate limit exceeded."),
+    },
+    operation_id="post_messaging_message_reaction",
+)
+
+
+MESSAGE_REACTION_DELETE_CONTRACT = OperationContract(
+    method="DELETE",
+    summary="Remove the current principal's message reaction",
+    description=(
+        "Soft-removes only this exact principal's matching reaction. Missing/already removed "
+        "reactions are idempotent and do not append duplicate realtime events."
+    ),
+    security=UNSAFE_SESSION_SECURITY,
+    permission="messaging:write",
+    parameters=(_MESSAGE_ID_PARAMETER, _EMOJI_PARAMETER),
+    responses={
+        "204": {"description": "Reaction is absent or soft-removed."},
+        "400": error_response("The path value is not a valid emoji reaction."),
+        "401": error_response("The session is absent, invalid, expired, or revoked."),
+        "403": error_response("The principal lacks messaging write authority."),
+        "404": error_response("The message is absent or outside the exact participant principal."),
+        "429": error_response("Authenticated request rate limit exceeded."),
+    },
+    operation_id="delete_messaging_message_reaction",
 )

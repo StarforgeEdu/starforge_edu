@@ -3,9 +3,9 @@
 Strict participant isolation: you only ever resolve threads you're a member of, so every
 detail/action is participant-gated (an out-of-scope thread 404s). Opening a thread is
 messaging:write; reading + listing is messaging:read; POSTing a message additionally
-requires messaging:write (so an A-2 write-revoke makes a role read-only). Messages are
-append-only. The only PATCH is the caller's own per-thread notification preference;
-messages themselves have no PUT/PATCH/DELETE surface.
+requires messaging:write (so an A-2 write-revoke makes a role read-only). Message edits,
+soft deletion, and reaction changes retain append-only evidence and durable realtime
+pointers; only the exact sending principal may edit or delete a message.
 """
 
 from __future__ import annotations
@@ -21,6 +21,10 @@ from django.views.decorators.csrf import csrf_exempt
 from apps.messaging.dto.thread_dto import CreateThreadDTO
 from apps.messaging.interfaces.services import IThreadService
 from apps.messaging.openapi_contracts import (
+    MESSAGE_DELETE_CONTRACT,
+    MESSAGE_PATCH_CONTRACT,
+    MESSAGE_REACTION_DELETE_CONTRACT,
+    MESSAGE_REACTION_POST_CONTRACT,
     THREAD_EVENTS_GET_CONTRACT,
     THREAD_EVENTS_HEAD_CONTRACT,
     THREAD_READ_POST_CONTRACT,
@@ -93,6 +97,19 @@ def _get_thread(request: HttpRequest, pk: int):
     if thread is None:
         raise NotFoundException(code="not_found")  # non-participant -> 404, strict isolation
     return thread
+
+
+def _get_message(request: HttpRequest, pk: int):
+    principal = _viewer_principal(request)
+    message = _service().get_message(
+        user=request.user,
+        principal_kind=principal.kind,
+        principal_id=principal.principal_id,
+        pk=pk,
+    )
+    if message is None:
+        raise NotFoundException(code="not_found")
+    return message
 
 
 def _message_window(request: HttpRequest):
@@ -313,7 +330,148 @@ def thread_messages_view(request: HttpRequest, pk: int) -> HttpResponse:
         lower, upper = window
         qs = qs.filter(created_at__gte=lower, created_at__lt=upper)
     items, total, page, size = paginate(request, qs)
-    return paginated([message_to_dict(m) for m in items], total=total, page=page, page_size=size)
+    principal = _viewer_principal(request)
+    return paginated(
+        [
+            message_to_dict(
+                message,
+                viewer_principal_kind=principal.kind,
+                viewer_principal_id=principal.principal_id,
+            )
+            for message in items
+        ],
+        total=total,
+        page=page,
+        page_size=size,
+    )
+
+
+@csrf_exempt
+@require_auth
+@openapi_contract(
+    path="/api/v1/messaging/messages/{pk}/",
+    operations=(MESSAGE_PATCH_CONTRACT, MESSAGE_DELETE_CONTRACT),
+)
+def message_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method not in ("PATCH", "DELETE"):
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, f"{_RESOURCE}:read")
+    message = _get_message(request, pk)
+    check_perm(request, f"{_RESOURCE}:write")
+    principal = _viewer_principal(request)
+    if request.method == "DELETE":
+        _service().delete_message(
+            message=message,
+            actor=request.user,
+            actor_principal_kind=principal.kind,
+            actor_principal_id=principal.principal_id,
+        )
+        return no_content()
+
+    body = read_json(request)
+    unknown = sorted(set(body) - {"body", "expected_version"})
+    if unknown:
+        raise ValidationException(
+            "Unknown message edit field.",
+            code="validation_error",
+            fields={name: ["This field is not supported."] for name in unknown},
+        )
+    if "body" not in body:
+        raise ValidationException(
+            "body is required.",
+            code="validation_error",
+            fields={"body": ["This field is required."]},
+        )
+    text = str_field(body, "body", max_length=10_000)
+    expected_version = int_field(
+        body,
+        "expected_version",
+        required=False,
+        min_value=1,
+        max_value=_MAX_DATABASE_ID,
+    )
+    updated = _service().edit_message(
+        message=message,
+        actor=request.user,
+        actor_principal_kind=principal.kind,
+        actor_principal_id=principal.principal_id,
+        body=text,
+        expected_version=expected_version,
+    )
+    return success(
+        message_to_dict(
+            updated,
+            viewer_principal_kind=principal.kind,
+            viewer_principal_id=principal.principal_id,
+        )
+    )
+
+
+@csrf_exempt
+@require_auth
+@openapi_contract(
+    path="/api/v1/messaging/messages/{pk}/reactions/",
+    operations=(MESSAGE_REACTION_POST_CONTRACT,),
+)
+def message_reactions_view(request: HttpRequest, pk: int) -> HttpResponse:
+    if request.method != "POST":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, f"{_RESOURCE}:read")
+    message = _get_message(request, pk)
+    check_perm(request, f"{_RESOURCE}:write")
+    body = read_json(request)
+    unknown = sorted(set(body) - {"emoji"})
+    if unknown:
+        raise ValidationException(
+            "Unknown reaction field.",
+            code="validation_error",
+            fields={name: ["This field is not supported."] for name in unknown},
+        )
+    if "emoji" not in body:
+        raise ValidationException(
+            "emoji is required.",
+            code="validation_error",
+            fields={"emoji": ["This field is required."]},
+        )
+    emoji = str_field(body, "emoji", max_length=16)
+    principal = _viewer_principal(request)
+    updated = _service().add_reaction(
+        message=message,
+        actor=request.user,
+        actor_principal_kind=principal.kind,
+        actor_principal_id=principal.principal_id,
+        emoji=emoji,
+    )
+    return success(
+        message_to_dict(
+            updated,
+            viewer_principal_kind=principal.kind,
+            viewer_principal_id=principal.principal_id,
+        )
+    )
+
+
+@csrf_exempt
+@require_auth
+@openapi_contract(
+    path="/api/v1/messaging/messages/{pk}/reactions/{emoji}/",
+    operations=(MESSAGE_REACTION_DELETE_CONTRACT,),
+)
+def message_reaction_detail_view(request: HttpRequest, pk: int, emoji: str) -> HttpResponse:
+    if request.method != "DELETE":
+        return error("Method not allowed.", code="method_not_allowed", status=405)
+    check_perm(request, f"{_RESOURCE}:read")
+    message = _get_message(request, pk)
+    check_perm(request, f"{_RESOURCE}:write")
+    principal = _viewer_principal(request)
+    _service().remove_reaction(
+        message=message,
+        actor=request.user,
+        actor_principal_kind=principal.kind,
+        actor_principal_id=principal.principal_id,
+        emoji=emoji,
+    )
+    return no_content()
 
 
 @csrf_exempt
@@ -533,7 +691,13 @@ def _send_message(request: HttpRequest, thread) -> HttpResponse:
         body=text,
         attachments=attachments,
     )
-    return created(message_to_dict(message))
+    return created(
+        message_to_dict(
+            message,
+            viewer_principal_kind=principal.kind,
+            viewer_principal_id=principal.principal_id,
+        )
+    )
 
 
 def _participant_ids(body: dict[str, Any]) -> list[int]:

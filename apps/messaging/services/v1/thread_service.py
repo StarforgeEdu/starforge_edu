@@ -11,11 +11,15 @@ from apps.messaging.interfaces.repositories import IThreadRepository
 from apps.messaging.interfaces.services import IThreadService
 from apps.messaging.models import Message, Thread
 from apps.messaging.services import (
+    add_message_reaction,
     assert_thread_safeguarding,
     create_thread,
+    delete_message,
+    edit_message,
     hide_thread,
     mark_read,
     post_message,
+    remove_message_reaction,
     set_archived,
     set_notifications_muted,
 )
@@ -52,6 +56,21 @@ class ThreadService(IThreadService):
 
     def messages_of(self, *, thread: Thread) -> QuerySet[Message]:
         return self.repository.messages_of(thread=thread)
+
+    def get_message(
+        self,
+        *,
+        user,
+        principal_kind: str,
+        principal_id: int,
+        pk: int,
+    ) -> Message | None:
+        return self.repository.get_participant_message(
+            user=user,
+            principal_kind=principal_kind,
+            principal_id=principal_id,
+            pk=pk,
+        )
 
     def event_page(
         self,
@@ -232,6 +251,74 @@ class ThreadService(IThreadService):
             attachments=attachments,
         )
 
+    def edit_message(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        body: str,
+        expected_version: int | None,
+    ) -> Message:
+        return edit_message(
+            message=message,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+            body=body,
+            expected_version=expected_version,
+        )
+
+    def delete_message(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+    ) -> Message:
+        return delete_message(
+            message=message,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+        )
+
+    def add_reaction(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        emoji: str,
+    ) -> Message:
+        return add_message_reaction(
+            message=message,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+            emoji=emoji,
+        )
+
+    def remove_reaction(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        emoji: str,
+    ) -> Message:
+        return remove_message_reaction(
+            message=message,
+            actor=actor,
+            actor_principal_kind=actor_principal_kind,
+            actor_principal_id=actor_principal_id,
+            emoji=emoji,
+        )
+
     def mark_read(
         self,
         *,
@@ -283,9 +370,7 @@ class ThreadService(IThreadService):
             archived=archived,
         )
 
-    def hide_thread(
-        self, *, thread: Thread, user, principal_kind: str, principal_id: int
-    ) -> None:
+    def hide_thread(self, *, thread: Thread, user, principal_kind: str, principal_id: int) -> None:
         hide_thread(
             thread=thread,
             user=user,

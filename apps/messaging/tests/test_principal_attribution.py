@@ -150,6 +150,28 @@ def test_same_bridge_role_sessions_own_separate_threads_and_delivery(tenant_a, c
     )
     assert delivered.status_code == 201, delivered.content
 
+    # Message-level mutation routes retain the same exact-principal boundary;
+    # sharing a bridge User never grants the sibling role access to the row.
+    staff_message = staff_client.get(f"{THREADS}{staff_thread.pk}/messages/").json()["data"][0]
+    staff_message_url = f"/api/v1/messaging/messages/{staff_message['id']}/"
+    assert student_client.patch(staff_message_url, {"body": "borrow"}, format="json").status_code == 404
+    assert (
+        student_client.post(
+            f"{staff_message_url}reactions/",
+            {"emoji": "👍"},
+            format="json",
+        ).status_code
+        == 404
+    )
+    own_edit = staff_client.patch(
+        staff_message_url,
+        {"body": "staff-only corrected", "expected_version": 1},
+        format="json",
+    )
+    assert own_edit.status_code == 200, own_edit.content
+    student_message_url = f"/api/v1/messaging/messages/{delivered.json()['data']['id']}/"
+    assert staff_client.delete(student_message_url).status_code == 404
+
     with schema_context(tenant_a.schema_name):
         student_seat.refresh_from_db()
         staff_seat.refresh_from_db()

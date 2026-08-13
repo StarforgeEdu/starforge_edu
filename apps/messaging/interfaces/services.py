@@ -22,6 +22,16 @@ class IThreadService(ABC):
     def messages_of(self, *, thread: Thread) -> QuerySet[Message]: ...
 
     @abstractmethod
+    def get_message(
+        self,
+        *,
+        user,
+        principal_kind: str,
+        principal_id: int,
+        pk: int,
+    ) -> Message | None: ...
+
+    @abstractmethod
     def event_page(
         self,
         *,
@@ -69,6 +79,50 @@ class IThreadService(ABC):
     ) -> Message: ...
 
     @abstractmethod
+    def edit_message(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        body: str,
+        expected_version: int | None,
+    ) -> Message: ...
+
+    @abstractmethod
+    def delete_message(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+    ) -> Message: ...
+
+    @abstractmethod
+    def add_reaction(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        emoji: str,
+    ) -> Message: ...
+
+    @abstractmethod
+    def remove_reaction(
+        self,
+        *,
+        message: Message,
+        actor,
+        actor_principal_kind: str,
+        actor_principal_id: int,
+        emoji: str,
+    ) -> Message: ...
+
+    @abstractmethod
     def mark_read(
         self,
         *,
@@ -102,9 +156,7 @@ class IThreadService(ABC):
     ) -> None: ...
 
     @abstractmethod
-    def hide_thread(
-        self, *, thread: Thread, user, principal_kind: str, principal_id: int
-    ) -> None: ...
+    def hide_thread(self, *, thread: Thread, user, principal_kind: str, principal_id: int) -> None: ...
 
     @abstractmethod
     def presign_attachment(
