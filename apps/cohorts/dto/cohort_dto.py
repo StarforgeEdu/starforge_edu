@@ -19,6 +19,8 @@ class CohortCreateDTO:
     end_date: date
     department_id: int | None = None
     level: str = ""
+    audience_type: str = ""
+    custom_audience_name: str = ""
     study_month: int = 1
     lesson_cycle_length: int = 12
     capacity: int | None = None

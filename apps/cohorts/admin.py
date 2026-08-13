@@ -31,11 +31,18 @@ class CohortAdmin(admin.ModelAdmin):
         "department",
         "study_month",
         "lesson_cycle_length",
+        "audience_type",
         "is_archived",
         "start_date",
         "end_date",
     )
-    list_filter = ("is_archived", "branch", "study_month", "lesson_cycle_length")
+    list_filter = (
+        "is_archived",
+        "branch",
+        "audience_type",
+        "study_month",
+        "lesson_cycle_length",
+    )
     search_fields = ("name", "level")
     # ``primary_teacher`` is a read-compatible projection of the canonical typed
     # assignments. Hiding it prevents two competing teacher editors in admin;

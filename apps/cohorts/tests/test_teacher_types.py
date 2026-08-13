@@ -317,6 +317,7 @@ def test_legacy_primary_edit_creates_canonical_main_assignment(director, tenant_
             "branch": branch.id,
             "start_date": "2026-01-01",
             "end_date": "2026-12-31",
+            "audience_type": "adults",
             "primary_teacher": teacher.id,
         },
         format="json",

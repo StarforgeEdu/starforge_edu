@@ -51,8 +51,8 @@ from core.scoping import (
 )
 
 _RESOURCE = "cohorts"
-_FILTERS = ("branch", "department", "is_archived")
-_SEARCH = ("name", "level")
+_FILTERS = ("branch", "department", "audience_type", "is_archived")
+_SEARCH = ("name", "level", "custom_audience_name")
 _ORDERING = ("start_date", "created_at", "name")
 
 
@@ -486,6 +486,13 @@ def _list(request: HttpRequest) -> HttpResponse:
 
 def _create(request: HttpRequest) -> HttpResponse:
     body = read_json(request)
+    audience_type = str_field(body, "audience_type", max_length=16).strip()
+    if not audience_type:
+        raise ValidationException(
+            "Group audience is required.",
+            code="validation_error",
+            fields={"audience_type": ["Choose Kids, Teens, Adults, or Custom / private."]},
+        )
     branch_id = int_field(body, "branch", required=True)
     department_id = int_field(body, "department")
     assert_permission_membership_scope(
@@ -502,6 +509,8 @@ def _create(request: HttpRequest) -> HttpResponse:
         end_date=_date(body, "end_date", required=True),  # type: ignore[arg-type]
         department_id=department_id,
         level=str_field(body, "level"),
+        audience_type=audience_type,
+        custom_audience_name=str_field(body, "custom_audience_name", max_length=80),
         study_month=int_field(
             body,
             "study_month",
@@ -539,6 +548,16 @@ def _changes(body: dict[str, Any]) -> dict[str, Any]:
         changes["department"] = int_field(body, "department")
     if "level" in body:
         changes["level"] = str_field(body, "level")
+    if "audience_type" in body:
+        changes["audience_type"] = str_field(body, "audience_type", max_length=16).strip()
+        if changes["audience_type"] != "custom" and "custom_audience_name" not in body:
+            changes["custom_audience_name"] = ""
+    if "custom_audience_name" in body:
+        changes["custom_audience_name"] = str_field(
+            body,
+            "custom_audience_name",
+            max_length=80,
+        )
     if "study_month" in body:
         changes["study_month"] = int_field(
             body,

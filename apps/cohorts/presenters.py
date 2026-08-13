@@ -66,8 +66,18 @@ def cohort_to_dict(cohort: Cohort) -> dict[str, Any]:
         "department": cohort.department_id,
         "department_name": cohort.department.name if cohort.department else None,
         "level": cohort.level,
+        "audience_type": cohort.audience_type,
+        "audience_type_label": cohort.get_audience_type_display(),
+        "custom_audience_name": cohort.custom_audience_name,
+        "audience_display": (
+            cohort.custom_audience_name
+            if cohort.audience_type == Cohort.AudienceType.CUSTOM
+            else cohort.get_audience_type_display()
+        ),
         "study_month": cohort.study_month,
         "lesson_cycle_length": cohort.lesson_cycle_length,
+        "automatic_exam_lesson": True,
+        "exam_lesson_number": cohort.lesson_cycle_length,
         "start_date": cohort.start_date.isoformat(),
         "end_date": cohort.end_date.isoformat(),
         "capacity": cohort.capacity,

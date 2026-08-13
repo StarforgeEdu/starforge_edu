@@ -9,6 +9,17 @@ from django.utils.translation import gettext_lazy as _
 
 
 class Cohort(models.Model):
+    class AudienceType(models.TextChoices):
+        # ``unspecified`` exists only for records created before audience
+        # classification shipped. New API creates reject it so every new group
+        # has an intentional audience, while old data remains deployable and can
+        # be categorized from Group settings.
+        UNSPECIFIED = "unspecified", _("Needs classification")
+        KIDS = "kids", _("Kids")
+        TEENS = "teens", _("Teens")
+        ADULTS = "adults", _("Adults")
+        CUSTOM = "custom", _("Custom / private")
+
     class LessonCycleLength(models.IntegerChoices):
         EIGHT = 8, _("8 lessons")
         TWELVE = 12, _("12 lessons")
@@ -23,6 +34,13 @@ class Cohort(models.Model):
         related_name="cohorts",
     )
     level = models.CharField(max_length=64, blank=True)
+    audience_type = models.CharField(
+        max_length=16,
+        choices=AudienceType.choices,
+        default=AudienceType.UNSPECIFIED,
+        db_index=True,
+    )
+    custom_audience_name = models.CharField(max_length=80, blank=True)
     # Human-readable position in the centre's curriculum. This is deliberately
     # explicit rather than guessed from dates: imported cohorts and holiday gaps
     # make calendar-month arithmetic untrustworthy.
@@ -64,6 +82,13 @@ class Cohort(models.Model):
                 condition=Q(lesson_cycle_length__in=(8, 12)),
                 name="cohort_lesson_cycle_length_supported",
             ),
+            models.CheckConstraint(
+                condition=(
+                    Q(audience_type="custom", custom_audience_name__gt="")
+                    | ~Q(audience_type="custom", custom_audience_name="")
+                ),
+                name="cohort_custom_audience_named",
+            ),
         ]
 
     def __str__(self) -> str:  # pragma: no cover
@@ -71,6 +96,11 @@ class Cohort(models.Model):
 
     def clean(self) -> None:
         errors: dict[str, list[str]] = {}
+        custom_audience_name = str(self.custom_audience_name or "").strip()
+        if self.audience_type == self.AudienceType.CUSTOM and not custom_audience_name:
+            errors["custom_audience_name"] = [str(_("Name this custom or private group type."))]
+        elif self.audience_type != self.AudienceType.CUSTOM and custom_audience_name:
+            errors["custom_audience_name"] = [str(_("Use a custom name only with Custom / private."))]
         for field_name in ("department", "primary_teacher", "default_room"):
             related = getattr(self, field_name, None)
             if related is not None and self.branch_id and related.branch_id != self.branch_id:

@@ -28,6 +28,7 @@ def test_director_create_list_retrieve_delete(tenant_a, as_role):
             "start_date": "2026-01-01",
             "end_date": "2026-06-30",
             "level": "A1",
+            "audience_type": "adults",
         },
         format="json",
     )
@@ -58,7 +59,13 @@ def test_create_rejects_end_before_start(tenant_a, as_role):
         branch = BranchFactory()
     resp = client.post(
         URL,
-        {"name": "Bad", "branch": branch.id, "start_date": "2026-06-30", "end_date": "2026-01-01"},
+        {
+            "name": "Bad",
+            "branch": branch.id,
+            "start_date": "2026-06-30",
+            "end_date": "2026-01-01",
+            "audience_type": "teens",
+        },
         format="json",
     )
     assert resp.status_code == 400
@@ -84,6 +91,7 @@ def test_create_rejects_cross_branch_relationships(tenant_a, as_role):
             "branch": branch.id,
             "start_date": "2026-01-01",
             "end_date": "2026-06-30",
+            "audience_type": "kids",
             "department": department.id,
             "default_room": room.id,
             "primary_teacher": teacher.id,
@@ -94,6 +102,44 @@ def test_create_rejects_cross_branch_relationships(tenant_a, as_role):
     assert response.status_code == 400
     assert response.json()["code"] == "cross_branch_relationship"
     assert set(response.json()["errors"]) == {"department", "default_room", "primary_teacher"}
+
+
+def test_create_requires_filterable_audience_and_names_custom_groups(tenant_a, as_role):
+    from apps.org.tests.factories import BranchFactory
+
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+    base = {
+        "name": "Private Focus",
+        "branch": branch.id,
+        "start_date": "2026-01-01",
+        "end_date": "2026-06-30",
+    }
+
+    missing = client.post(URL, base, format="json")
+    unnamed = client.post(URL, {**base, "audience_type": "custom"}, format="json")
+    unsupported = client.post(URL, {**base, "audience_type": "executives"}, format="json")
+    created = client.post(
+        URL,
+        {**base, "audience_type": "custom", "custom_audience_name": "Executive private"},
+        format="json",
+    )
+
+    assert missing.status_code == 400
+    assert set(missing.json()["errors"]) == {"audience_type"}
+    assert unnamed.status_code == 400
+    assert set(unnamed.json()["errors"]) == {"custom_audience_name"}
+    assert unsupported.status_code == 400
+    assert set(unsupported.json()["errors"]) == {"audience_type"}
+    assert created.status_code == 201, created.content
+    assert created.json()["data"]["audience_display"] == "Executive private"
+    assert created.json()["data"]["exam_lesson_number"] == 12
+    assert created.json()["data"]["automatic_exam_lesson"] is True
+
+    filtered = client.get(URL, {"audience_type": "custom"})
+    assert filtered.status_code == 200
+    assert {row["id"] for row in filtered.json()["data"]} == {created.json()["data"]["id"]}
 
 
 def test_update_rejects_blank_name_negative_capacity_and_cross_branch_room(tenant_a, as_role):

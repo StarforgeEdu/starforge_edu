@@ -38,6 +38,8 @@ from core.exceptions import ConflictException, ValidationException
 _SCALAR_FIELDS = (
     "name",
     "level",
+    "audience_type",
+    "custom_audience_name",
     "study_month",
     "lesson_cycle_length",
     "start_date",
@@ -65,6 +67,8 @@ class CohortService(ICohortService):
             branch=self._resolve_branch(data.branch_id),
             department=self._resolve_department(data.department_id),
             level=data.level,
+            audience_type=data.audience_type,
+            custom_audience_name=data.custom_audience_name,
             study_month=data.study_month,
             lesson_cycle_length=data.lesson_cycle_length,
             start_date=data.start_date,
@@ -349,6 +353,32 @@ class CohortService(ICohortService):
                 fields={"name": ["This field may not be blank."]},
             )
         cohort.name = name
+        cohort.custom_audience_name = str(cohort.custom_audience_name or "").strip()
+        if cohort.audience_type not in Cohort.AudienceType.values:
+            raise ValidationException(
+                _("Choose a supported group audience."),
+                code="validation_error",
+                fields={"audience_type": ["Choose Kids, Teens, Adults, or Custom / private."]},
+            )
+        if cohort.audience_type == Cohort.AudienceType.UNSPECIFIED and cohort.pk is None:
+            raise ValidationException(
+                _("Group audience is required."),
+                code="validation_error",
+                fields={"audience_type": ["Choose Kids, Teens, Adults, or Custom / private."]},
+            )
+        if cohort.audience_type == Cohort.AudienceType.CUSTOM:
+            if not cohort.custom_audience_name:
+                raise ValidationException(
+                    _("Name the custom or private group type."),
+                    code="validation_error",
+                    fields={"custom_audience_name": ["Enter a name for this custom or private group type."]},
+                )
+        elif cohort.custom_audience_name:
+            raise ValidationException(
+                _("Custom audience name is only available for custom groups."),
+                code="validation_error",
+                fields={"custom_audience_name": ["Clear this value or choose Custom / private."]},
+            )
         if cohort.capacity is not None and cohort.capacity < 0:
             raise ValidationException(
                 _("Capacity cannot be negative."),
