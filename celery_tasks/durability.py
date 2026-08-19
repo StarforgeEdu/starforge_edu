@@ -142,6 +142,11 @@ TASK_DURABILITY_CONTRACTS = (
         "retry resets only non-terminal exports and redelivery reuses DONE",
     ),
     DurabilityContract(
+        "celery_tasks.people_import_tasks.process_people_import",
+        "draft and row locks plus terminal imported-row state bound to the created object",
+        "redelivery skips completed drafts and imported rows, then resumes only remaining ready rows",
+    ),
+    DurabilityContract(
         "celery_tasks.print_tasks.*",
         "durable print-job state/audit dedupe; physical output is pulled under a separate delivery lease",
         "Celery never reprints; stale physical leases are quarantined for reconciliation",
