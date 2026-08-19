@@ -5,7 +5,7 @@ signal, honor-roll knob, scoping, cross-tenant, and query budgets."""
 from __future__ import annotations
 
 import io
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -1082,3 +1082,75 @@ def test_exams_list_query_budget(tenant_a, user_in, as_user, django_assert_max_n
     with django_assert_max_num_queries(9):  # +1: A-2 per-request permission-override load
         body = client.get("/api/v1/academics/exams/").json()
     assert body["pagination"]["total"] == 5
+
+
+def test_exam_overview_uses_exact_branch_scope_and_fourteen_calendar_dates(
+    tenant_a,
+    as_role,
+):
+    from django.utils import timezone
+
+    client, _ = as_role("director")
+    today = timezone.localdate()
+    with schema_context(tenant_a.schema_name):
+        branch = BranchFactory()
+        cohort = CohortFactory(branch=branch)
+        other_cohort = CohortFactory(branch=BranchFactory())
+        published = ExamFactory(
+            cohort=cohort,
+            title="Today published",
+            exam_date=today,
+            is_published=True,
+        )
+        draft = ExamFactory(
+            cohort=cohort,
+            title="Last day draft",
+            exam_date=today + timedelta(days=13),
+            is_published=False,
+        )
+        correction = ExamFactory(
+            cohort=cohort,
+            title="Correction pending",
+            exam_date=today + timedelta(days=2),
+            is_published=False,
+            requires_republish=True,
+        )
+        outside_window = ExamFactory(
+            cohort=cohort,
+            title="Outside window",
+            exam_date=today + timedelta(days=14),
+            is_published=True,
+        )
+        ExamFactory(
+            cohort=other_cohort,
+            title="Other branch",
+            exam_date=today + timedelta(days=1),
+            is_published=True,
+        )
+
+    response = client.get(
+        "/api/v1/academics/exams/overview/",
+        {"branch": branch.pk},
+    )
+    assert response.status_code == 200, response.content
+    data = response.json()["data"]
+    assert data["total_exams"] == 4
+    assert data["published_exams"] == 2
+    assert data["drafts"] == 1
+    assert data["corrections_due"] == 1
+    assert data["next_14_days"] == 3
+    assert data["as_of"] == today.isoformat()
+    assert data["window_end"] == (today + timedelta(days=13)).isoformat()
+    assert data["schedule_kind"] == "upcoming"
+    assert [row["id"] for row in data["schedule"]] == [
+        published.pk,
+        correction.pk,
+        draft.pk,
+        outside_window.pk,
+    ]
+    assert [row["id"] for row in data["attention"]] == [
+        correction.pk,
+        draft.pk,
+    ]
+    assert sum(row["value"] for row in data["subject_distribution"]) == 4
+    assert sum(row["value"] for row in data["type_distribution"]) == 4

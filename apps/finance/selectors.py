@@ -5,10 +5,21 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from django.db.models import DecimalField, OuterRef, Q, QuerySet, Subquery, Sum, Value
+from django.db.models import (
+    DecimalField,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Q,
+    QuerySet,
+    Subquery,
+    Sum,
+    Value,
+)
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 
-from apps.finance.models import CashierShift, Invoice, PaymentAllocation
+from apps.finance.models import CashierShift, FeeSchedule, Invoice, PaymentAllocation
 from core.historical_scope import ATTRIBUTED_SCOPE_STATUSES
 from core.permissions import (
     PermissionRoleSet,
@@ -186,6 +197,52 @@ def scoped_invoice_summaries(
         user=user,
         roles=roles,
         permission=permission,
+    )
+
+
+def scoped_debt_invoices(
+    *,
+    user,
+    roles: set[str] | None = None,
+    permission: str = "finance:read",
+) -> QuerySet[Invoice]:
+    """Visible, past-due monthly tuition invoices with a positive balance.
+
+    Rebase the scoped ids onto the one-row-per-invoice summary query before
+    aggregation. Permission joins can otherwise multiply invoice rows and
+    overstate a student's debt when the register groups records by student.
+    """
+    visible_ids = (
+        scoped_invoice_summaries(
+            user=user,
+            roles=roles,
+            permission=permission,
+        )
+        .order_by()
+        .values("pk")
+    )
+    money_field = DecimalField(max_digits=24, decimal_places=2)
+    return (
+        _invoice_summary_base()
+        .filter(
+            pk__in=Subquery(visible_ids),
+            status__in=OPEN_STATUSES,
+            due_date__lt=timezone.localdate(),
+        )
+        .filter(
+            Q(fee_schedule__billing_period=FeeSchedule.BillingPeriod.MONTHLY)
+            | Q(
+                fee_schedule__isnull=True,
+                period__regex=r"^\d{4}-(0[1-9]|1[0-2])$",
+            )
+        )
+        .annotate(
+            debt_uzs=ExpressionWrapper(
+                F("total_uzs") - F("allocated_uzs"),
+                output_field=money_field,
+            )
+        )
+        .filter(debt_uzs__gt=0)
     )
 
 

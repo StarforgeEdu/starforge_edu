@@ -9,9 +9,12 @@ even on read, so a student/parent holding ``academics:read`` can't harvest score
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
+from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.views.decorators.csrf import csrf_exempt
 
@@ -42,7 +45,7 @@ from core.api_auth import check_perm, require_auth
 from core.container import container
 from core.exceptions import NotFoundException, PermissionException, ValidationException
 from core.http import bool_field, decimal_field, parse_bool, read_json, read_json_array
-from core.listing import apply_filters, paginate
+from core.listing import apply_filters, paginate, positive_int_filter
 from core.openapi_contracts import openapi_contract
 from core.permissions import get_user_roles
 from core.ratelimit import check_rate
@@ -478,6 +481,91 @@ def exams_collection_view(request: HttpRequest) -> HttpResponse:
         )
         return created(exam_to_dict(exam))
     return _method_not_allowed()
+
+
+@csrf_exempt
+@require_auth
+def exams_overview_view(request: HttpRequest) -> HttpResponse:
+    """Exact assessment readiness and schedule aggregates for one visible scope."""
+    if request.method not in ("GET", "HEAD"):
+        return _method_not_allowed()
+    check_perm(request, "academics:read")
+    exams = _exam_service().scoped(
+        user=request.user,
+        roles=get_user_roles(request),
+        permission="academics:read",
+    )
+    branch_id = positive_int_filter(request, "branch")
+    if branch_id is not None:
+        exams = exams.filter(cohort__branch_id=branch_id)
+
+    today = timezone.localdate()
+    window_end = today + timedelta(days=13)
+    totals = exams.aggregate(
+        total_exams=Count("id"),
+        published_exams=Count(
+            "id",
+            filter=Q(is_published=True, requires_republish=False),
+        ),
+        drafts=Count(
+            "id",
+            filter=Q(is_published=False, requires_republish=False),
+        ),
+        corrections_due=Count("id", filter=Q(requires_republish=True)),
+        next_14_days=Count(
+            "id",
+            filter=Q(exam_date__gte=today, exam_date__lte=window_end),
+        ),
+        subjects_used=Count("subject_id", distinct=True),
+    )
+
+    schedule = list(exams.filter(exam_date__gte=today).order_by("exam_date", "id")[:8])
+    schedule_kind = "upcoming"
+    if not schedule:
+        schedule = list(exams.filter(exam_date__lt=today).order_by("-exam_date", "-id")[:8])
+        schedule_kind = "recent"
+    attention = list(
+        exams.filter(Q(requires_republish=True) | Q(is_published=False)).order_by(
+            "-requires_republish", "exam_date", "id"
+        )[:6]
+    )
+    subject_distribution = list(
+        exams.values("subject_id", "subject__name")
+        .annotate(value=Count("id"))
+        .order_by("-value", "subject__name")[:7]
+    )
+    type_distribution = list(
+        exams.values("exam_type_id", "exam_type__name")
+        .annotate(value=Count("id"))
+        .order_by("-value", "exam_type__name")[:7]
+    )
+    return success(
+        {
+            **totals,
+            "branch": branch_id,
+            "as_of": today.isoformat(),
+            "window_end": window_end.isoformat(),
+            "schedule_kind": schedule_kind,
+            "schedule": [exam_to_dict(exam) for exam in schedule],
+            "attention": [exam_to_dict(exam) for exam in attention],
+            "subject_distribution": [
+                {
+                    "id": row["subject_id"],
+                    "label": row["subject__name"] or "Subject not recorded",
+                    "value": row["value"],
+                }
+                for row in subject_distribution
+            ],
+            "type_distribution": [
+                {
+                    "id": row["exam_type_id"],
+                    "label": row["exam_type__name"] or "Type not recorded",
+                    "value": row["value"],
+                }
+                for row in type_distribution
+            ],
+        }
+    )
 
 
 def _get_exam_in_scope(request: HttpRequest, pk: int, *, permission: str) -> Exam:

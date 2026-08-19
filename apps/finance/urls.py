@@ -14,6 +14,7 @@ urlpatterns = [
     path("fee-schedules/<int:pk>/", views.fee_schedule_detail_view, name="finance-fee-schedule-detail"),
     # invoices
     path("invoices/", views.invoices_collection_view, name="finance-invoice-collection"),
+    path("debt-students/", views.debt_students_collection_view, name="finance-debt-student-collection"),
     path("invoices/<int:pk>/void/", views.invoice_void_view, name="finance-invoice-void"),
     path(
         "invoices/<int:pk>/payment-plan/",

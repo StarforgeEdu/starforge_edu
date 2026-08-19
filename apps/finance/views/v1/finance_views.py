@@ -11,17 +11,18 @@ apps.finance.services domain fns behind IFinanceService.
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from django.db.models import Q, QuerySet
+from django.db.models import Count, Max, Min, Q, QuerySet, Sum
 from django.http import HttpRequest, HttpResponse
+from django.utils import timezone
 from django.utils.text import slugify
 from django.views.decorators.csrf import csrf_exempt
 
-from apps.cohorts.models import Cohort
+from apps.cohorts.models import Cohort, CohortTeacher
 from apps.finance.dto import StatementExportRequestDTO
 from apps.finance.interfaces.services import IFinanceService
 from apps.finance.models import FeeSchedule, InvoiceLine
@@ -42,7 +43,7 @@ from apps.finance.presenters import (
     refund_to_dict,
     statement_export_to_dict,
 )
-from apps.finance.selectors import has_natural_finance_scope
+from apps.finance.selectors import has_natural_finance_scope, scoped_debt_invoices
 from apps.org.models import Branch
 from core.api_auth import check_perm, require_auth
 from core.container import container
@@ -60,6 +61,7 @@ from core.listing import (
     paginate,
     parse_date_range_filters,
     positive_int_filter,
+    validate_pagination_filters,
 )
 from core.openapi_contracts import openapi_contract
 from core.permissions import PermissionRoleSet, Role, get_user_roles, has_permission_code
@@ -519,6 +521,250 @@ def invoices_collection_view(request: HttpRequest) -> HttpResponse:
         )
         return created(invoice_to_dict(fresh or invoice))
     return _method_not_allowed()
+
+
+def _debt_student_name(row: dict[str, Any]) -> str:
+    parts = [row.get("student__first_name"), row.get("student__middle_name"), row.get("student__last_name")]
+    name = " ".join(str(part).strip() for part in parts if str(part or "").strip())
+    return name or str(row.get("student__student_id") or f"Student {row['student_id']}")
+
+
+def _debt_teacher_name(row: dict[str, Any]) -> str | None:
+    parts = [
+        row.get("cohort__primary_teacher__first_name"),
+        row.get("cohort__primary_teacher__middle_name"),
+        row.get("cohort__primary_teacher__last_name"),
+    ]
+    name = " ".join(str(part).strip() for part in parts if str(part or "").strip())
+    return name or None
+
+
+def _debt_student_payload(
+    row: dict[str, Any],
+    *,
+    today: date,
+    teachers_by_cohort: dict[int, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    oldest_due = row.get("oldest_due_date")
+    days_overdue = (today - oldest_due).days if isinstance(oldest_due, date) else None
+    if days_overdue is None:
+        aging_bucket = "unknown"
+    elif days_overdue <= 7:
+        aging_bucket = "1_7"
+    elif days_overdue <= 30:
+        aging_bucket = "8_30"
+    elif days_overdue <= 60:
+        aging_bucket = "31_60"
+    else:
+        aging_bucket = "61_plus"
+    teachers = list(teachers_by_cohort.get(row.get("cohort_id"), []))
+    primary_teacher_id = row.get("cohort__primary_teacher_id")
+    primary_teacher_name = _debt_teacher_name(row)
+    if (
+        primary_teacher_id
+        and primary_teacher_name
+        and not any(teacher["id"] == primary_teacher_id for teacher in teachers)
+    ):
+        teachers.insert(0, {"id": primary_teacher_id, "name": primary_teacher_name})
+    return {
+        "id": f"{row['student_id']}:{row.get('cohort_id') or 'none'}",
+        "student": row["student_id"],
+        "student_id": row.get("student__student_id"),
+        "student_name": _debt_student_name(row),
+        "branch": row.get("branch_at_issue_id"),
+        "branch_name": row.get("branch_at_issue__name"),
+        "cohort": row.get("cohort_id"),
+        "cohort_name": row.get("cohort__name"),
+        "teacher": primary_teacher_id,
+        "teacher_name": ", ".join(teacher["name"] for teacher in teachers) or None,
+        "teachers": teachers,
+        "overdue_invoice_count": row.get("overdue_invoice_count", 0),
+        "total_billed_uzs": str(row.get("total_billed_uzs") or Decimal("0.00")),
+        "outstanding_uzs": str(row.get("outstanding_uzs") or Decimal("0.00")),
+        "oldest_due_date": oldest_due.isoformat() if isinstance(oldest_due, date) else None,
+        "latest_due_date": (
+            row["latest_due_date"].isoformat() if isinstance(row.get("latest_due_date"), date) else None
+        ),
+        "days_overdue": days_overdue,
+        "aging_bucket": aging_bucket,
+    }
+
+
+@csrf_exempt
+@require_auth
+def debt_students_collection_view(request: HttpRequest) -> HttpResponse:
+    """Decision-ready student debt register, aggregated server-side.
+
+    The register contains only past-due, positive invoice balances and keeps the
+    same historical finance scope as the invoice API. Filters are applied before
+    grouping so the totals and page count describe the selected register exactly.
+    """
+    if request.method not in ("GET", "HEAD"):
+        return _method_not_allowed()
+    check_perm(request, "finance:read")
+    validate_pagination_filters(request)
+    today = timezone.localdate()
+    invoices = scoped_debt_invoices(user=request.user, roles=_roles(request))
+
+    branch_id = positive_int_filter(request, "branch")
+    cohort_id = positive_int_filter(request, "cohort")
+    teacher_id = positive_int_filter(request, "teacher")
+    if branch_id is not None:
+        invoices = invoices.filter(branch_at_issue_id=branch_id)
+    if cohort_id is not None:
+        invoices = invoices.filter(cohort_id=cohort_id)
+    if teacher_id is not None:
+        co_teacher_groups = CohortTeacher.objects.filter(teacher_id=teacher_id).values("cohort_id")
+        invoices = invoices.filter(
+            Q(cohort__primary_teacher_id=teacher_id) | Q(cohort_id__in=co_teacher_groups)
+        )
+
+    date_from, date_to = parse_date_range_filters(request)
+    invoices = apply_date_range_filters(
+        invoices,
+        field="due_date",
+        date_from=date_from,
+        date_to=date_to,
+    )
+    aging = str(request.GET.get("aging") or "")
+    aging_ranges = {
+        "1_7": (today - timedelta(days=7), today - timedelta(days=1)),
+        "8_30": (today - timedelta(days=30), today - timedelta(days=8)),
+        "31_60": (today - timedelta(days=60), today - timedelta(days=31)),
+        "61_plus": (None, today - timedelta(days=61)),
+    }
+    if aging and aging not in aging_ranges:
+        raise ValidationException(
+            "Invalid value for filter 'aging'.",
+            code="validation_error",
+            fields={"aging": ["Invalid value."]},
+        )
+    if aging:
+        lower, upper = aging_ranges[aging]
+        if lower is not None:
+            invoices = invoices.filter(due_date__gte=lower)
+        invoices = invoices.filter(due_date__lte=upper)
+
+    search = str(request.GET.get("search") or "").strip()
+    if "\x00" in search or len(search) > 200:
+        raise ValidationException(
+            "Invalid value for filter 'search'.",
+            code="validation_error",
+            fields={"search": ["Invalid value."]},
+        )
+    if search:
+        invoices = invoices.filter(
+            Q(student__student_id__icontains=search)
+            | Q(student__first_name__icontains=search)
+            | Q(student__middle_name__icontains=search)
+            | Q(student__last_name__icontains=search)
+        )
+
+    grouped = invoices.values(
+        "student_id",
+        "student__student_id",
+        "student__first_name",
+        "student__middle_name",
+        "student__last_name",
+        "cohort_id",
+        "cohort__name",
+        "cohort__primary_teacher_id",
+        "cohort__primary_teacher__first_name",
+        "cohort__primary_teacher__middle_name",
+        "cohort__primary_teacher__last_name",
+        "branch_at_issue_id",
+        "branch_at_issue__name",
+    ).annotate(
+        overdue_invoice_count=Count("id"),
+        total_billed_uzs=Sum("total_uzs"),
+        outstanding_uzs=Sum("debt_uzs"),
+        oldest_due_date=Min("due_date"),
+        latest_due_date=Max("due_date"),
+    )
+
+    invoice_totals = invoices.aggregate(
+        total_outstanding_uzs=Sum("debt_uzs"),
+        overdue_invoice_count=Count("id"),
+    )
+    minimum_raw = str(request.GET.get("minimum_outstanding") or "").strip()
+    if minimum_raw:
+        try:
+            minimum = Decimal(minimum_raw)
+        except Exception:
+            minimum = Decimal("-1")
+        if not minimum.is_finite() or minimum < 0:
+            raise ValidationException(
+                "Invalid value for filter 'minimum_outstanding'.",
+                code="validation_error",
+                fields={"minimum_outstanding": ["Enter a non-negative amount."]},
+            )
+        grouped = grouped.filter(outstanding_uzs__gte=minimum)
+
+    ordering = str(request.GET.get("ordering") or "-outstanding_uzs")
+    order_map = {
+        "outstanding_uzs": ("outstanding_uzs", "student_id", "cohort_id"),
+        "-outstanding_uzs": ("-outstanding_uzs", "student_id", "cohort_id"),
+        "oldest_due_date": ("oldest_due_date", "student_id", "cohort_id"),
+        "-oldest_due_date": ("-oldest_due_date", "student_id", "cohort_id"),
+        "student_name": ("student__last_name", "student__first_name", "student_id", "cohort_id"),
+        "-student_name": ("-student__last_name", "-student__first_name", "student_id", "cohort_id"),
+    }
+    if ordering not in order_map:
+        raise ValidationException(
+            "Invalid value for filter 'ordering'.",
+            code="validation_error",
+            fields={"ordering": ["Invalid value."]},
+        )
+    grouped = grouped.order_by(*order_map[ordering])
+
+    total = grouped.count()
+    page = int(request.GET.get("page") or 1)
+    page_size = int(request.GET.get("page_size") or 25)
+    start = (page - 1) * page_size
+    rows = list(grouped[start : start + page_size])
+    cohort_ids = {row["cohort_id"] for row in rows if row.get("cohort_id")}
+    teachers_by_cohort: dict[int, list[dict[str, Any]]] = {}
+    if cohort_ids:
+        assignments = (
+            CohortTeacher.objects.filter(cohort_id__in=cohort_ids)
+            .select_related("teacher")
+            .order_by("cohort_id", "id")
+        )
+        for assignment in assignments:
+            teacher_name = assignment.teacher.get_full_name()
+            teachers_by_cohort.setdefault(assignment.cohort_id, []).append(
+                {"id": assignment.teacher_id, "name": teacher_name}
+            )
+    return paginated(
+        [
+            _debt_student_payload(
+                row,
+                today=today,
+                teachers_by_cohort=teachers_by_cohort,
+            )
+            for row in rows
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+        pagination_extra={
+            "summary": {
+                "student_groups": total,
+                # A group-level minimum cannot be re-aggregated portably without
+                # materializing the whole register. Withhold those two rollups
+                # rather than publish a pre-filter total or load every debtor.
+                "overdue_invoice_count": (
+                    None if minimum_raw else invoice_totals.get("overdue_invoice_count") or 0
+                ),
+                "total_outstanding_uzs": (
+                    None
+                    if minimum_raw
+                    else str(invoice_totals.get("total_outstanding_uzs") or Decimal("0.00"))
+                ),
+                "as_of": today.isoformat(),
+            }
+        },
+    )
 
 
 def _get_invoice(request: HttpRequest, pk: int, *, permission: str = "finance:read"):

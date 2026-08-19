@@ -11,6 +11,7 @@ urlpatterns = [
     path("exam-types/<int:pk>/", views.exam_type_detail_view, name="exam-type-detail"),
     # Exams (+ per-student results / CSV import / publish actions)
     path("exams/", views.exams_collection_view, name="exam-list"),
+    path("exams/overview/", views.exams_overview_view, name="exam-overview"),
     path("exams/<int:pk>/results/import-csv/", views.exam_import_csv_view, name="exam-import-csv"),
     path("exams/<int:pk>/results/", views.exam_results_view, name="exam-results"),
     path("exams/<int:pk>/readiness/", views.exam_readiness_view, name="exam-readiness"),

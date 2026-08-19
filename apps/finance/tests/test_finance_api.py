@@ -18,6 +18,7 @@ pytestmark = pytest.mark.django_db
 INVOICES_URL = "/api/v1/finance/invoices/"
 FEE_URL = "/api/v1/finance/fee-schedules/"
 OUTSTANDING_URL = "/api/v1/finance/outstanding/"
+DEBT_STUDENTS_URL = "/api/v1/finance/debt-students/"
 
 
 def _attach_staff_principal(tenant, user, *, label: str):
@@ -51,6 +52,109 @@ def test_invoice_list_denied(as_role, role):
 
 def test_invoice_list_anonymous_denied(tenant_a, client_for):
     assert client_for(tenant_a).get(INVOICES_URL).status_code == 401
+
+
+def test_debt_students_aggregates_positive_past_due_balances_and_filters_teacher(
+    tenant_a,
+    as_role,
+):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.cohorts.tests.factories import CohortFactory, CohortTeacherFactory
+    from apps.finance.models import FeeSchedule, Invoice, PaymentAllocation
+    from apps.finance.tests.factories import FeeScheduleFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    client, _ = as_role(Role.DIRECTOR)
+    with schema_context(tenant_a.schema_name):
+        teacher = TeacherProfileFactory(first_name="Malika", last_name="Karimova")
+        cohort = CohortFactory(branch=teacher.branch, primary_teacher=teacher, name="Evening A2")
+        co_teacher = TeacherProfileFactory(
+            branch=teacher.branch,
+            first_name="Dilshod",
+            last_name="Saidov",
+        )
+        CohortTeacherFactory(cohort=cohort, teacher=co_teacher)
+        monthly_schedule = FeeScheduleFactory(cohort=cohort)
+        student = StudentProfileFactory(
+            branch=teacher.branch,
+            current_cohort=cohort,
+            first_name="Aziza",
+            last_name="Rahimova",
+        )
+        old = InvoiceFactory(
+            student=student,
+            cohort=cohort,
+            fee_schedule=monthly_schedule,
+            period="2026-06",
+            status=Invoice.Status.OVERDUE,
+            due_date=timezone.localdate() - timedelta(days=40),
+            total_uzs=Decimal("900000.00"),
+        )
+        InvoiceFactory(
+            student=student,
+            cohort=cohort,
+            fee_schedule=monthly_schedule,
+            period="2026-07",
+            status=Invoice.Status.ISSUED,
+            due_date=timezone.localdate() - timedelta(days=10),
+            total_uzs=Decimal("700000.00"),
+        )
+        PaymentAllocation.objects.create(
+            invoice=old,
+            payment_id=9191,
+            amount_uzs=Decimal("250000.00"),
+        )
+        InvoiceFactory(
+            student=student,
+            cohort=cohort,
+            fee_schedule=monthly_schedule,
+            period="2026-08",
+            status=Invoice.Status.ISSUED,
+            due_date=timezone.localdate() + timedelta(days=2),
+            total_uzs=Decimal("300000.00"),
+        )
+        InvoiceFactory(
+            student=student,
+            cohort=cohort,
+            fee_schedule=FeeScheduleFactory(
+                cohort=cohort,
+                billing_period=FeeSchedule.BillingPeriod.TERM,
+            ),
+            period="2026-T3",
+            status=Invoice.Status.OVERDUE,
+            due_date=timezone.localdate() - timedelta(days=20),
+            total_uzs=Decimal("5000000.00"),
+        )
+
+    response = client.get(
+        DEBT_STUDENTS_URL,
+        {"teacher": co_teacher.pk, "search": "Aziza", "ordering": "student_name"},
+    )
+    assert response.status_code == 200, response.content
+    body = response.json()
+    assert body["pagination"]["total"] == 1
+    assert body["pagination"]["summary"]["total_outstanding_uzs"] == "1350000.00"
+    row = body["data"][0]
+    assert row["student_name"] == "Aziza Rahimova"
+    assert row["cohort_name"] == "Evening A2"
+    assert row["teacher_name"] == "Malika Karimova, Dilshod Saidov"
+    assert row["teacher"] == teacher.pk
+    assert row["teachers"] == [
+        {"id": teacher.pk, "name": "Malika Karimova"},
+        {"id": co_teacher.pk, "name": "Dilshod Saidov"},
+    ]
+    assert row["overdue_invoice_count"] == 2
+    assert row["outstanding_uzs"] == "1350000.00"
+    assert row["aging_bucket"] == "31_60"
+
+
+def test_debt_students_rejects_unknown_ordering(as_role):
+    response = as_role(Role.DIRECTOR)[0].get(DEBT_STUDENTS_URL, {"ordering": "created_at"})
+    assert response.status_code == 400
+    assert response.json()["errors"] == {"ordering": ["Invalid value."]}
 
 
 # --------------------------------------------------------------------------- #
