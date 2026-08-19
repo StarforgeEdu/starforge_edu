@@ -15,6 +15,7 @@ api_v1_patterns = [
     path("crm/", include("apps.crm.urls")),
     path("parents/", include("apps.parents.urls")),
     path("teachers/", include("apps.teachers.urls")),
+    path("people-imports/", include("apps.people_imports.urls")),
     path("cohorts/", include("apps.cohorts.urls")),
     path("schedule/", include("apps.schedule.urls")),
     path("attendance/", include("apps.attendance.urls")),

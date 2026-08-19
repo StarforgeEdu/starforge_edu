@@ -192,6 +192,7 @@ TENANT_APPS = [
     "apps.crm.apps.CRMConfig",
     "apps.parents.apps.ParentsConfig",
     "apps.teachers.apps.TeachersConfig",
+    "apps.people_imports.apps.PeopleImportsConfig",
     "apps.cohorts.apps.CohortsConfig",
     "apps.schedule.apps.ScheduleConfig",
     "apps.attendance.apps.AttendanceConfig",
@@ -569,6 +570,7 @@ CELERY_TASK_ROUTES = {
     "celery_tasks.attachment_tasks.*": {"queue": "maintenance"},
     "celery_tasks.billing_tasks.*": {"queue": "maintenance"},
     "celery_tasks.finance_tasks.*": {"queue": "maintenance"},
+    "celery_tasks.people_import_tasks.*": {"queue": "maintenance"},
 }
 # Beat schedule (DatabaseScheduler ingests this at beat startup; tasks register
 # with workers via celery_tasks/tasks.py — see tests/test_celery_registration.py.
