@@ -8,7 +8,7 @@ license = { text = "Proprietary" }
 authors = [{ name = "Starforge Edu" }]
 
 dependencies = [
-    "django>=6.0.7,<6.1",
+    "django>=6.0.8,<6.1",
     "djangorestframework>=3.16",
     "drf-spectacular>=0.28",
     "django-filter>=24.3",

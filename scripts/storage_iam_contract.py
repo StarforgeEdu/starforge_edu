@@ -141,12 +141,8 @@ def _public_static_policy(static_bucket: str) -> dict[str, Any]:
 
 
 def _cors_document(origins: list[str], methods: tuple[str, ...]) -> str:
-    allowed_origins = "\n".join(
-        f"    <AllowedOrigin>{escape(origin)}</AllowedOrigin>" for origin in origins
-    )
-    allowed_methods = "\n".join(
-        f"    <AllowedMethod>{method}</AllowedMethod>" for method in methods
-    )
+    allowed_origins = "\n".join(f"    <AllowedOrigin>{escape(origin)}</AllowedOrigin>" for origin in origins)
+    allowed_methods = "\n".join(f"    <AllowedMethod>{method}</AllowedMethod>" for method in methods)
     return f"""<CORSConfiguration>
   <CORSRule>
 {allowed_origins}
