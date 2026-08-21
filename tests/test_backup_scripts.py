@@ -355,7 +355,7 @@ def test_deployment_blocks_producers_then_drains_workers_before_backup():
     assert "{{json .Config.Cmd}}" in DEPLOY_SCRIPT
     assert 'command_json" == \'["worker"]\'' in DEPLOY_SCRIPT
     assert 'docker stop --time 120 "${producer_containers[@]}"' in DEPLOY_SCRIPT
-    assert "scripts/drain_celery_for_release.py --expected-workers" in DEPLOY_SCRIPT
+    assert "python -m scripts.drain_celery_for_release --expected-workers" in DEPLOY_SCRIPT
     assert "drained_worker_containers" in DEPLOY_SCRIPT
     assert 'actual_workers" == "$expected_workers' in DEPLOY_SCRIPT
     assert "{{.State.Status}}" in DEPLOY_SCRIPT

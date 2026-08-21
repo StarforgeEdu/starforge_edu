@@ -735,7 +735,7 @@ drain_project_applications() {
   if (( worker_count > 0 )); then
     drained_worker_containers=("${worker_containers[@]}")
     capture_web_command "${evidence_prefix}-celery-drain.json" \
-      python scripts/drain_celery_for_release.py --expected-workers "$worker_count" || return 1
+      python -m scripts.drain_celery_for_release --expected-workers "$worker_count" || return 1
     # A newly appeared worker could have early-acknowledged work after the
     # stable observation. Re-discover by command and require the exact same
     # running container set before stopping the workers proven idle.
