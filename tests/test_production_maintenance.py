@@ -50,6 +50,12 @@ def test_controller_requires_exact_digest_container_and_read_only_config_mount()
     assert "previous state was restored" in SCRIPT
 
 
+def test_controller_maps_commands_to_rendered_state_names():
+    assert 'enable|assert-enabled) desired_state="enabled"' in SCRIPT
+    assert 'disable|assert-disabled) desired_state="disabled"' in SCRIPT
+    assert '"$tmp_dir/${desired_state}.caddy"' in SCRIPT
+
+
 def test_maintenance_environment_is_explicit_and_backed_up_with_deployment_state():
     assert "STARFORGE_CADDY_CONTAINER=" in ENV_EXAMPLE
     assert "CADDY_IMAGE=" in ENV_EXAMPLE

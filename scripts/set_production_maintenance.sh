@@ -196,7 +196,10 @@ if [[ -e "$state_file" ]]; then
   fi
 fi
 
-desired_state="${action#assert-}"
+case "$action" in
+  enable|assert-enabled) desired_state="enabled" ;;
+  disable|assert-disabled) desired_state="disabled" ;;
+esac
 if [[ "$action" == "enable" || "$action" == "disable" ]]; then
   install -o root -g root -m 0644 "$tmp_dir/${desired_state}.caddy" "$tmp_dir/state.caddy"
   mv -f -- "$tmp_dir/state.caddy" "$state_file"
