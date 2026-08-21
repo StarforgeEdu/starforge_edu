@@ -332,9 +332,19 @@ def test_deployment_records_broker_depth_on_both_sides_of_quiescence():
 
     assert before < stop < after < backup
     assert "scripts/capture_broker_depth.py" in DEPLOY_SCRIPT
+    assert "python -m scripts.capture_broker_depth" in DEPLOY_SCRIPT
     assert "unexpected_list_queue_depth" in (ROOT / "scripts/capture_broker_depth.py").read_text(
         encoding="utf-8"
     )
+
+
+def test_deployment_reopens_maintenance_when_pre_quiescence_probe_fails():
+    cleanup = DEPLOY_SCRIPT.index('if [[ "$status" -ne 0 && "$maintenance_enabled" == "1"')
+    quiesced_cleanup = DEPLOY_SCRIPT.index(
+        'if [[ "$status" -ne 0 && "$apps_quiesced" == "1"', cleanup
+    )
+    assert '"$apps_quiesced" == "0"' in DEPLOY_SCRIPT[cleanup:quiesced_cleanup]
+    assert 'set_production_maintenance.sh" disable' in DEPLOY_SCRIPT[cleanup:quiesced_cleanup]
 
 
 def test_deployment_blocks_producers_then_drains_workers_before_backup():

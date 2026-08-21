@@ -292,6 +292,17 @@ on_exit() {
   local status="$?"
   trap - EXIT
   set +e
+  if [[ "$status" -ne 0 && "$maintenance_enabled" == "1" && \
+        "$apps_quiesced" == "0" && -n "${release_dir:-}" ]]; then
+    if curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time 15 \
+         "$HEALTH_URL" >/dev/null && \
+       STARFORGE_REPO_DIR="$release_dir" \
+         "$release_dir/scripts/set_production_maintenance.sh" disable >&2; then
+      maintenance_enabled=0
+    else
+      echo "Application services are still running but maintenance could not be disabled." >&2
+    fi
+  fi
   if [[ "$status" -ne 0 && "$apps_quiesced" == "1" && "${#compose[@]}" -gt 0 ]]; then
     if [[ "$schema_change_started" == "0" ]]; then
       if [[ "${#previous_app_containers[@]}" -gt 0 ]]; then
@@ -698,7 +709,7 @@ capture_broker_depth() {
   local destination="$1"
   shift
   capture_web_command "$destination" \
-    python scripts/capture_broker_depth.py "$@"
+    python -m scripts.capture_broker_depth "$@"
 }
 
 drain_project_applications() {
