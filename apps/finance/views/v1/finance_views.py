@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from django.db.models import Count, Max, Min, Q, QuerySet, Sum
@@ -557,7 +557,8 @@ def _debt_student_payload(
         aging_bucket = "31_60"
     else:
         aging_bucket = "61_plus"
-    teachers = list(teachers_by_cohort.get(row.get("cohort_id"), []))
+    cohort_id = row.get("cohort_id")
+    teachers = list(teachers_by_cohort.get(cohort_id, [])) if isinstance(cohort_id, int) else []
     primary_teacher_id = row.get("cohort__primary_teacher_id")
     primary_teacher_name = _debt_teacher_name(row)
     if (
@@ -721,7 +722,7 @@ def debt_students_collection_view(request: HttpRequest) -> HttpResponse:
     page = int(request.GET.get("page") or 1)
     page_size = int(request.GET.get("page_size") or 25)
     start = (page - 1) * page_size
-    rows = list(grouped[start : start + page_size])
+    rows = cast(list[dict[str, Any]], list(grouped[start : start + page_size]))
     cohort_ids = {row["cohort_id"] for row in rows if row.get("cohort_id")}
     teachers_by_cohort: dict[int, list[dict[str, Any]]] = {}
     if cohort_ids:

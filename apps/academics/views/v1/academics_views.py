@@ -10,7 +10,7 @@ even on read, so a student/parent holding ``academics:read`` can't harvest score
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse
@@ -529,15 +529,21 @@ def exams_overview_view(request: HttpRequest) -> HttpResponse:
             "-requires_republish", "exam_date", "id"
         )[:6]
     )
-    subject_distribution = list(
-        exams.values("subject_id", "subject__name")
-        .annotate(value=Count("id"))
-        .order_by("-value", "subject__name")[:7]
+    subject_distribution = cast(
+        list[dict[str, Any]],
+        list(
+            exams.values("subject_id", "subject__name")
+            .annotate(value=Count("id"))
+            .order_by("-value", "subject__name")[:7]
+        ),
     )
-    type_distribution = list(
-        exams.values("exam_type_id", "exam_type__name")
-        .annotate(value=Count("id"))
-        .order_by("-value", "exam_type__name")[:7]
+    type_distribution = cast(
+        list[dict[str, Any]],
+        list(
+            exams.values("exam_type_id", "exam_type__name")
+            .annotate(value=Count("id"))
+            .order_by("-value", "exam_type__name")[:7]
+        ),
     )
     return success(
         {
