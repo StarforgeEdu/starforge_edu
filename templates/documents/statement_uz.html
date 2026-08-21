@@ -1,0 +1,65 @@
+{% load i18n %}<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <title>Hisob ko'chirmasi</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body { font-family: "DejaVu Sans", sans-serif; color: #1a1a1a; font-size: 11pt; }
+    h1 { font-size: 18pt; margin-bottom: 0; }
+    h2 { font-size: 13pt; margin-top: 1.5em; }
+    .meta { color: #555; margin-bottom: 1.5em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5em; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f0f0f0; }
+    td.num, th.num { text-align: right; }
+    .balance { margin-top: 1.5em; font-size: 13pt; font-weight: bold; }
+    .empty { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>Hisob ko'chirmasi</h1>
+  <div class="meta">
+    <div>O'quvchi: {{ student.user.get_full_name }} ({{ student.student_id }})</div>
+    <div>Sana: {{ generated_on }}</div>
+  </div>
+
+  {% if invoices %}
+  {% for inv in invoices %}
+  <h2>Hisob-faktura {{ inv.number }} — {{ inv.get_status_display }} (muddati {{ inv.due_date }})</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Tavsif</th>
+        <th class="num">Soni</th>
+        <th class="num">Narxi</th>
+        <th class="num">Summa (so'm)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for line in inv.lines.all %}
+      <tr>
+        <td>{{ line.description }}</td>
+        <td class="num">{{ line.quantity }}</td>
+        <td class="num">{{ line.unit_price_uzs }}</td>
+        <td class="num">{{ line.amount_uzs }}</td>
+      </tr>
+      {% endfor %}
+      {% for alloc in inv.allocations.all %}
+      <tr>
+        <td>To'lov qabul qilindi (#{{ alloc.payment_id }})</td>
+        <td class="num"></td>
+        <td class="num"></td>
+        <td class="num">-{{ alloc.amount_uzs }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+  {% else %}
+  <p class="empty">Hisob-fakturalar yo'q.</p>
+  {% endif %}
+
+  <div class="balance">Qoldiq to'lov: {{ outstanding_uzs }} so'm</div>
+</body>
+</html>

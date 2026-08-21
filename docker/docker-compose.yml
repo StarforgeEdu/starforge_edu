@@ -1,10 +1,10 @@
 # Local dev stack. Subdomain routing works against *.localhost on most
 # modern OSes (resolves to 127.0.0.1 by default). Add the demo tenant via
-# `docker compose run --rm web python scripts/seed_dev.py`.
+# `docker compose run --rm -e STARFORGE_ALLOW_LOCAL_DEMO_SEED=1 web python scripts/seed_dev.py`.
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
     environment:
       POSTGRES_DB: starforge
       POSTGRES_USER: starforge
@@ -19,7 +19,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
     command: ["redis-server", "--appendonly", "yes"]
     ports: ["6379:6379"]
     volumes:
@@ -31,7 +31,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -47,7 +47,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: starforge:dev
-    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--reload", "--access-logfile", "-"]
+    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--reload", "--no-control-socket", "--access-logfile", "-", "--access-logformat", "%(h)s %(m)s %(s)s %(L)s"]
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.development
       DATABASE_URL: postgres://starforge:starforge@postgres:5432/starforge

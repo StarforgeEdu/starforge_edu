@@ -1,0 +1,36 @@
+# Keep secrets, VCS history, and local caches OUT of the production image
+# (docker/Dockerfile does COPY . /app from the repo root).
+.git
+.gitignore
+.env
+.env.*
+*.pem
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.sqlite3
+node_modules/
+config/settings/local_run.py
+# Docs/tests aren't needed at runtime (kept small; keep migrations + templates).
+.github/
+docs/
+*.md
+**/tests/
+tests/
+conftest.py
+pytest.ini
+mypy.ini
+.pre-commit-config.yaml
+# The release image executes this bounded, read-only broker probe during
+# cutover. Keep every other operator/development script outside the image.
+scripts/*
+!scripts/capture_broker_depth.py
+!scripts/drain_celery_for_release.py
+!scripts/run_leadership_release_smoke.py

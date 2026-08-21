@@ -1,0 +1,29 @@
+{
+  "method": "GetStatement",
+  "description": "Reconciliation feed for a [from, to] window (epoch milliseconds). Returns the transactions list; amounts are in tiyin and the account object is echoed.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "GetStatement",
+    "params": {"from": 1699999000000, "to": 1700001000000}
+  },
+  "expected_result": {
+    "transactions": [
+      {
+        "id": "5e7a0f9b3c2d1a0011223344",
+        "time": 1700000000000,
+        "amount": 15000000,
+        "account": {"order_id": "INV-2026-000001"},
+        "create_time": 1700000000000,
+        "perform_time": 1700000005000,
+        "cancel_time": 0,
+        "transaction": "1",
+        "state": 2,
+        "reason": null
+      }
+    ]
+  },
+  "errors": {
+    "auth_failed": -32504
+  }
+}

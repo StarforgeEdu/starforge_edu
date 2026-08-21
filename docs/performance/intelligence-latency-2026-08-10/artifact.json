@@ -1,0 +1,899 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "StarForge Intelligence Latency Remediation",
+    "description": "Technical incident report for the 2026-08-10 intelligence API latency remediation.",
+    "generatedAt": "2026-08-10T17:52:31Z",
+    "cards": [
+      {
+        "id": "baseline_tail",
+        "description": "Backend p99 before the fix and in the immediate eight-minute post-deploy sample.",
+        "dataset": "headline",
+        "sourceId": "headline_sql",
+        "metrics": [
+          {
+            "label": "Pre-fix backend p99",
+            "field": "pre_p99_s",
+            "format": "number",
+            "unit": "s"
+          },
+          {
+            "label": "Post-deploy backend p99",
+            "field": "post_p99_s",
+            "format": "number",
+            "unit": "s"
+          }
+        ]
+      },
+      {
+        "id": "risk_warm",
+        "description": "Authenticated production risk-list latency after the rewrite and private snapshot cache.",
+        "dataset": "headline",
+        "sourceId": "headline_sql",
+        "metrics": [
+          {
+            "label": "Risk endpoint, warm",
+            "field": "risk_warm_s",
+            "format": "number",
+            "unit": "s"
+          },
+          {
+            "label": "Risk endpoint, cold",
+            "field": "risk_cold_s",
+            "format": "number",
+            "unit": "s"
+          }
+        ]
+      },
+      {
+        "id": "planner_reduction",
+        "description": "Reduction in summed PostgreSQL planner cost after eliminating correlated subplans.",
+        "dataset": "headline",
+        "sourceId": "headline_sql",
+        "metrics": [
+          {
+            "label": "Planner-cost reduction",
+            "field": "planner_reduction_x",
+            "format": "number",
+            "unit": "×"
+          },
+          {
+            "label": "Correlated subplans after",
+            "field": "subplans_after",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "schema_transfer",
+        "description": "Transfer reduction for the large OpenAPI schema response with gzip enabled.",
+        "dataset": "headline",
+        "sourceId": "headline_sql",
+        "metrics": [
+          {
+            "label": "Schema transfer reduction",
+            "field": "schema_reduction_rate",
+            "format": "percent"
+          },
+          {
+            "label": "Compressed wire bytes",
+            "field": "schema_compressed_bytes",
+            "format": "compact"
+          }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "conservative_speedup",
+        "title": "Conservative latency improvement by measurement",
+        "subtitle": "Uses the 30-second risk lower bound and 60-second executive timeout floor; higher is better.",
+        "type": "bar",
+        "dataset": "speedups",
+        "sourceId": "speedup_sql",
+        "encodings": {
+          "x": {
+            "field": "measurement",
+            "type": "ordinal",
+            "label": "Measurement"
+          },
+          "y": {
+            "field": "minimum_speedup_x",
+            "type": "quantitative",
+            "label": "Minimum speedup",
+            "format": "number"
+          }
+        },
+        "yAxisTitle": "Minimum observed speedup (×)",
+        "valueFormat": "number",
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "baseline_distribution",
+        "title": "Pre-fix backend request-duration distribution",
+        "subtitle": "Twenty-minute production incident sample; duration excludes client network time.",
+        "dataset": "baseline_latency",
+        "sourceId": "baseline_sql",
+        "defaultSort": {
+          "field": "display_order",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "display_order",
+            "label": "Order",
+            "type": "number"
+          },
+          {
+            "field": "statistic",
+            "label": "Statistic",
+            "type": "text"
+          },
+          {
+            "field": "backend_duration_s",
+            "label": "Backend duration",
+            "format": "number",
+            "unit": "s"
+          }
+        ]
+      },
+      {
+        "id": "post_distribution",
+        "title": "Immediate post-deploy backend request-duration distribution",
+        "subtitle": "Eight-minute production recovery sample: 137 requests, one over one second, none over five seconds.",
+        "dataset": "post_latency",
+        "sourceId": "post_sql",
+        "defaultSort": {
+          "field": "display_order",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "display_order",
+            "label": "Order",
+            "type": "number"
+          },
+          {
+            "field": "statistic",
+            "label": "Statistic",
+            "type": "text"
+          },
+          {
+            "field": "backend_duration_s",
+            "label": "Backend duration",
+            "format": "number",
+            "unit": "s"
+          }
+        ]
+      },
+      {
+        "id": "live_verification",
+        "title": "Optimized selector and live endpoint verification",
+        "subtitle": "Production-size tenant with 1,200 operational students and 190,800 attendance records.",
+        "dataset": "verification",
+        "sourceId": "verification_sql",
+        "defaultSort": {
+          "field": "display_order",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "display_order",
+            "label": "Order",
+            "type": "number"
+          },
+          {
+            "field": "measurement",
+            "label": "Measurement",
+            "type": "text"
+          },
+          {
+            "field": "before_observation",
+            "label": "Before",
+            "type": "text"
+          },
+          {
+            "field": "after_s",
+            "label": "After",
+            "format": "number",
+            "unit": "s"
+          },
+          {
+            "field": "state",
+            "label": "Layer / cache state",
+            "type": "text"
+          },
+          {
+            "field": "verification_note",
+            "label": "Verification note",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "plan_comparison",
+        "title": "PostgreSQL plan-shape comparison",
+        "subtitle": "Before is the expanded correlated statement; after is the sum of the set-based signal plans.",
+        "dataset": "query_plan",
+        "sourceId": "plan_sql",
+        "defaultSort": {
+          "field": "display_order",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "display_order",
+            "label": "Order",
+            "type": "number"
+          },
+          {
+            "field": "implementation",
+            "label": "Implementation",
+            "type": "text"
+          },
+          {
+            "field": "planner_cost",
+            "label": "Planner cost",
+            "format": "number"
+          },
+          {
+            "field": "correlated_subplans",
+            "label": "Correlated subplans",
+            "format": "number"
+          },
+          {
+            "field": "query_shape",
+            "label": "Query shape",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "incident_evidence",
+        "label": "Intelligence latency incident evidence ledger",
+        "path": "docs/performance/intelligence-latency-2026-08-10/evidence.md"
+      },
+      {
+        "id": "headline_sql",
+        "label": "Report headline metric transform",
+        "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql"
+      },
+      {
+        "id": "baseline_sql",
+        "label": "Pre-fix latency distribution transform",
+        "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql"
+      },
+      {
+        "id": "post_sql",
+        "label": "Post-deploy latency distribution transform",
+        "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql"
+      },
+      {
+        "id": "speedup_sql",
+        "label": "Conservative speedup transform",
+        "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql"
+      },
+      {
+        "id": "verification_sql",
+        "label": "Live verification transform",
+        "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql"
+      },
+      {
+        "id": "plan_sql",
+        "label": "Query-plan comparison transform",
+        "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql"
+      },
+      {
+        "id": "selector_implementation",
+        "label": "Set-based intelligence selectors",
+        "path": "apps/intelligence/selectors.py"
+      },
+      {
+        "id": "cache_implementation",
+        "label": "Permission-safe intelligence cache",
+        "path": "apps/intelligence/cache.py"
+      },
+      {
+        "id": "view_implementation",
+        "label": "Intelligence authorization and HTTP views",
+        "path": "apps/intelligence/views/v1/intelligence_views.py"
+      },
+      {
+        "id": "cache_settings",
+        "label": "Intelligence cache defaults",
+        "path": "config/settings/base.py"
+      },
+      {
+        "id": "redis_cache_aside",
+        "label": "Redis cache-aside and stampede-control guidance",
+        "href": "https://redis.io/docs/latest/develop/use-cases/cache-aside/ruby/"
+      },
+      {
+        "id": "duckdb_concurrency",
+        "label": "DuckDB concurrency guidance",
+        "href": "https://duckdb.org/docs/current/connect/concurrency"
+      },
+      {
+        "id": "duckdb_tuning",
+        "label": "DuckDB workload-tuning guidance",
+        "href": "https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads"
+      },
+      {
+        "id": "polars_lazy",
+        "label": "Polars lazy API guidance",
+        "href": "https://docs.pola.rs/user-guide/concepts/lazy-api/"
+      },
+      {
+        "id": "clickhouse_use_cases",
+        "label": "ClickHouse analytical use cases",
+        "href": "https://clickhouse.com/use-cases"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "layout": "full",
+        "body": "# StarForge Intelligence Latency Remediation"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "## The pathological tail is removed; capacity is now headroom\n\n**The minute-long dashboard was primarily a backend query-shape defect, not ordinary server load.** Correlated attendance, grade, and invoice annotations produced 20 repeated subplans and consumed both synchronous web workers. The one-vCPU host amplified the failure, but PostgreSQL locks, Redis health, and the normal request majority were healthy.\n\n**The remediation is an orders-of-magnitude improvement.** Student-risk work moved from 30–58 seconds to 0.228 seconds in the selector, 0.1086 seconds for a live cold request, and 0.0228 seconds warm. Executive-summary work moved from a greater-than-60-second timeout to 0.0887 seconds in the selector and 0.054–0.1273 seconds on observed Redis hits. In the immediate post-deploy sample, backend p99 was 0.7776 seconds across 137 requests, with zero requests above five seconds; 108 authenticated smoke operations passed.\n\n**Two vCPUs materially improve resilience; 4 CPU / 8 GB is a sensible production target.** The larger host should be purchased for concurrency, memory safety, and operational headroom—not to mask inefficient SQL. Keep PostgreSQL as the source of truth and Redis as a permission-safe snapshot layer."
+      },
+      {
+        "id": "headline_metrics",
+        "type": "metric-strip",
+        "layout": "full",
+        "cardIds": [
+          "baseline_tail",
+          "risk_warm",
+          "planner_reduction",
+          "schema_transfer"
+        ]
+      },
+      {
+        "id": "measurement_definitions",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "## What was measured and what each number means\n\n- **Backend duration** is server-side request time from production logs; it excludes client DNS, TLS, and transfer delay.\n- **Selector duration** is the direct application computation over the seeded production tenant, isolating query and Python work from HTTP transport.\n- **Live cold** is an authenticated endpoint request that computes and stores a private snapshot. **Live warm** is an authenticated request served from that snapshot.\n- **Planner cost** is PostgreSQL's relative plan-cost estimate, not elapsed milliseconds. The after value is the sum of the three set-based signal plans, so the comparison is directional rather than a single-plan identity.\n- **Conservative speedup** divides the lowest observed pre-fix risk duration (30 seconds) or the executive timeout floor (60 seconds) by the after duration. Every plotted value is therefore a lower bound.\n- **Verification population** is one tenant with 1,200 operational students and 190,800 attendance rows. This tests realistic row volume, not maximum concurrent users."
+      },
+      {
+        "id": "root_cause",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "## A small pathological tail—not a uniformly slow server—caused the outage pattern\n\nThe median backend request completed in 0.121 seconds and roughly 98.6% completed under one second. The p99 jumped to 49.863 seconds because executive-summary and risk requests repeatedly expanded correlated subqueries. When both synchronous workers entered those plans, unrelated requests queued behind them; six worker timeouts and two cgroup OOM kills followed. This explains why the dashboard could take a minute while most API calls still looked healthy."
+      },
+      {
+        "id": "baseline_table_block",
+        "type": "table",
+        "tableId": "baseline_distribution",
+        "layout": "full"
+      },
+      {
+        "id": "post_recovery",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "### The immediate production tail returned below one second\n\nAcross the first 137 post-deploy requests, median backend time was 0.0291 seconds, p95 was 0.3322 seconds, and p99 was 0.7776 seconds. One request exceeded one second and none exceeded five seconds. This is a strong recovery smoke signal, but the eight-minute window is too short to serve as a production SLO baseline."
+      },
+      {
+        "id": "post_table_block",
+        "type": "table",
+        "tableId": "post_distribution",
+        "layout": "full"
+      },
+      {
+        "id": "set_based_fix",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "selector_implementation",
+        "body": "## Set-based aggregation removes the multiplicative work\n\nThe new selector reads each authorized risk signal once: grouped attendance counts, grouped published-exam averages, and distinct overdue-student identifiers. It combines the compact maps in memory, ranks deterministically, and hydrates only the requested page. The recorded plans contain zero correlated subplans, and exact-result checking matched the previous first 100 rows and 1,200-row total."
+      },
+      {
+        "id": "speedup_intro",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "### Every measured optimized path is at least two orders of magnitude faster\n\nThe chart intentionally uses lower-bound baselines. The warm risk response is the largest gain, but even the conservative selector-only measurements clear 100×. These are discrete incident comparisons—not a time trend or a statistical confidence interval."
+      },
+      {
+        "id": "speedup_chart_block",
+        "type": "chart",
+        "chartId": "conservative_speedup",
+        "layout": "full"
+      },
+      {
+        "id": "speedup_interpretation",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "The selector measurements isolate the SQL/application change; the live measurements add HTTP and Redis behavior. Because the server CPU was resized near the deployment, live endpoint gains cannot be assigned entirely to one intervention. The zero-subplan plan and selector timings independently establish that the code rewrite—not hardware alone—removed the dominant bottleneck."
+      },
+      {
+        "id": "verification_table_block",
+        "type": "table",
+        "tableId": "live_verification",
+        "layout": "full"
+      },
+      {
+        "id": "plan_table_block",
+        "type": "table",
+        "tableId": "plan_comparison",
+        "layout": "full"
+      },
+      {
+        "id": "cache_correctness",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Redis accelerates repeated snapshots without becoming an authorization source\n\n**Authorization runs before cache access.** Keys bind tenant, exact role principal, effective permissions and scopes, selected resource scope, filters, locale, timezone, and date. Risk-list caching is limited to organization-wide staff; teacher and scoped-staff lists bypass it because cohort and department assignments are mutable. Risk detail reauthorizes the student against live scope before reading a cached payload.\n\n**Freshness and failure behavior are bounded.** Executive snapshots are fresh for 300 seconds and retained stale for 1,800 seconds; risk snapshots are fresh for 120 seconds and retained stale for 600 seconds. A 60-second distributed refresh lease prevents repeated refresh work, stale losers return immediately, and cold losers poll for at most one second before computing. Redis read, lock, or write failures fall through to the authoritative loader.\n\n**The browser never treats protected data as public cache content.** Responses use `private, no-cache, max-age=0, must-revalidate`, vary by authorization and language, and expose only non-sensitive cache-status, age, and generated-at headers. This follows Redis's cache-aside and stampede-control model while preserving application authorization as the decision point."
+      },
+      {
+        "id": "transport",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "## Compression removes transfer waste but cannot erase network latency\n\nGzip reduced the 1,386,127-byte OpenAPI response to 65,266 wire bytes—a 95.29% reduction. That materially helps slow links, but the same client still observed 3.65 seconds to first byte because round-trip latency and bandwidth were variable. The API fix addresses server compute; compression addresses payload transfer; client-side timing must keep those components separate."
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "## Four checks isolate code, cache, transport, and capacity\n\n1. **Production request logs** established the 20-minute duration distribution and showed worker timeouts/OOM events.\n2. **PostgreSQL plan inspection** counted correlated subplans, planner cost, relation scans, and tuple reads; lock/deadlock checks ruled out a blocking incident.\n3. **Selector equivalence and live probes** checked result identity, bounded query count, cold/warm behavior, and authenticated endpoint latency against the production-size tenant.\n4. **Host and transport probes** separated CPU/memory constraints from network/TLS latency and measured content-encoding savings.\n\nThe diagnosis is descriptive and mechanistic: it identifies a repeated-work query plan and confirms its removal. It is not an experiment estimating a causal hardware effect."
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "incident_evidence",
+        "body": "## The evidence is strong for this incident, not a universal capacity proof\n\n- The live before/after interval includes both software changes and a one-to-two-vCPU resize; only the selector/plan checks isolate software.\n- The baseline is a 20-minute incident sample, and the cache timings are smoke observations rather than p95/p99 distributions.\n- The 1,200-student seed validates row volume and output equivalence, not multi-tenant concurrency or sustained refresh stampedes.\n- Stale-while-refresh deliberately allows bounded age. Event-driven invalidation would be needed where 2–30 minutes of staleness is unacceptable.\n- This work targeted the known intelligence tail. Other endpoint families still need continuous p95/p99 monitoring and query-budget regression tests."
+      },
+      {
+        "id": "capacity_recommendation",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## Use 4 CPU / 8 GB as production headroom and operate the fix\n\nA 4-vCPU / 8-GB server is a proportionate next production tier for this combined Django, PostgreSQL, Redis, and worker host. It provides room for concurrent web requests, background work, database cache, and rolling operations while reducing the probability that one component's burst becomes an OOM incident.\n\n1. **Keep the set-based selector and private Redis snapshots as the primary fix.** Do not raise timeouts to accommodate pathological SQL.\n2. **Size web and worker concurrency after the upgrade from measurements.** Track CPU saturation, memory working set/OOMs, PostgreSQL active connections and slow queries, Redis hit rate/evictions, and endpoint p50/p95/p99.\n3. **Set explicit service objectives.** A practical starting gate is warm intelligence p95 below 250 ms, cold intelligence p95 below 1 second for this tenant size, and zero 60-second worker timeouts; validate under a representative concurrent load test before public launch.\n4. **Add event-driven cache invalidation only where freshness requires it.** Retain TTLs as a recovery backstop.\n5. **Re-run the production-size benchmark after each material selector, permission, or schema change.** Preserve exact scope and result-equivalence assertions."
+      },
+      {
+        "id": "architecture_boundary",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## PostgreSQL plus Redis is the right request path; reserve OLAP tools for their actual job\n\nUse [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/ruby/) for permission-bound snapshots now. Introduce [ClickHouse](https://clickhouse.com/use-cases) only when append-heavy analytical events reach millions of rows and a deliberate CDC/ETL pipeline can support a separate OLAP projection.\n\n[DuckDB's concurrency model](https://duckdb.org/docs/current/connect/concurrency) is primarily designed around one writer process, and its [tuning guidance](https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads) favors larger, less-frequent analytical queries over many small concurrent requests. [Polars lazy execution](https://docs.pola.rs/user-guide/concepts/lazy-api/) is valuable for predicate/projection pushdown in batch analysis. Both are good offline/reporting tools, but neither should be inserted into the authenticated management request path to solve a query that PostgreSQL now completes in well under a second."
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## What to measure next\n\n- What are cold and warm p95/p99 values under 10, 25, and 50 concurrent management sessions on the 4-CPU / 8-GB target?\n- Which remaining endpoints dominate aggregate database time after intelligence is removed from the slow-query ranking?\n- What freshness guarantee does each management metric actually require, and which domain events should invalidate its snapshot?\n- At what event volume and retention horizon would a CDC-fed ClickHouse projection become cheaper than PostgreSQL rollups?\n- Should PostgreSQL and application workers remain colocated after launch, or do sustained CPU, memory, and I/O profiles justify separating the database?"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-10T17:52:31Z",
+    "status": "ready",
+    "datasets": {
+      "headline": [
+        {
+          "pre_p99_s": 49.863,
+          "pre_max_s": 58.141,
+          "post_p99_s": 0.7776,
+          "risk_warm_s": 0.0228,
+          "risk_cold_s": 0.1086,
+          "planner_reduction_x": 954.3939297793526,
+          "subplans_after": 0,
+          "schema_reduction_rate": 0.9529148483508365,
+          "schema_compressed_bytes": 65266
+        }
+      ],
+      "speedups": [
+        {
+          "measurement": "Risk selector",
+          "before_floor_s": 30,
+          "after_s": 0.228,
+          "minimum_speedup_x": 131.57894736842104,
+          "comparison_basis": "30 s lower bound",
+          "layer": "Set-based SQL",
+          "display_order": 1
+        },
+        {
+          "measurement": "Risk live cold",
+          "before_floor_s": 30,
+          "after_s": 0.1086,
+          "minimum_speedup_x": 276.24309392265195,
+          "comparison_basis": "30 s lower bound",
+          "layer": "Cold private snapshot",
+          "display_order": 2
+        },
+        {
+          "measurement": "Risk live warm",
+          "before_floor_s": 30,
+          "after_s": 0.0228,
+          "minimum_speedup_x": 1315.7894736842104,
+          "comparison_basis": "30 s lower bound",
+          "layer": "Warm private snapshot",
+          "display_order": 3
+        },
+        {
+          "measurement": "Executive selector",
+          "before_floor_s": 60,
+          "after_s": 0.0887,
+          "minimum_speedup_x": 676.4374295377678,
+          "comparison_basis": "60 s timeout floor",
+          "layer": "Set-based SQL",
+          "display_order": 4
+        },
+        {
+          "measurement": "Executive cache hit",
+          "before_floor_s": 60,
+          "after_s": 0.1273,
+          "minimum_speedup_x": 471.3275726630008,
+          "comparison_basis": "60 s timeout floor; slower observed hit",
+          "layer": "Warm private snapshot",
+          "display_order": 5
+        }
+      ],
+      "baseline_latency": [
+        {
+          "display_order": 1,
+          "statistic": "p50 (median)",
+          "backend_duration_s": 0.121
+        },
+        {
+          "display_order": 2,
+          "statistic": "p90",
+          "backend_duration_s": 0.923
+        },
+        {
+          "display_order": 3,
+          "statistic": "p95",
+          "backend_duration_s": 2.4
+        },
+        {
+          "display_order": 4,
+          "statistic": "p99",
+          "backend_duration_s": 49.863
+        },
+        {
+          "display_order": 5,
+          "statistic": "Maximum",
+          "backend_duration_s": 58.141
+        }
+      ],
+      "post_latency": [
+        {
+          "display_order": 1,
+          "statistic": "p50 (median)",
+          "backend_duration_s": 0.0291
+        },
+        {
+          "display_order": 2,
+          "statistic": "p95",
+          "backend_duration_s": 0.3322
+        },
+        {
+          "display_order": 3,
+          "statistic": "p99",
+          "backend_duration_s": 0.7776
+        },
+        {
+          "display_order": 4,
+          "statistic": "Maximum",
+          "backend_duration_s": 1.4249
+        }
+      ],
+      "verification": [
+        {
+          "display_order": 1,
+          "measurement": "Risk selector",
+          "before_observation": "30–58 s",
+          "after_s": 0.228,
+          "state": "Selector",
+          "verification_note": "Exact first-100 rows and 1,200 total matched"
+        },
+        {
+          "display_order": 2,
+          "measurement": "Risk endpoint, cold",
+          "before_observation": "30–58 s",
+          "after_s": 0.1086,
+          "state": "Cache miss",
+          "verification_note": "Authenticated live request"
+        },
+        {
+          "display_order": 3,
+          "measurement": "Risk endpoint, warm",
+          "before_observation": "30–58 s",
+          "after_s": 0.0228,
+          "state": "Cache hit",
+          "verification_note": "Authenticated live request"
+        },
+        {
+          "display_order": 4,
+          "measurement": "Executive selector",
+          "before_observation": ">60 s timeout",
+          "after_s": 0.0887,
+          "state": "Selector",
+          "verification_note": "Four database queries"
+        },
+        {
+          "display_order": 5,
+          "measurement": "Executive cache hit A",
+          "before_observation": ">60 s timeout",
+          "after_s": 0.054,
+          "state": "Cache hit",
+          "verification_note": "Authenticated live request"
+        },
+        {
+          "display_order": 6,
+          "measurement": "Executive cache hit B",
+          "before_observation": ">60 s timeout",
+          "after_s": 0.1273,
+          "state": "Cache hit",
+          "verification_note": "Authenticated live request"
+        }
+      ],
+      "query_plan": [
+        {
+          "display_order": 1,
+          "implementation": "Before",
+          "planner_cost": 5925831.91,
+          "correlated_subplans": 20,
+          "query_shape": "Repeated correlated attendance, grade, and invoice subqueries"
+        },
+        {
+          "display_order": 2,
+          "implementation": "After",
+          "planner_cost": 6209,
+          "correlated_subplans": 0,
+          "query_shape": "Three grouped signals plus bounded student-page hydration"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "incident_evidence",
+      "label": "Intelligence latency incident evidence ledger",
+      "path": "docs/performance/intelligence-latency-2026-08-10/evidence.md",
+      "query": {
+        "engine": "production logs, PostgreSQL plans, and authenticated HTTP probes",
+        "description": "Reviewed incident observations and verification measurements recorded on 2026-08-10.",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [
+          "production HTTP request logs",
+          "PostgreSQL EXPLAIN JSON plans",
+          "seeded tenant verification output"
+        ],
+        "filters": [
+          "Production incident sample: 20 minutes",
+          "Tenant verification population: 1,200 operational students",
+          "Attendance volume: 190,800 records",
+          "Authenticated management intelligence endpoints"
+        ],
+        "metric_definitions": [
+          "Backend duration is server-side request time and excludes client network time.",
+          "Conservative speedup uses 30 seconds for the risk lower bound and 60 seconds for the executive timeout floor.",
+          "Planner cost is PostgreSQL's relative cost estimate; after is summed across set-based signal plans."
+        ]
+      }
+    },
+    {
+      "id": "headline_sql",
+      "label": "Report headline metric transform",
+      "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql",
+      "query": {
+        "engine": "postgresql",
+        "language": "sql",
+        "description": "Creates the bounded headline row from reviewed incident measurements.",
+        "sql": "SELECT 49.863::double precision AS pre_p99_s, 58.141::double precision AS pre_max_s, 0.7776::double precision AS post_p99_s, 0.0228::double precision AS risk_warm_s, 0.1086::double precision AS risk_cold_s, (5925831.91 / 6209.0)::double precision AS planner_reduction_x, 0::integer AS subplans_after, (1 - 65266.0 / 1386127.0)::double precision AS schema_reduction_rate, 65266::integer AS schema_compressed_bytes;",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [],
+        "filters": [
+          "Values transcribed from the reviewed 2026-08-10 incident evidence ledger"
+        ],
+        "metric_definitions": [
+          "Planner-cost reduction = 5,925,831.91 / 6,209.",
+          "Schema transfer reduction = 1 - 65,266 / 1,386,127."
+        ]
+      }
+    },
+    {
+      "id": "baseline_sql",
+      "label": "Pre-fix latency distribution transform",
+      "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql",
+      "query": {
+        "engine": "postgresql",
+        "language": "sql",
+        "description": "Creates the bounded pre-fix backend-duration distribution table.",
+        "sql": "SELECT * FROM (VALUES (1, 'p50 (median)', 0.121::double precision), (2, 'p90', 0.923::double precision), (3, 'p95', 2.400::double precision), (4, 'p99', 49.863::double precision), (5, 'Maximum', 58.141::double precision)) AS baseline(display_order, statistic, backend_duration_s) ORDER BY display_order;",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [],
+        "filters": [
+          "Twenty-minute production incident sample"
+        ],
+        "metric_definitions": [
+          "Backend duration is server-side request time in seconds."
+        ]
+      }
+    },
+    {
+      "id": "post_sql",
+      "label": "Post-deploy latency distribution transform",
+      "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql",
+      "query": {
+        "engine": "postgresql",
+        "language": "sql",
+        "description": "Creates the bounded immediate post-deploy backend-duration distribution table.",
+        "sql": "SELECT * FROM (VALUES (1, 'p50 (median)', 0.0291::double precision), (2, 'p95', 0.3322::double precision), (3, 'p99', 0.7776::double precision), (4, 'Maximum', 1.4249::double precision)) AS post_deploy(display_order, statistic, backend_duration_s) ORDER BY display_order;",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [],
+        "filters": [
+          "Eight-minute production recovery sample",
+          "137 requests",
+          "One request over one second and zero over five seconds"
+        ],
+        "metric_definitions": [
+          "Backend duration is server-side request time in seconds."
+        ]
+      }
+    },
+    {
+      "id": "speedup_sql",
+      "label": "Conservative speedup transform",
+      "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql",
+      "query": {
+        "engine": "postgresql",
+        "language": "sql",
+        "description": "Computes conservative lower-bound speedups from reviewed before floors and after durations.",
+        "sql": "WITH measurements(label, before_floor_s, after_s, comparison_basis, layer, display_order) AS (VALUES ('Risk selector', 30.0, 0.2280, '30 s lower bound', 'Set-based SQL', 1), ('Risk live cold', 30.0, 0.1086, '30 s lower bound', 'Cold private snapshot', 2), ('Risk live warm', 30.0, 0.0228, '30 s lower bound', 'Warm private snapshot', 3), ('Executive selector', 60.0, 0.0887, '60 s timeout floor', 'Set-based SQL', 4), ('Executive cache hit', 60.0, 0.1273, '60 s timeout floor; slower observed hit', 'Warm private snapshot', 5)) SELECT label AS measurement, before_floor_s, after_s, ROUND((before_floor_s / after_s)::numeric, 1) AS minimum_speedup_x, comparison_basis, layer, display_order FROM measurements ORDER BY display_order;",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [],
+        "filters": [
+          "Risk before floor: 30 seconds",
+          "Executive before floor: 60-second timeout",
+          "Executive cache comparison uses the slower observed 0.1273-second hit"
+        ],
+        "metric_definitions": [
+          "Minimum speedup = before floor in seconds / after duration in seconds."
+        ]
+      }
+    },
+    {
+      "id": "verification_sql",
+      "label": "Live verification transform",
+      "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql",
+      "query": {
+        "engine": "postgresql",
+        "language": "sql",
+        "description": "Creates the bounded selector and live endpoint verification table.",
+        "sql": "SELECT * FROM (VALUES (1, 'Risk selector', '30–58 s', 0.2280, 'Selector', 'Exact first-100 rows and 1,200 total matched'), (2, 'Risk endpoint, cold', '30–58 s', 0.1086, 'Cache miss', 'Authenticated live request'), (3, 'Risk endpoint, warm', '30–58 s', 0.0228, 'Cache hit', 'Authenticated live request'), (4, 'Executive selector', '>60 s timeout', 0.0887, 'Selector', 'Four database queries'), (5, 'Executive cache hit A', '>60 s timeout', 0.0540, 'Cache hit', 'Authenticated live request'), (6, 'Executive cache hit B', '>60 s timeout', 0.1273, 'Cache hit', 'Authenticated live request')) AS verification(display_order, measurement, before_observation, after_s, state, verification_note) ORDER BY display_order;",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [],
+        "filters": [
+          "Production-size tenant with 1,200 operational students and 190,800 attendance records"
+        ],
+        "metric_definitions": [
+          "After duration is elapsed seconds for the named selector or authenticated live endpoint observation."
+        ]
+      }
+    },
+    {
+      "id": "plan_sql",
+      "label": "Query-plan comparison transform",
+      "path": "docs/performance/intelligence-latency-2026-08-10/report_data.sql",
+      "query": {
+        "engine": "postgresql",
+        "language": "sql",
+        "description": "Creates the bounded before/after PostgreSQL plan comparison table.",
+        "sql": "SELECT * FROM (VALUES (1, 'Before', 5925831.91::double precision, 20, 'Repeated correlated attendance, grade, and invoice subqueries'), (2, 'After', 6209.00::double precision, 0, 'Three grouped signals plus bounded student-page hydration')) AS plan_comparison(display_order, implementation, planner_cost, correlated_subplans, query_shape) ORDER BY display_order;",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [],
+        "filters": [
+          "Before: expanded correlated risk statement",
+          "After: summed set-based signal plan costs"
+        ],
+        "metric_definitions": [
+          "Planner cost is PostgreSQL's relative plan-cost estimate.",
+          "Correlated subplans count repeated SubPlan nodes in the reviewed plan."
+        ]
+      }
+    },
+    {
+      "id": "selector_implementation",
+      "label": "Set-based intelligence selectors",
+      "path": "apps/intelligence/selectors.py",
+      "query": {
+        "engine": "python/django orm",
+        "language": "python",
+        "description": "Application source implementing set-based risk signal aggregation, ranking, and page hydration.",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": [
+          "attendance attendance records",
+          "academics exam results",
+          "finance invoices",
+          "students profiles"
+        ]
+      }
+    },
+    {
+      "id": "cache_implementation",
+      "label": "Permission-safe intelligence cache",
+      "path": "apps/intelligence/cache.py",
+      "query": {
+        "engine": "python/django cache",
+        "language": "python",
+        "description": "Application source implementing permission-bound keys, fresh/stale reads, refresh leases, cold-miss polling, and failure fallback.",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": []
+      }
+    },
+    {
+      "id": "view_implementation",
+      "label": "Intelligence authorization and HTTP views",
+      "path": "apps/intelligence/views/v1/intelligence_views.py",
+      "query": {
+        "engine": "python/django",
+        "language": "python",
+        "description": "Application source resolving live scope before cache reads and emitting private freshness headers.",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": []
+      }
+    },
+    {
+      "id": "cache_settings",
+      "label": "Intelligence cache defaults",
+      "path": "config/settings/base.py",
+      "query": {
+        "engine": "python/django settings",
+        "language": "python",
+        "description": "Default executive and risk fresh/stale windows and distributed refresh lease duration.",
+        "executed_at": "2026-08-10T17:52:31Z",
+        "tables_used": []
+      }
+    },
+    {
+      "id": "redis_cache_aside",
+      "label": "Redis cache-aside and stampede-control guidance",
+      "href": "https://redis.io/docs/latest/develop/use-cases/cache-aside/ruby/"
+    },
+    {
+      "id": "duckdb_concurrency",
+      "label": "DuckDB concurrency guidance",
+      "href": "https://duckdb.org/docs/current/connect/concurrency"
+    },
+    {
+      "id": "duckdb_tuning",
+      "label": "DuckDB workload-tuning guidance",
+      "href": "https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads"
+    },
+    {
+      "id": "polars_lazy",
+      "label": "Polars lazy API guidance",
+      "href": "https://docs.pola.rs/user-guide/concepts/lazy-api/"
+    },
+    {
+      "id": "clickhouse_use_cases",
+      "label": "ClickHouse analytical use cases",
+      "href": "https://clickhouse.com/use-cases"
+    }
+  ]
+}

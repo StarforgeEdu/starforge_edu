@@ -1,21 +1,32 @@
 """Test settings — fast, deterministic, no external services."""
 
+import base64
+
 from .base import *  # noqa: F403
 
 DEBUG = False
 SECRET_KEY = "test-only-not-secret"
 ALLOWED_HOSTS = ["*"]
 
+# Deterministic field-encryption key (TD-11) so encrypted round-trips are stable.
+FIELD_ENCRYPTION_KEY = base64.urlsafe_b64encode(b"starforge-dev-fieldenc-key-32byt").decode()
+
 # Synchronous Celery in tests.
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
-CELERY_TASK_CLS = "celery.app.task:Task"  # bypass tenant-schemas-celery in tests
+# Keep the real tenant-schemas-celery task base (config/celery.py wires
+# core.celery_base:SchemaHeaderTask); CeleryApp ignores CELERY_TASK_CLS anyway.
 
 # In-memory channel layer.
 CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
 
 # Locmem cache.
 CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+# Risk API tests intentionally create new domain rows between requests. Keep
+# those legacy functional tests uncached; the dedicated cache suite opts in to
+# production TTLs explicitly. Executive tests already clear/assert their cache.
+INTELLIGENCE_RISK_CACHE_FRESH_SECONDS = 0
+INTELLIGENCE_RISK_CACHE_STALE_SECONDS = 0
 
 # Local file storage in tests.
 STORAGES = {
@@ -25,9 +36,23 @@ STORAGES = {
 
 # Always mock SMS in tests.
 ESKIZ_USE_MOCK = True
+SMS_MOCK_CAPTURE_OUTBOX = True
+FCM_MOCK_CAPTURE_OUTBOX = True
+ALLOW_LEGACY_PRINCIPAL_UNION_FOR_TESTS = True
+ALLOW_LEGACY_TENANT_SESSIONS_FOR_TESTS = True
+
+# Compatibility coverage for the retired mock-era Uzum callback. Production
+# explicitly disables it because it is not the current official Merchant API.
+UZUM_LEGACY_INTEGRATION_ENABLED = True
 
 # Faster password hashing in tests.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+# Fresh DB connection per test — persistent connections (base sets CONN_MAX_AGE=60)
+# don't mix cleanly with pytest's per-test transaction wrapping + django-tenants schema
+# switching, and tests want deterministic isolation over connection reuse.
+DATABASES["default"]["CONN_MAX_AGE"] = 0  # noqa: F405
+DATABASES["default"]["CONN_HEALTH_CHECKS"] = False  # noqa: F405
 
 # Quiet logs in tests.
 LOGGING["loggers"][""]["level"] = "WARNING"  # type: ignore[index]  # noqa: F405

@@ -1,8 +1,11 @@
-from rest_framework.routers import DefaultRouter
+from django.urls import path
 
-from .views import AiItemViewSet
+from apps.ai.views.v1 import ai_views as views
 
-router = DefaultRouter()
-router.register(r"", AiItemViewSet, basename="ai_app")
-
-urlpatterns = router.urls
+urlpatterns = [
+    path("budget/", views.budget_view, name="ai-budget"),
+    path("exam-generation/", views.exam_generation_view, name="ai-exam-generation"),
+    path("usage-report/", views.usage_report_view, name="ai-usage-report"),
+    path("requests/", views.ai_requests_collection_view, name="ai-request-list"),
+    path("requests/<int:pk>/", views.ai_request_detail_view, name="ai-request-detail"),
+]

@@ -1,0 +1,10 @@
+{% extends "documents/reports/_base.html" %}
+{% load i18n %}
+{% block title %}{% trans "AI usage report" %}{% endblock %}
+{% block heading %}{% trans "AI usage report" %}{% endblock %}
+{% block summary %}
+<div class="summary">
+  <div><strong>{% trans "Month" %}:</strong> {{ data.month }}</div>
+  <div><strong>{% trans "Tokens consumed" %}:</strong> {{ data.tokens_consumed }}</div>
+</div>
+{% endblock %}

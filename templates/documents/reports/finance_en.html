@@ -1,0 +1,12 @@
+{% extends "documents/reports/_base.html" %}
+{% load i18n %}
+{% block title %}{% trans "Finance report" %}{% endblock %}
+{% block heading %}{% trans "Finance report" %}{% endblock %}
+{% block summary %}
+<div class="summary">
+  <div><strong>{% trans "Total invoices" %}:</strong> {{ data.total_invoices }}</div>
+  <div><strong>{% trans "Total billed" %}:</strong> {{ data.total_billed_uzs }} UZS</div>
+  <div><strong>{% trans "Total collected" %}:</strong> {{ data.total_collected_uzs }} UZS</div>
+  <div><strong>{% trans "Outstanding balance" %}:</strong> {{ data.outstanding_uzs }} UZS</div>
+</div>
+{% endblock %}

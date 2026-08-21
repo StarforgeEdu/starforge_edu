@@ -1,8 +1,21 @@
-from rest_framework.routers import DefaultRouter
+"""Reports URLConf (mounted at /api/v1/reports/ by config/urls.py).
 
-from .views import ReportItemViewSet
+Order matters: the ``runs``/``schedules`` routers are listed before the library
+router so ``reports/runs/`` and ``reports/schedules/`` resolve to their own
+viewsets rather than the library's ``reports/<pk>/`` retrieve pattern.
+"""
 
-router = DefaultRouter()
-router.register(r"", ReportItemViewSet, basename="reports")
+from rest_framework.routers import SimpleRouter
 
-urlpatterns = router.urls
+from apps.reports.views import ReportRunViewSet, ReportScheduleViewSet, ReportViewSet
+
+runs_router = SimpleRouter()
+runs_router.register("runs", ReportRunViewSet, basename="report-runs")
+
+schedules_router = SimpleRouter()
+schedules_router.register("schedules", ReportScheduleViewSet, basename="report-schedules")
+
+library_router = SimpleRouter()
+library_router.register("", ReportViewSet, basename="reports")
+
+urlpatterns = runs_router.urls + schedules_router.urls + library_router.urls

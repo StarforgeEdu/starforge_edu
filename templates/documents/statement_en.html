@@ -1,0 +1,65 @@
+{% load i18n %}<!doctype html>
+<html lang="{{ LANGUAGE_CODE }}">
+<head>
+  <meta charset="utf-8">
+  <title>{% trans "Statement of Account" %}</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body { font-family: "DejaVu Sans", sans-serif; color: #1a1a1a; font-size: 11pt; }
+    h1 { font-size: 18pt; margin-bottom: 0; }
+    h2 { font-size: 13pt; margin-top: 1.5em; }
+    .meta { color: #555; margin-bottom: 1.5em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5em; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f0f0f0; }
+    td.num, th.num { text-align: right; }
+    .balance { margin-top: 1.5em; font-size: 13pt; font-weight: bold; }
+    .empty { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>{% trans "Statement of Account" %}</h1>
+  <div class="meta">
+    <div>{% trans "Student" %}: {{ student.user.get_full_name }} ({{ student.student_id }})</div>
+    <div>{% trans "Date" %}: {{ generated_on }}</div>
+  </div>
+
+  {% if invoices %}
+  {% for inv in invoices %}
+  <h2>{% trans "Invoice" %} {{ inv.number }} — {{ inv.get_status_display }} ({% trans "due" %} {{ inv.due_date }})</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>{% trans "Description" %}</th>
+        <th class="num">{% trans "Qty" %}</th>
+        <th class="num">{% trans "Unit" %}</th>
+        <th class="num">{% trans "Amount (UZS)" %}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for line in inv.lines.all %}
+      <tr>
+        <td>{{ line.description }}</td>
+        <td class="num">{{ line.quantity }}</td>
+        <td class="num">{{ line.unit_price_uzs }}</td>
+        <td class="num">{{ line.amount_uzs }}</td>
+      </tr>
+      {% endfor %}
+      {% for alloc in inv.allocations.all %}
+      <tr>
+        <td>{% trans "Payment received" %} (#{{ alloc.payment_id }})</td>
+        <td class="num"></td>
+        <td class="num"></td>
+        <td class="num">-{{ alloc.amount_uzs }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+  {% else %}
+  <p class="empty">{% trans "No invoices on record." %}</p>
+  {% endif %}
+
+  <div class="balance">{% trans "Outstanding balance" %}: {{ outstanding_uzs }} UZS</div>
+</body>
+</html>

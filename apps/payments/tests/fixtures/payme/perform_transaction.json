@@ -1,0 +1,22 @@
+{
+  "method": "PerformTransaction",
+  "description": "Moves state 1 -> 2 (performed). Idempotent: re-sending returns the same perform_time and state 2. perform_time is epoch milliseconds. On success the linked invoice is allocated/paid exactly once.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "PerformTransaction",
+    "params": {"id": "5e7a0f9b3c2d1a0011223344"}
+  },
+  "expected_result": {
+    "transaction": "1",
+    "state": 2,
+    "perform_time": 1700000005000
+  },
+  "state_before": 1,
+  "state_after": 2,
+  "errors": {
+    "unknown_transaction": -31003,
+    "cannot_perform": -31008,
+    "auth_failed": -32504
+  }
+}

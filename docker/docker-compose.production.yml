@@ -1,0 +1,297 @@
+name: starforge
+
+x-app: &app
+  image: ${APP_IMAGE:?APP_IMAGE must be an immutable Starforge image tag}
+  restart: unless-stopped
+  env_file:
+    - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/app.env
+  secrets:
+    - source: firebase_credentials
+      target: firebase.json
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - internal
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=128m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 160
+  init: true
+  # Must exceed Gunicorn's validated request + graceful shutdown envelope.
+  # The release controller uses the same 120-second bound for discovered
+  # producer/worker/orphan containers.
+  stop_grace_period: 120s
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must use an immutable tag or digest}
+    restart: unless-stopped
+    env_file:
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/postgres.env
+    volumes:
+      - sf_pg:/var/lib/postgresql/data
+    networks:
+      - internal
+    shm_size: 128m
+    mem_limit: 512m
+    cpus: 0.60
+    pids_limit: 160
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  redis:
+    image: ${REDIS_IMAGE:?REDIS_IMAGE must use an immutable tag or digest}
+    restart: unless-stopped
+    # Leave headroom below the container limit for Redis metadata, client buffers,
+    # AOF rewrite, and allocator fragmentation.  The broker must fail writes rather
+    # than evict queued financial/notification work.
+    command:
+      ["redis-server", "--appendonly", "yes", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - sf_redis:/data
+    networks:
+      - internal
+    mem_limit: 160m
+    cpus: 0.25
+    pids_limit: 80
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  minio:
+    image: ${MINIO_IMAGE:?MINIO_IMAGE must use an immutable tag or digest}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    env_file:
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/minio.env
+    volumes:
+      - sf_minio:/data
+    networks:
+      internal: {}
+      edge:
+        aliases: [starforge-minio]
+    mem_limit: 256m
+    cpus: 0.30
+    pids_limit: 100
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  web:
+    <<: *app
+    command: ["web"]
+    environment:
+      WEB_CONCURRENCY: "2"
+    networks:
+      internal: {}
+      edge:
+        aliases: [starforge-web]
+    # Two synchronous workers peaked above the former 384 MiB cgroup limit
+    # during production-sized intelligence reads.  Keep enough headroom to
+    # avoid worker OOM churn and let the web tier use one of the host's two
+    # CPUs without allowing it to starve PostgreSQL or background workers.
+    mem_limit: 512m
+    cpus: 1.00
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  daphne:
+    <<: *app
+    command: ["daphne"]
+    networks:
+      internal: {}
+      edge:
+        aliases: [starforge-daphne]
+    mem_limit: 256m
+    cpus: 0.35
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/healthz/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker-critical:
+    <<: *app
+    command: ["worker"]
+    environment:
+      CELERY_QUEUES: critical
+      CELERY_WORKER_CONCURRENCY: "1"
+    networks:
+      - internal
+      - egress
+    mem_limit: 320m
+    cpus: 0.45
+    healthcheck:
+      test:
+        ["CMD-SHELL", "celery -A config inspect ping --destination \"celery@$$HOSTNAME\" --timeout=5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  worker-default:
+    <<: *app
+    command: ["worker"]
+    environment:
+      CELERY_QUEUES: default,notifications,maintenance
+      CELERY_WORKER_CONCURRENCY: "1"
+    networks:
+      - internal
+      - egress
+    mem_limit: 384m
+    cpus: 0.55
+    healthcheck:
+      test:
+        ["CMD-SHELL", "celery -A config inspect ping --destination \"celery@$$HOSTNAME\" --timeout=5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Isolate long PDF/AI work so a single slow provider or renderer cannot starve
+  # interactive notifications and normal background jobs.
+  worker-long:
+    <<: *app
+    command: ["worker"]
+    environment:
+      CELERY_QUEUES: reports,ai
+      CELERY_WORKER_CONCURRENCY: "1"
+    networks:
+      - internal
+      - egress
+    mem_limit: 384m
+    cpus: 0.45
+    healthcheck:
+      test:
+        ["CMD-SHELL", "celery -A config inspect ping --destination \"celery@$$HOSTNAME\" --timeout=5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  beat:
+    <<: *app
+    command: ["beat"]
+    # Django initialization plus the database-backed scheduler exceeds 128 MiB
+    # on the production image. Keep enough headroom for schedule reloads so the
+    # kernel does not repeatedly OOM-kill the authoritative scheduler.
+    mem_limit: 256m
+    cpus: 0.15
+    pids_limit: 80
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os; from pathlib import Path; pids = ['1', *Path('/proc/1/task/1/children').read_text().split()]; commands = [(Path('/proc') / pid / 'cmdline').read_bytes() for pid in pids if pid != str(os.getpid())]; raise SystemExit(0 if any(b'celery' in command and b'beat' in command for command in commands) else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    secrets:
+      - source: firebase_credentials
+        target: firebase.json
+      - source: migration_cutover_evidence
+        target: migration-cutover.evidence
+    environment:
+      # Only scripts/deploy_production.sh should set this after stopping every
+      # old application process and completing a verified quiesced backup.
+      STARFORGE_MAINTENANCE_CUTOVER: ${STARFORGE_MAINTENANCE_CUTOVER:-}
+      STARFORGE_RELEASE_REVISION: ${STARFORGE_RELEASE_REVISION:-}
+      STARFORGE_CANDIDATE_IMAGE_ID: ${STARFORGE_CANDIDATE_IMAGE_ID:-}
+      STARFORGE_RELEASE_HELPERS_SHA256: ${STARFORGE_RELEASE_HELPERS_SHA256:-}
+      STARFORGE_EMPTY_DATABASE_BOOTSTRAP: ${STARFORGE_EMPTY_DATABASE_BOOTSTRAP:-}
+    restart: "no"
+    profiles: [tools]
+    mem_limit: 384m
+    cpus: 0.60
+
+  cutover-check:
+    <<: *app
+    command:
+      ["python", "manage.py", "check_safeguarding_encryption_cutover", "--token"]
+    restart: "no"
+    profiles: [tools]
+    mem_limit: 128m
+    cpus: 0.15
+
+  release-preflight:
+    <<: *app
+    command:
+      ["python", "manage.py", "check_release_migration_preflight", "--fail-on-blocked", "--no-color"]
+    restart: "no"
+    profiles: [tools]
+    mem_limit: 256m
+    cpus: 0.30
+
+  collectstatic:
+    <<: *app
+    command: ["python", "manage.py", "collectstatic", "--noinput"]
+    # The release verifier fetches the public static URL after writing its probe.
+    # Keep database/cache access on the internal network while granting this
+    # short-lived tool the narrow outbound path required for that verification.
+    networks:
+      - internal
+      - egress
+    # The CSP-trusted static bucket is writable only from this one-shot tool.
+    # Long-running services inherit app.env alone and use a URL-only backend.
+    env_file:
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/app.env
+      - ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/static-storage.env
+    environment:
+      STATIC_STORAGE_WRITE_ENABLED: "True"
+      # Remove media authority inherited from app.env in the final container
+      # environment. Production settings also reject this mixed-credential mode.
+      AWS_S3_ACCESS_KEY_ID: ""
+      AWS_S3_SECRET_ACCESS_KEY: ""
+    restart: "no"
+    profiles: [tools]
+    mem_limit: 256m
+    cpus: 0.40
+
+networks:
+  internal:
+    internal: true
+  edge:
+    external: true
+  egress:
+    driver: bridge
+
+secrets:
+  # The deployment default is an inert persistent placeholder so a release with push
+  # explicitly disabled does not need fake credentials. When push is enabled,
+  # point this at the real service-account JSON; production settings validate it.
+  firebase_credentials:
+    file: ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/firebase.json
+  migration_cutover_evidence:
+    file: ${STARFORGE_DEPLOY_DIR:-/root/starforge-deploy}/migration-cutover.evidence
+
+volumes:
+  sf_pg: {}
+  sf_redis: {}
+  sf_minio: {}

@@ -23,6 +23,7 @@ venv/
 db.sqlite3
 db.sqlite3-journal
 local_settings.py
+config/settings/local_run.py
 media/
 staticfiles/
 

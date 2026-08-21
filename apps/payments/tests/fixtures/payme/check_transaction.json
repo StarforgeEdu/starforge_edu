@@ -1,0 +1,22 @@
+{
+  "method": "CheckTransaction",
+  "description": "Status query. Returns the lifecycle timestamps (all epoch milliseconds; 0 when the phase has not happened) plus current state and reason.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "CheckTransaction",
+    "params": {"id": "5e7a0f9b3c2d1a0011223344"}
+  },
+  "expected_result": {
+    "create_time": 1700000000000,
+    "perform_time": 1700000005000,
+    "cancel_time": 0,
+    "transaction": "1",
+    "state": 2,
+    "reason": null
+  },
+  "errors": {
+    "unknown_transaction": -31003,
+    "auth_failed": -32504
+  }
+}

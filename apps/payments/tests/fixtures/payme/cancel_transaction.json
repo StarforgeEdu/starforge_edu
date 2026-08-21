@@ -1,0 +1,23 @@
+{
+  "method": "CancelTransaction",
+  "description": "Cancels. From state 1 -> -1 (cancelled before perform). From state 2 -> -2 (cancelled after perform; drives a Refund). cancel_time is epoch milliseconds; the reason code is stored.",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "CancelTransaction",
+    "params": {"id": "5e7a0f9b3c2d1a0011223344", "reason": 3}
+  },
+  "expected_result": {
+    "transaction": "1",
+    "state": -1,
+    "cancel_time": 1700000009000
+  },
+  "transitions": {
+    "from_created": {"state_before": 1, "state_after": -1},
+    "from_performed": {"state_before": 2, "state_after": -2}
+  },
+  "errors": {
+    "unknown_transaction": -31003,
+    "auth_failed": -32504
+  }
+}

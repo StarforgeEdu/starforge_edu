@@ -2,36 +2,147 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, "codex/**"]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan the complete Git history for secrets
+        run: >-
+          docker run --rm
+          -v "$PWD:/repo:ro"
+          zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+          git /repo --redact --no-banner
+
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          version: "0.11.x"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.28"
       - run: uv sync --all-groups --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - name: Reject medium and high confidence security findings
+        run: uv run bandit -q -r apps core infrastructure config celery_tasks -ll
+      - name: Reject untranslated API/domain errors
+        run: uv run python scripts/check_i18n.py
 
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          version: "0.11.x"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.28"
       - run: uv sync --all-groups --frozen
       - run: uv run mypy apps core infrastructure config
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.28"
+      - run: uv sync --all-groups --frozen
+      - name: Reject dependencies with known vulnerabilities
+        run: uv run pip-audit --local --strict
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Validate production shell scripts
+        run: >-
+          bash -n docker/entrypoint.sh
+          scripts/backup_production.sh
+          scripts/configure_production_storage.sh
+          scripts/deploy_production.sh
+          scripts/launch_production_deploy.sh
+          scripts/prune_production_backups.sh
+          scripts/set_production_maintenance.sh
+          scripts/verify_production_storage.sh
+          scripts/verify_restore.sh
+      - name: Build the production image
+        run: docker build --build-arg VCS_REF=${{ github.sha }} --tag starforge-ci:${{ github.sha }} --file docker/Dockerfile .
+      - name: Verify immutable provenance and runtime minimization
+        run: |
+          test "$(docker image inspect starforge-ci:${{ github.sha }} --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "${{ github.sha }}"
+          docker image inspect starforge-ci:${{ github.sha }} --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -Fx "STARFORGE_IMAGE_REVISION=${{ github.sha }}"
+          docker run --rm --entrypoint python starforge-ci:${{ github.sha }} - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          forbidden = ("bandit", "factory", "ipdb", "IPython", "mypy", "pip_audit", "pytest", "ruff")
+          present = [name for name in forbidden if importlib.util.find_spec(name) is not None]
+          assert not present, f"development modules present in runtime image: {present}"
+          assert Path("/app/scripts/capture_broker_depth.py").is_file()
+          assert Path("/app/scripts/drain_celery_for_release.py").is_file()
+          assert Path("/app/scripts/run_leadership_release_smoke.py").is_file()
+          PY
+      - name: Validate native PDF and push dependencies
+        run: |
+          docker run --rm --entrypoint python starforge-ci:${{ github.sha }} -c "import firebase_admin; from weasyprint import HTML; assert HTML(string='<p>ok</p>').write_pdf()[:4] == b'%PDF'"
+      - name: Run Django production deployment checks
+        run: |
+          docker run --rm --entrypoint python \
+            -e SECRET_KEY='ci-only-production-check-secret-key-0000000000000000000000000000' \
+            -e ALLOWED_HOSTS='example.invalid' \
+            -e FIELD_ENCRYPTION_KEY='sxHcPTH6vnzsZ0_HSYTjWsQssumrpoqqlXn7dlR8RB0=' \
+            -e NUM_PROXIES='1' \
+            -e DATABASE_URL='postgres://ci:ci@127.0.0.1:5432/ci' \
+            -e REDIS_URL='redis://127.0.0.1:6379/0' \
+            -e AWS_STORAGE_BUCKET_NAME='ci' \
+            -e AWS_STATIC_BUCKET_NAME='ci-static' \
+            -e AWS_S3_ENDPOINT_URL='https://storage.example.invalid' \
+            -e AWS_S3_PUBLIC_ENDPOINT_URL='https://media.example.invalid' \
+            -e AWS_STATIC_PUBLIC_ENDPOINT_URL='https://static.example.invalid' \
+            -e AWS_S3_ACCESS_KEY_ID='ci-media-runtime' \
+            -e AWS_S3_SECRET_ACCESS_KEY='ci-media-runtime-secret-key-0000000000000000' \
+            -e AWS_S3_REGION_NAME='us-east-1' \
+            -e AWS_EC2_METADATA_DISABLED='true' \
+            -e STATIC_STORAGE_WRITE_ENABLED='False' \
+            -e EMAIL_HOST='smtp.example.invalid' \
+            -e EMAIL_USE_TLS='True' \
+            -e ESKIZ_EMAIL='ci@example.invalid' \
+            -e ESKIZ_PASSWORD="$GITHUB_RUN_ID" \
+            -e ESKIZ_FROM='ci' \
+            -e ANTHROPIC_API_KEY='ci-only' \
+            -e SOLIQ_API_URL='https://soliq.example.invalid' \
+            -e SOLIQ_API_ALLOWED_HOSTS='soliq.example.invalid' \
+            -e SOLIQ_API_TOKEN='ci-only' \
+            -e PUSH_NOTIFICATIONS_ENABLED='False' \
+            -e FCM_CREDENTIALS_FILE='/run/secrets/firebase.json' \
+            starforge-ci:${{ github.sha }} manage.py check --deploy --fail-level WARNING
 
   test:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_DB: starforge
           POSTGRES_USER: starforge
@@ -43,7 +154,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
         ports: ["6379:6379"]
         options: >-
           --health-cmd "redis-cli ping"
@@ -56,21 +167,38 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       SECRET_KEY: "ci-only-not-secret"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          version: "0.11.x"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.28"
       - run: uv sync --all-groups --frozen
+      # D4-LF-2: compile the uz/en/ru gettext catalogs so activate("uz") resolves
+      # translated strings in the suite. The Linux runner has GNU gettext (the
+      # Windows dev box does not — locale/*/LC_MESSAGES/django.mo are committed,
+      # built by scripts/build_locale.py; compilemessages refreshes them from the
+      # committed .po here as the authoritative step).
+      - run: sudo apt-get update && sudo apt-get install -y gettext
+      - run: uv run python manage.py compilemessages -l uz -l en -l ru
       - run: uv run python manage.py check
-      - run: uv run pytest -q
+      - run: uv run python manage.py makemigrations --check --dry-run
+      - run: uv run python manage.py showmigrations --plan
+      # TD-20 coverage floor: 70 after Day 1 → 80 after Day 3 → 85 after Day 5.
+      # Raising this number is the EOD duty of D1-A / D3-F / D5-B respectively.
+      # Each worker provisions its own public and tenant schemas. Keep the
+      # parallelism bounded so larger/self-hosted runners cannot exhaust Postgres.
+      - run: uv run pytest -q -n 2 --dist=loadfile --cov=apps --cov=core --cov-fail-under=70
 
   schema:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          version: "0.11.x"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+        with:
+          version: "0.11.28"
       - run: uv sync --all-groups --frozen
       - name: Generate OpenAPI schema
         env:
@@ -78,8 +206,10 @@ jobs:
           SECRET_KEY: "ci-only-not-secret"
           DATABASE_URL: "postgres://x:x@localhost:5432/x"
           REDIS_URL: "redis://localhost:6379/0"
-        run: uv run python manage.py spectacular --file openapi.yaml --validate
-      - uses: actions/upload-artifact@v4
+        run: uv run python scripts/export_openapi.py --validate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: openapi
-          path: openapi.yaml
+          path: |
+            openapi.yaml
+            openapi-public.yaml

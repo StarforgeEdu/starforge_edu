@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from django.contrib.auth import get_user_model
 
 from core.validators import normalize_phone
 
-User = get_user_model()
+if TYPE_CHECKING:
+    from apps.users.models import User
+else:
+    User = get_user_model()
 
 
 def find_by_identifier(identifier: str) -> User | None:

@@ -1,0 +1,50 @@
+{% load i18n %}<!doctype html>
+<html lang="{{ LANGUAGE_CODE }}">
+<head>
+  <meta charset="utf-8">
+  <title>{% trans "Academic Transcript" %}</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body { font-family: "DejaVu Sans", sans-serif; color: #1a1a1a; font-size: 11pt; }
+    h1 { font-size: 18pt; margin-bottom: 0; }
+    .meta { color: #555; margin-bottom: 1.5em; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1em; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+    th { background: #f0f0f0; }
+    .empty { color: #888; font-style: italic; margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <h1>{% trans "Academic Transcript" %}</h1>
+  <div class="meta">
+    <div>{% trans "Student" %}: {{ student.user.get_full_name }} ({{ student.student_id }})</div>
+    {% if transcript.term %}<div>{% trans "Term" %}: {{ transcript.term }}</div>
+    {% else %}<div>{% trans "Full academic history" %}</div>{% endif %}
+  </div>
+
+  {% if grades %}
+  <table>
+    <thead>
+      <tr>
+        <th>{% trans "Subject" %}</th>
+        <th>{% trans "Term" %}</th>
+        <th>{% trans "Grade" %}</th>
+        <th>{% trans "Score" %}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for grade in grades %}
+      <tr>
+        <td>{{ grade.subject.name }}</td>
+        <td>{{ grade.term }}</td>
+        <td>{{ grade.value_display }}</td>
+        <td>{{ grade.value_raw }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">{% trans "No published grades on record." %}</p>
+  {% endif %}
+</body>
+</html>

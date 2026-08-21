@@ -1,0 +1,64 @@
+# Starforge Edu ru translations (D4-LF-2).
+# Seeded by scripts/build_locale.py; CI's `makemessages -a` extends this.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: starforge_edu\n"
+"Report-Msgid-Bugs-To: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: ru\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Invalid input."
+msgstr "Неверные данные."
+
+msgid "Invalid phone number."
+msgstr "Неверный номер телефона."
+
+msgid "You don't have permission to do that."
+msgstr "У вас нет прав для этого действия."
+
+msgid "Resource not found."
+msgstr "Ресурс не найден."
+
+msgid "Forbidden."
+msgstr "Запрещено."
+
+msgid "Too many requests."
+msgstr "Слишком много запросов."
+
+msgid "Conflict with the current state."
+msgstr "Конфликт с текущим состоянием."
+
+msgid "The request could not be processed."
+msgstr "Запрос не может быть обработан."
+
+msgid "Authentication failed."
+msgstr "Ошибка аутентификации."
+
+msgid "No active tenant context."
+msgstr "Нет активного контекста арендатора."
+
+msgid "Something went wrong."
+msgstr "Что-то пошло не так."
+
+msgid "Invalid username or password."
+msgstr "Неверный логин или пароль."
+
+msgid "Current password is incorrect."
+msgstr "Текущий пароль неверен."
+
+msgid "Invalid code."
+msgstr "Неверный код."
+
+msgid "A file must be attached to a lesson or a folder."
+msgstr "Файл должен быть прикреплён к уроку или папке."
+
+msgid "At least one field is required."
+msgstr "Требуется хотя бы одно поле."
+
+msgid "Provide plan_code and/or status."
+msgstr "Укажите plan_code и/или status."
+
