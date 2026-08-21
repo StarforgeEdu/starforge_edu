@@ -234,7 +234,7 @@ check_ci() {
   curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
     --config <(printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN") \
     -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/MythicalCosmic/starforge_edu/commits/${sha}/check-runs?per_page=100" \
+    "https://api.github.com/repos/StarforgeEdu/starforge_edu/commits/${sha}/check-runs?per_page=100" \
     | python3 -c '
 import json
 import sys

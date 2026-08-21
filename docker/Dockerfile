@@ -30,7 +30,7 @@ FROM python:3.13-slim@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493
 ARG VCS_REF
 
 LABEL org.opencontainers.image.title="StarForge Edu" \
-      org.opencontainers.image.source="https://github.com/MythicalCosmic/starforge_edu" \
+      org.opencontainers.image.source="https://github.com/StarforgeEdu/starforge_edu" \
       org.opencontainers.image.revision="${VCS_REF}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
