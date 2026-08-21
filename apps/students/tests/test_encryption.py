@@ -55,6 +55,19 @@ def student_with_notes(tenant_a):
     return branch, student
 
 
+def _teacher_directory_client(*, tenant, user_in, as_user, branch, student):
+    """Bind the teacher to the student's cohort under the exact-principal scope."""
+    from apps.cohorts.tests.factories import CohortFactory
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
+    teacher_user = user_in(tenant, roles=[Role.TEACHER], branch=branch)
+    with schema_context(tenant.schema_name):
+        teacher = TeacherProfileFactory(user=teacher_user, branch=branch)
+        student.current_cohort = CohortFactory(branch=branch, primary_teacher=teacher)
+        student.save(update_fields=("current_cohort",))
+    return as_user(tenant, teacher_user)
+
+
 def test_list_payload_has_no_medical_notes_key(tenant_a, user_in, as_user, student_with_notes):
     branch, _student = student_with_notes
     client = as_user(tenant_a, user_in(tenant_a, roles=[Role.REGISTRAR], branch=branch))
@@ -65,7 +78,13 @@ def test_list_payload_has_no_medical_notes_key(tenant_a, user_in, as_user, stude
 
 def test_teacher_retrieve_gets_null_medical_notes(tenant_a, user_in, as_user, student_with_notes):
     branch, student = student_with_notes
-    client = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
+    client = _teacher_directory_client(
+        tenant=tenant_a,
+        user_in=user_in,
+        as_user=as_user,
+        branch=branch,
+        student=student,
+    )
     resp = client.get(f"/api/v1/students/{student.id}/")
     assert resp.status_code == 200
     assert resp.json()["data"]["medical_notes"] is None
@@ -183,7 +202,13 @@ def test_corrupt_emergency_contacts_fail_closed_only_after_authorized_projection
             ["corrupt-emergency-contact-token", student.pk],
         )
 
-    directory = as_user(tenant_a, user_in(tenant_a, roles=[Role.TEACHER], branch=branch))
+    directory = _teacher_directory_client(
+        tenant=tenant_a,
+        user_in=user_in,
+        as_user=as_user,
+        branch=branch,
+        student=student,
+    )
     hidden = directory.get(f"/api/v1/students/{student.pk}/")
     assert hidden.status_code == 200, hidden.content
     assert hidden.json()["data"]["emergency_contacts"] is None

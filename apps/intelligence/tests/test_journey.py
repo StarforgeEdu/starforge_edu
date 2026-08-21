@@ -19,7 +19,7 @@ def _journey_url(student_id):
     return f"/api/v1/intelligence/journey/{student_id}/"
 
 
-def _student_with_events(tenant, branch, *, user=None):
+def _student_with_events(tenant, branch, *, user=None, primary_teacher=None):
     """A student with one of each event type: an enrollment move, a published grade,
     an achievement, and an invoice."""
     from apps.academics.tests.factories import ExamFactory, ExamResultFactory
@@ -31,7 +31,7 @@ def _student_with_events(tenant, branch, *, user=None):
     from apps.students.tests.factories import StudentProfileFactory
 
     with schema_context(tenant.schema_name):
-        cohort = CohortFactory.create(branch=branch)
+        cohort = CohortFactory.create(branch=branch, primary_teacher=primary_teacher)
         kwargs = {"user": user} if user is not None else {}
         student = StudentProfileFactory.create(branch=branch, current_cohort=cohort, **kwargs)
         EnrollmentEvent.objects.create(student=student, from_status="lead", to_status="active")
@@ -68,10 +68,17 @@ def test_journey_merges_all_event_types_newest_first(tenant_a, as_role):
 
 
 def test_journey_invoices_are_finance_gated(tenant_a, as_role):
+    from apps.teachers.tests.factories import TeacherProfileFactory
+
     teacher, teacher_user = as_role(Role.TEACHER)  # staff, but no finance:read and not the family
     with schema_context(tenant_a.schema_name):
         teacher_branch = teacher_user.role_memberships.get(role=Role.TEACHER).branch
-    student = _student_with_events(tenant_a, teacher_branch)
+        teacher_profile = TeacherProfileFactory(user=teacher_user, branch=teacher_branch)
+    student = _student_with_events(
+        tenant_a,
+        teacher_branch,
+        primary_teacher=teacher_profile,
+    )
 
     types = {e["type"] for e in teacher.get(_journey_url(student.id)).json()["data"]["events"]}
     assert "grade" in types  # the academic story is visible
