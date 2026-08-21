@@ -657,7 +657,8 @@ capture_web_command() {
 }
 
 capture_preflight() {
-  local destination="$1" temporary="${destination}.tmp"
+  local destination="$1"
+  local temporary="${destination}.tmp"
   rm -f -- "$temporary"
   if ! "${compose[@]}" --profile tools run --rm --no-deps -T release-preflight >"$temporary"; then
     chmod 0600 "$temporary"
